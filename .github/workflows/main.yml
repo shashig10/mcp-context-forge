@@ -39,6 +39,7 @@ permissions:
 jobs:
     build-scan-sign:
         runs-on: ubuntu-latest
+        environment: dev
 
         env:
             CACHE_DIR: /tmp/.buildx-cache # BuildKit layer cache dir
