@@ -24,15 +24,15 @@
 #    See the documentation for each action used below for the recommended IAM policies for this IAM user,
 #    and best practices on handling the access key credentials.
 
-name: Deploy to Amazon ECS
+name: Build and Deploy to Amazon ECR
 
 on:
   push:
     branches: [ "main" ]
 
 env:
-  AWS_REGION: MY_AWS_REGION                   # set this to your preferred AWS region, e.g. us-west-1
-  ECR_REPOSITORY: MY_ECR_REPOSITORY           # set this to your Amazon ECR repository name
+  AWS_REGION: eu-central-1                   # set this to your preferred AWS region, e.g. us-west-1
+  ECR_REPOSITORY: mcp_context_forge           # set this to your Amazon ECR repository name
 
 permissions:
   contents: read
