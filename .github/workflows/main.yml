@@ -42,8 +42,7 @@ jobs:
 
         env:
             CACHE_DIR: /tmp/.buildx-cache # BuildKit layer cache dir
-            # Temporarily disable Trivy (RHEL 10 unsupported). Set to 'true' to re‑enable.
-            TRIVY_ENABLED: 'false'
+
 
         steps:
             # -------------------------------------------------------------
@@ -57,7 +56,7 @@ jobs:
             # -------------------------------------------------------------
             -   name: 🏷️  Set IMAGE_NAME (lower-case repo path)
                 run: |
-                    IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+                    IMAGE="196525939274.dkr.ecr.eu-central-1.amazonaws.com' | tr '[:upper:]' '[:lower:]')"
                     echo "IMAGE_NAME=$IMAGE" >> "$GITHUB_ENV"
                     echo "Will build & push: $IMAGE_NAME"
 
@@ -107,6 +106,7 @@ jobs:
                 env:
                     ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
                     IMAGE_TAG: ${{ github.sha }}
+                    ECR_REPOSITORY: "mcp_context_forge"
                 run: |
                     docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
                     echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
