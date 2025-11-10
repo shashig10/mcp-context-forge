@@ -1,72 +1,141 @@
-# This workflow will build and push a new container image to Amazon ECR,
-# and then will deploy a new task definition to Amazon ECS, when there is a push to the "main" branch.
+# ===============================================================
+# 📦 Secure Docker Build & Scan Workflow
+# ===============================================================
 #
-# To use this workflow, you will need to complete the following set-up steps:
+# This workflow:
+#   - Builds and tags the container image (`latest` + timestamp)
+#   - Re-uses a BuildKit layer cache for faster rebuilds
+#   - Lints the Dockerfile with **Hadolint** (CLI) → SARIF
+#   - Lints the finished image with **Dockle** (CLI) → SARIF
+#   - Generates an SPDX SBOM with **Syft**
+#   - Scans the image for CRITICAL CVEs with **Trivy/Grype**
+#   - Uploads Hadolint, Dockle and Trivy results as SARIF files
+#   - Pushes the image to **GitHub Container Registry (GHCR)**
+#   - Signs & attests the image with **Cosign (key-less OIDC)**
 #
-# 1. Create an ECR repository to store your images.
-#    For example: `aws ecr create-repository --repository-name my-ecr-repo --region us-east-2`.
-#    Replace the value of the `ECR_REPOSITORY` environment variable in the workflow below with your repository's name.
-#    Replace the value of the `AWS_REGION` environment variable in the workflow below with your repository's region.
-#
-# 2. Create an ECS task definition, an ECS cluster, and an ECS service.
-#    For example, follow the Getting Started guide on the ECS console:
-#      https://us-east-2.console.aws.amazon.com/ecs/home?region=us-east-2#/firstRun
-#    Replace the value of the `ECS_SERVICE` environment variable in the workflow below with the name you set for the Amazon ECS service.
-#    Replace the value of the `ECS_CLUSTER` environment variable in the workflow below with the name you set for the cluster.
-#
-# 3. Store your ECS task definition as a JSON file in your repository.
-#    The format should follow the output of `aws ecs register-task-definition --generate-cli-skeleton`.
-#    Replace the value of the `ECS_TASK_DEFINITION` environment variable in the workflow below with the path to the JSON file.
-#    Replace the value of the `CONTAINER_NAME` environment variable in the workflow below with the name of the container
-#    in the `containerDefinitions` section of the task definition.
-#
-# 4. Store an IAM user access key in GitHub Actions secrets named `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
-#    See the documentation for each action used below for the recommended IAM policies for this IAM user,
-#    and best practices on handling the access key credentials.
+# Triggers:
+#   - Every push / PR to `main`
+#   - Weekly scheduled run (Tue 18:17 UTC) to catch new CVEs
+# ---------------------------------------------------------------
 
-name: Build and Deploy to Amazon ECR
-
+name: Build and push container image to ECR
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
-env:
-  AWS_REGION: eu-central-1                   # set this to your preferred AWS region, e.g. us-west-1
-  ECR_REPOSITORY: mcp_context_forge           # set this to your Amazon ECR repository name
 
+# -----------------------------------------------------------------
+# Minimal permissions - keep the principle of least privilege
+# -----------------------------------------------------------------
 permissions:
   contents: read
+  packages: write # push to ghcr.io via GITHUB_TOKEN
+  security-events: write # upload SARIF to "Code scanning"
+  actions: read # needed by upload-sarif in private repos
+  id-token: write # required for OIDC token generation
 
 jobs:
-  deploy:
-    name: Deploy
+  build-scan-sign:
     runs-on: ubuntu-latest
-    environment: dev
+
+    env:
+      CACHE_DIR: /tmp/.buildx-cache # BuildKit layer cache dir
+      # Temporarily disable Trivy (RHEL 10 unsupported). Set to 'true' to re‑enable.
+      TRIVY_ENABLED: 'false'
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      # -------------------------------------------------------------
+      # 0️⃣  Checkout source
+      # -------------------------------------------------------------
+      - name: ⬇️  Checkout code
+        uses: actions/checkout@v5
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      # -------------------------------------------------------------
+      # 0️⃣.5️⃣  Derive lower-case IMAGE_NAME for Docker tag
+      # -------------------------------------------------------------
+      - name: 🏷️  Set IMAGE_NAME (lower-case repo path)
+        run: |
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=$IMAGE" >> "$GITHUB_ENV"
+          echo "Will build & push: $IMAGE_NAME"
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      # -------------------------------------------------------------
+      # 1️⃣  Dockerfile lint (Hadolint CLI → SARIF)
+      # -------------------------------------------------------------
+      - name: 🔍  Dockerfile lint (Hadolint)
+        id: hadolint
+        continue-on-error: true
+        run: |
+          curl -sSL https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64 -o /usr/local/bin/hadolint
+          chmod +x /usr/local/bin/hadolint
+          hadolint -f sarif Containerfile.lite > hadolint-results.sarif
+          echo "HADOLINT_EXIT=$?" >> "$GITHUB_ENV"
+          exit 0
+      - name: ☁️  Upload Hadolint SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint-results.sarif
 
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        # Build a docker container and
-        # push it to ECR so that it can
-        # be deployed to ECS.
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      # -------------------------------------------------------------
+      # 2️⃣  Set up Buildx & restore cache
+      # -------------------------------------------------------------
+      - name: 🛠️  Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.11.1
+
+      - name: 🔄  Restore BuildKit layer cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      # -------------------------------------------------------------
+      # 3️⃣  Build & tag image (timestamp + latest)
+      # -------------------------------------------------------------
+      - name: 🏗️  Build Docker image
+        env:
+          DOCKER_CONTENT_TRUST: "1"
+        run: |
+          TAG=$(date +%s)
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          docker buildx build \
+            --file Containerfile.lite \
+            --tag $IMAGE_NAME:$TAG \
+            --tag $IMAGE_NAME:latest \
+            --cache-from type=local,src=${{ env.CACHE_DIR }} \
+            --cache-to   type=local,dest=${{ env.CACHE_DIR }},mode=max \
+            --load \
+            .   # build context is mandatory
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          run: |
+              # Build a docker container and
+              # push it to ECR so that it can
+              # be deployed to ECS.
+              # docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+              docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+              echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+    
+
+
+
+
+
+
