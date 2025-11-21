@@ -75,6 +75,7 @@ table thead th {
     font-size: 0.75rem !important;
     letter-spacing: 0.05em !important;
     padding: 1rem 1.5rem !important;
+    text-align: center !important;
 }
 
 .dark table thead th {
@@ -82,23 +83,57 @@ table thead th {
     color: rgb(196 181 253) !important;
 }
 
-/* Hide S.No column */
-table thead th:first-child,
-table tbody td:first-child {
-    display: none !important;
-}
-
 /* Table cell general styling - no wrapping, use ellipsis */
-table td {
+/* table td {
     max-width: 200px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+} */
+
+/* URL column - panel-specific styling */
+/* MCP Servers (Gateways) - URL is 3rd column (after S.No hidden, Name, URL) */
+#gateways-panel table td:nth-child(3) {
+    max-width: 350px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
 }
 
-/* URL column - wider with ellipsis */
-table td:nth-child(3) {
-    max-width: 300px !important;
+#gateways-panel table td:nth-child(2) {
+    max-width: 200px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-wrap: inherit !important;
+    /* text-overflow: ellipsis !important; */
+}
+
+/* Hide S.No column */
+#gateways-panel table thead th:first-child,
+#gateways-panel table thead th:nth-child(6),
+#gateways-panel table tbody td:first-child,
+#gateways-panel table tbody td:nth-child(6) {
+    display: none !important;
+}
+
+/* Actions column - minimum width with flexibility */
+/* Apply to all tab panels */
+#gateways-panel table td:last-child {
+    min-width: 180px !important;
+    white-space: normal !important;
+}
+
+/* Virtual Servers (Catalog) - URL is 3rd column */
+#catalog-panel table td:nth-child(3) {
+    max-width: 350px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+/* Virtual Servers (Roots) - URL column */
+#roots-panel table td:nth-child(2) {
+    max-width: 350px !important;
     white-space: nowrap !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
@@ -125,12 +160,6 @@ table td a[href^="https"] {
 table td:nth-child(4),
 table td:nth-child(5) {
     max-width: 300px !important;
-}
-
-/* Actions column - no truncation */
-table td:last-child {
-    max-width: none !important;
-    white-space: normal !important;
 }
 
 /* Table row styling */
@@ -342,12 +371,68 @@ a.text-red-500 {
     background: rgb(254 226 226 / 50%) !important;
 }
 
+/* Override submit button styles for action buttons (Deactivate, Delete, etc.) */
+form button[type="submit"].text-yellow-600,
+form button[type="submit"].text-yellow-500,
+button[type="submit"].text-yellow-600,
+button[type="submit"].text-yellow-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-red-600,
+form button[type="submit"].text-red-500,
+button[type="submit"].text-red-600,
+button[type="submit"].text-red-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-orange-600,
+form button[type="submit"].text-orange-500,
+button[type="submit"].text-orange-600,
+button[type="submit"].text-orange-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-green-600,
+form button[type="submit"].text-green-500,
+button[type="submit"].text-green-600,
+button[type="submit"].text-green-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-blue-600,
+form button[type="submit"].text-blue-500,
+button[type="submit"].text-blue-600,
+button[type="submit"].text-blue-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
 /* Remove purple/indigo backgrounds from action buttons */
 button[class*="bg-purple"],
 button[class*="bg-indigo"]:not([type="submit"]),
 a[class*="bg-purple"],
 a[class*="bg-indigo"] {
     background: transparent !important;
+}
+
+form button:not([type="submit"]) {
+    background: transparent;
+    border: none !important;
 }
 
 /* Utility buttons (like "Clear Filter") */
