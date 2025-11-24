@@ -1,3 +1,875 @@
+/* ============================================
+   UPTIMIZE COLOR THEME OVERRIDES
+   ============================================ */
+
+/* Update page background to light purple tint */
+body {
+    background: linear-gradient(to bottom, rgb(250 248 255), rgb(245 243 255)) !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol" !important;
+}
+
+.dark body {
+    background: linear-gradient(to bottom, rgb(17 15 35), rgb(24 21 45)) !important;
+}
+
+/* ============================================
+   CARD-BASED CONTENT ENHANCEMENT
+   ============================================ */
+
+/* Enhanced card styling for all content cards */
+.bg-white {
+    border-radius: 1.5rem !important;
+    box-shadow: 0 4px 20px rgb(124 108 220 / 10%) !important;
+}
+
+.dark .bg-white {
+    box-shadow: 0 4px 20px rgb(0 0 0 / 25%) !important;
+}
+
+/* Table containers */
+.overflow-x-auto {
+    border-radius: 1.5rem;
+}
+
+/* Tab panels with better spacing */
+.tab-panel {
+    margin-top: 1.5rem;
+}
+
+/* Form sections and cards */
+.shadow {
+    box-shadow: 0 4px 20px rgb(124 108 220 / 12%) !important;
+}
+
+.shadow-lg {
+    box-shadow: 0 6px 30px rgb(124 108 220 / 15%) !important;
+}
+
+.dark .shadow {
+    box-shadow: 0 4px 20px rgb(0 0 0 / 30%) !important;
+}
+
+.dark .shadow-lg {
+    box-shadow: 0 6px 30px rgb(0 0 0 / 35%) !important;
+}
+
+/* Add spacing between major sections */
+.mt-8 {
+    margin-top: 2.5rem !important;
+}
+
+.mb-4 {
+    margin-bottom: 1.5rem !important;
+}
+
+/* ============================================
+   TABLE STYLING ENHANCEMENTS
+   ============================================ */
+
+/* Purple-themed table headers */
+table thead th {
+    background: linear-gradient(to bottom, rgb(245 243 255), rgb(238 236 255)) !important;
+    color: rgb(109 40 217) !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+    padding: 1rem 1.5rem !important;
+    text-align: center !important;
+}
+
+.dark table thead th {
+    background: linear-gradient(to bottom, rgb(67 56 202 / 20%), rgb(79 70 229 / 20%)) !important;
+    color: rgb(196 181 253) !important;
+}
+
+/* URL column - panel-specific styling */
+/* MCP Servers - URL is 3rd column */
+#gateways-panel table td:nth-child(3) {
+    max-width: 350px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+#gateways-panel table td:nth-child(2) {
+    max-width: 200px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-wrap: inherit !important;
+    /* text-overflow: ellipsis !important; */
+}
+
+/* Hide columns */
+#gateways-panel table thead th:first-child,
+#gateways-panel table thead th:nth-child(6),
+#gateways-panel table tbody td:first-child,
+#gateways-panel table tbody td:nth-child(6) {
+    display: none !important;
+}
+
+/* Show full URL on hover - MCP Servers URL column */
+#gateways-panel table td:nth-child(3):hover {
+    white-space: normal !important;
+    overflow: visible !important;
+    /* max-width: none !important; */
+    position: relative;
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+}
+
+.dark #gateways-panel table td:nth-child(3):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+}
+
+/* Actions column - minimum width with flexibility */
+/* Apply to all tab panels */
+#gateways-panel table td:last-child {
+    min-width: 180px !important;
+    white-space: normal !important;
+}
+
+/* Virtual Servers (Catalog)*/
+
+/* Hide columns */
+#catalog-panel table thead th:first-child,
+#catalog-panel table thead th:nth-child(2),
+#catalog-panel table thead th:nth-child(3),
+#catalog-panel table tbody td:first-child,
+#catalog-panel table tbody td:nth-child(2),
+#catalog-panel table tbody td:nth-child(3) {
+    display: none !important;
+}
+
+/* Description and Owner column - Virtual Servers (Catalog) */
+
+#catalog-panel table td:nth-child(8) {
+    max-width: 350px !important;
+    max-height: 160px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    /* text-wrap: initial !important; */
+}
+
+#catalog-panel table td:nth-child(5) /* Description */ {
+    max-width: 300px !important;
+    max-height: 120px !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: 5 !important;
+    text-overflow: ellipsis !important;
+}
+
+#catalog-panel table td:nth-child(6) {
+    text-align: center !important;
+}
+
+/* Show full description on hover as tooltip - Virtual Servers (Catalog) */
+#catalog-panel table td:nth-child(5):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 300px !important;
+    max-height: none !important;  /* Remove height limit */
+    display: block !important;     /* Remove webkit-box display */
+    -webkit-line-clamp: unset !important;  /* Remove line clamp */
+    -webkit-box-orient: unset !important;  /* Remove box orientation */
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+.dark #catalog-panel table td:nth-child(5):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+/* Tools Panel */
+
+/* Hide columns */
+#tools-panel table thead th:nth-child(2), /* Gateway Name */
+#tools-panel table thead th:nth-child(4), /* URL */
+#tools-panel table thead th:nth-child(8), /* Annotations */
+#tools-panel table tbody td:nth-child(2),
+#tools-panel table tbody td:nth-child(4),
+#tools-panel table tbody td:nth-child(8) {
+    display: none !important;
+}
+
+/* Description and Owner column - Tools Panel */
+#tools-panel table td:nth-child(10) /* Owner */ {
+    max-width: 300px !important;
+    max-height: 160px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+#tools-panel table td:nth-child(7) /* Description */ {
+    max-width: 300px !important;
+    max-height: 80px !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: 3 !important;
+    text-overflow: ellipsis !important;
+    /* text-overflow: ellipsis !important; */
+    /* text-wrap: initial !important; */
+}
+
+#tools-panel table th td:first-child /* S. No. */ {
+    max-width: 25px !important;
+}
+
+#tools-panel table td:nth-child(3), /* Name */
+#tools-panel table td:nth-child(10), /* Owner */
+#tools-panel table td:nth-child(11) /* Team */{
+    min-width: 150px !important;
+    text-wrap: inherit !important;
+}
+
+#tools-panel table td:nth-child(5),
+#tools-panel table td:nth-child(9),
+#tools-panel table td:nth-child(11) {
+    text-align: center !important;
+}
+
+/* Show full description on hover as tooltip - Tools Panel */
+#tools-panel table td:nth-child(7):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 300px !important;
+    max-width: 300px !important;
+    max-height: none !important;  /* Remove height limit */
+    display: block !important;     /* Remove webkit-box display */
+    -webkit-line-clamp: unset !important;  /* Remove line clamp */
+    -webkit-box-orient: unset !important;  /* Remove box orientation */
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+.dark #tools-panel table td:nth-child(7):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+/* Prompts Panel */
+
+/* Description and Owner column - Prompts Panel */
+#prompts-panel table td:nth-child(2), /* Name */
+#prompts-panel table td:nth-child(6) /* Owner */ {
+    max-width: 300px !important;
+    max-height: 160px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+#prompts-panel table td:nth-child(3) /* Description */ {
+    max-width: 300px !important;
+    max-height: 80px !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: 3 !important;
+    text-overflow: ellipsis !important;
+}
+
+#prompts-panel table td:nth-child(5), /* Owner */
+#prompts-panel table td:nth-child(6) /* Team */{
+    min-width: 150px !important;
+    text-wrap: inherit !important;
+}
+
+/* Show full description on hover as tooltip - Prompts Panel */
+#prompts-panel table td:nth-child(3):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 300px !important;
+    max-height: none !important;  /* Remove height limit */
+    display: block !important;     /* Remove webkit-box display */
+    -webkit-line-clamp: unset !important;  /* Remove line clamp */
+    -webkit-box-orient: unset !important;  /* Remove box orientation */
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+.dark #prompts-panel table td:nth-child(3):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+/* Resources Panel */
+
+/* Description and Owner column - Resources Panel */
+#resources-panel table td:nth-child(2), /* URI */
+#resources-panel table td:nth-child(7), /* Owner */ 
+#resources-panel table td:nth-child(8) /* Team */{
+    max-width: 200px !important;
+    max-height: 160px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-wrap: inherit !important;
+    text-overflow: ellipsis !important;
+    /* text-wrap: initial !important; */
+}
+
+#resources-panel table td:nth-child(4) /* Description */ {
+    max-width: 200px !important;
+    max-height: 80px !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: 3 !important;
+    text-overflow: ellipsis !important;
+}
+
+#resources-panel table td:nth-child(2), /* URI */ 
+#resources-panel table td:nth-child(7) /* Owner */ {
+/* #resources-panel table td:nth-child(8) Team{ */
+    min-width: 125px !important;
+    text-wrap: inherit !important;
+}
+
+/* Show full description on hover as tooltip - Resources Panel */
+#resources-panel table td:nth-child(4):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 200px !important;
+    max-height: none !important;  /* Remove height limit */
+    display: block !important;     /* Remove webkit-box display */
+    -webkit-line-clamp: unset !important;  /* Remove line clamp */
+    -webkit-box-orient: unset !important;  /* Remove box orientation */
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+.dark #resources-panel table td:nth-child(4):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+/* A2A Agents Panel */
+
+/* Description and Owner column -  A2A Agents */
+#a2a-agents-panel table td:nth-child(2) /* Name */ {
+    min-width: 150px !important;
+    max-width: 150px !important;
+    text-wrap: inherit !important;
+}
+
+#a2a-agents-panel table td:nth-child(4) /* Endpoint */ {
+    min-width: 150px !important;
+    max-width: 200px !important;  /* Slightly wider for URLs */
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+/* Show full URL on hover - A2A Agents Endpoint column */
+#a2a-agents-panel table td:nth-child(4):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 150px !important;
+    max-width: 200px !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+.dark #a2a-agents-panel table td:nth-child(4):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+#a2a-agents-panel table thead th:first-child, /* ID */
+#a2a-agents-panel table tbody td:first-child {
+    display: none !important;
+}
+
+#a2a-agents-panel table td:nth-child(3) /* Description */
+{
+    max-width: 200px !important;
+    max-height: 100px !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: 4 !important;
+    text-overflow: ellipsis !important;
+}
+
+
+/* Show full description on hover as tooltip -  A2A Agents */
+
+#a2a-agents-panel table td:nth-child(3):hover {
+    position: relative !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    min-width: 200px !important;
+    max-height: none !important;  /* Remove height limit */
+    display: block !important;     /* Remove webkit-box display */
+    -webkit-line-clamp: unset !important;  /* Remove line clamp */
+    -webkit-box-orient: unset !important;  /* Remove box orientation */
+    z-index: 100;
+    background: rgb(255 255 255) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%) !important;
+    padding: 0.75rem !important;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(229 231 235);
+    left: auto;
+    top: auto;
+}
+
+
+.dark #a2a-agents-panel table td:nth-child(3):hover {
+    background: rgb(31 41 55) !important;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 40%) !important;
+    border-color: rgb(55 65 81);
+    color: rgb(243 244 246) !important;
+}
+
+
+/* Specific URL styling for better readability */
+table td a[href^="http"],
+table td a[href^="https"] {
+    display: inline-block;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: rgb(107 114 128);
+    font-size: 0.875rem;
+}
+
+.dark table td a[href^="http"],
+.dark table td a[href^="https"] {
+    color: rgb(156 163 175);
+}
+
+/* Description column */
+table td:nth-child(4),
+table td:nth-child(5) {
+    max-width: 300px !important;
+}
+
+/* Table row styling */
+table tbody tr {
+    border-bottom: 1px solid rgb(243 244 246);
+    transition: background-color 0.15s ease;
+}
+
+table tbody tr:hover {
+    background: rgb(249 250 251) !important;
+}
+
+.dark table tbody tr {
+    border-bottom-color: rgb(55 65 81);
+}
+
+.dark table tbody tr:hover {
+    background: rgb(31 41 55) !important;
+}
+
+/* ============================================
+   INPUT FIELD ENHANCEMENTS
+   ============================================ */
+
+/* Enhanced input styling */
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="url"],
+input[type="search"],
+textarea,
+select {
+    border: 2px solid rgb(229 231 235) !important;
+    border-radius: 0.75rem !important;
+    padding: 0.75rem 1rem !important;
+    background: white !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 4px rgb(0 0 0 / 3%) !important;
+}
+
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+input[type="url"]:focus,
+input[type="search"]:focus,
+textarea:focus,
+select:focus {
+    outline: none !important;
+    border-color: rgb(124 108 220) !important;
+    box-shadow: 0 0 0 3px rgb(124 108 220 / 10%), 0 2px 8px rgb(124 108 220 / 15%) !important;
+    background: rgb(250 248 255) !important;
+}
+
+.dark input[type="text"],
+.dark input[type="email"],
+.dark input[type="password"],
+.dark input[type="url"],
+.dark input[type="search"],
+.dark textarea,
+.dark select {
+    border-color: rgb(55 65 81) !important;
+    background: rgb(31 41 55) !important;
+    color: rgb(243 244 246) !important;
+}
+
+.dark input[type="text"]:focus,
+.dark input[type="email"]:focus,
+.dark input[type="password"]:focus,
+.dark input[type="url"]:focus,
+.dark input[type="search"]:focus,
+.dark textarea:focus,
+.dark select:focus {
+    border-color: rgb(139 92 246) !important;
+    background: rgb(30 27 75) !important;
+    box-shadow: 0 0 0 3px rgb(139 92 246 / 15%), 0 2px 8px rgb(139 92 246 / 20%) !important;
+}
+
+/* Search input specific styling */
+input[type="search"]::placeholder,
+input[type="text"]::placeholder {
+    color: rgb(156 163 175);
+    font-style: italic;
+}
+
+.dark input[type="search"]::placeholder,
+.dark input[type="text"]::placeholder {
+    color: rgb(107 114 128);
+}
+
+/* ============================================
+   BUTTON ENHANCEMENTS
+   ============================================ */
+
+/* Primary buttons (submit buttons only) */
+button[type="submit"],
+.bg-indigo-600 {
+    background: linear-gradient(135deg, rgb(124 108 220), rgb(139 116 230)) !important;
+    border: none !important;
+    border-radius: 0.75rem !important;
+    padding: 0.75rem 1.5rem !important;
+    font-weight: 600 !important;
+    box-shadow: 0 4px 12px rgb(124 108 220 / 30%) !important;
+    transition: all 0.2s ease !important;
+}
+
+button[type="submit"]:hover,
+.bg-indigo-600:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 16px rgb(124 108 220 / 40%) !important;
+}
+
+/* Action buttons - transparent with colored text */
+.text-blue-600,
+.text-blue-500,
+.text-indigo-600,
+button.text-blue-600,
+button.text-blue-500,
+button.text-indigo-600,
+a.text-blue-600,
+a.text-blue-500,
+a.text-indigo-600 {
+    background: transparent !important;
+    border: none !important;
+    /* padding: 0.375rem 0.75rem !important; */
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+
+.text-blue-600:hover,
+.text-blue-500:hover,
+.text-indigo-600:hover {
+    background: rgb(219 234 254 / 50%) !important;
+}
+
+.text-purple-600:hover {
+    background: rgba(124 108 220/30%) !important;
+}
+
+.text-green-600,
+.text-green-500,
+button.text-green-600,
+button.text-green-500,
+a.text-green-600,
+a.text-green-500 {
+    background: transparent !important;
+    border: none !important;
+    /* padding: 0.375rem 0.75rem !important; */
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+
+.text-green-600:hover,
+.text-green-500:hover {
+    background: rgb(220 252 231 / 50%) !important;
+}
+
+.text-orange-600,
+.text-orange-500,
+button.text-orange-600,
+button.text-orange-500,
+a.text-orange-600,
+a.text-orange-500 {
+    background: transparent !important;
+    border: none !important;
+    /* padding: 0.375rem 0.75rem !important; */
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+
+.text-orange-600:hover,
+.text-orange-500:hover {
+    background: rgb(254 243 199 / 50%) !important;
+}
+
+.text-yellow-600,
+.text-yellow-500,
+button.text-yellow-600,
+button.text-yellow-500,
+a.text-yellow-600,
+a.text-yellow-500 {
+    background: transparent !important;
+    border: none !important;
+    /* padding: 0.375rem 0.75rem !important; */
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+
+.text-yellow-600:hover,
+.text-yellow-500:hover {
+    background: rgb(254 249 195 / 50%) !important;
+}
+
+.text-red-600,
+.text-red-500,
+button.text-red-600,
+button.text-red-500,
+a.text-red-600,
+a.text-red-500 {
+    background: transparent !important;
+    border: none !important;
+    /* padding: 0.375rem 0.75rem !important; */
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    transition: all 0.15s ease !important;
+}
+
+.text-red-600:hover,
+.text-red-500:hover {
+    background: rgb(254 226 226 / 50%) !important;
+}
+
+/* Override submit button styles for action buttons (Deactivate, Delete, etc.) */
+form button[type="submit"].text-yellow-600,
+form button[type="submit"].text-yellow-500,
+button[type="submit"].text-yellow-600,
+button[type="submit"].text-yellow-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-red-600,
+form button[type="submit"].text-red-500,
+button[type="submit"].text-red-600,
+button[type="submit"].text-red-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-orange-600,
+form button[type="submit"].text-orange-500,
+button[type="submit"].text-orange-600,
+button[type="submit"].text-orange-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-green-600,
+form button[type="submit"].text-green-500,
+button[type="submit"].text-green-600,
+button[type="submit"].text-green-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+form button[type="submit"].text-blue-600,
+form button[type="submit"].text-blue-500,
+button[type="submit"].text-blue-600,
+button[type="submit"].text-blue-500 {
+    background: transparent !important;
+    border: none !important;
+    padding: 0.375rem 0.75rem !important;
+    box-shadow: none !important;
+}
+
+/* Remove purple/indigo backgrounds from action buttons */
+button[class*="bg-purple"],
+button[class*="bg-indigo"]:not([type="submit"]),
+a[class*="bg-purple"],
+a[class*="bg-indigo"] {
+    background: transparent !important;
+}
+
+form button:not([type="submit"]) {
+    background: transparent;
+    border: none !important;
+}
+
+/* Utility buttons (like "Clear Filter") */
+.border-gray-300 {
+    background: white !important;
+    border-radius: 0.5rem !important;
+    border: 1px solid rgb(229 231 235) !important;
+    padding: 0.5rem 1rem !important;
+    transition: all 0.2s ease !important;
+}
+
+.border-gray-300:hover {
+    background: rgb(249 250 251) !important;
+    border-color: rgb(124 108 220) !important;
+}
+
+button.inline-flex {
+    color: rgb(55 65 81) !important; /* Dark gray text */
+}
+
+/* Keep white text for submit buttons with inline-flex */
+button[type="submit"].inline-flex {
+    color: white !important;
+}
+
+/* ============================================
+   BADGE & TAG ENHANCEMENTS
+   ============================================ */
+
+/* Status badges */
+.bg-green-100 {
+    background: rgb(220 252 231) !important;
+    color: rgb(21 128 61) !important;
+    padding: 0.375rem 0.75rem !important;
+    border-radius: 0.5rem !important;
+    font-weight: 600 !important;
+}
+
+.bg-purple-100 {
+    background: rgb(243 232 255) !important;
+    color: rgb(107 33 168)!important;
+    padding: 0.375rem 0.75rem !important;
+    border-radius: 0.5rem !important;
+    font-weight: 600 !important;
+}
+
+
+.bg-yellow-100 {
+    background: rgb(254 249 195) !important;
+    color: rgb(161 98 7) !important;
+    padding: 0.375rem 0.75rem !important;
+    border-radius: 0.5rem !important;
+    font-weight: 600 !important;
+}
+
+.bg-red-100 {
+    background: rgb(254 226 226) !important;
+    color: rgb(185 28 28) !important;
+    padding: 0.375rem 0.75rem !important;
+    border-radius: 0.5rem !important;
+    font-weight: 600 !important;
+}
+
+/* Tag badges */
+.bg-blue-100 {
+    background: rgb(219 234 254) !important;
+    color: rgb(30 64 175) !important;
+    padding: 0.375rem 0.75rem !important;
+    border-radius: 0.5rem !important;
+    font-weight: 500 !important;
+    font-size: 0.75rem !important;
+}
+
+.dark .bg-green-100 {
+    background: rgb(21 128 61 / 20%) !important;
+    color: rgb(134 239 172) !important;
+}
+
+.dark .bg-yellow-100 {
+    background: rgb(161 98 7 / 20%) !important;
+    color: rgb(253 224 71) !important;
+}
+
+.dark .bg-blue-100 {
+    background: rgb(30 64 175 / 20%) !important;
+    color: rgb(147 197 253) !important;
+}
+
 /* CSS for Header Bar */
 #sticky-header {
   transform: translateZ(0);
@@ -992,18 +1864,184 @@
 
 
 /* ============================================
+   UPTIMIZE BRANDING STYLES
+   ============================================ */
+
+/* MCP Gateway Control Center text - hides on scroll */
+.header-control-center {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    color: rgb(124 108 220);
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+    transition: opacity 0.28s ease, transform 0.28s ease, height 0.28s ease;
+    opacity: 1;
+    transform: translateY(0);
+    height: auto;
+}
+
+#sticky-header.compact .header-control-center {
+    opacity: 0;
+    transform: translateY(-8px);
+    height: 0;
+    margin-bottom: 0;
+    pointer-events: none;
+}
+
+.dark .header-control-center {
+    color: rgb(167 154 235);
+}
+
+/* Logo and title container */
+.header-brand-container {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.header-logo {
+    height: auto;
+    width: 10rem;
+    transition: height 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+#sticky-header.compact .header-logo {
+    height: 2rem;
+}
+
+/* Header background styling - Card-based design */
+#sticky-header {
+    background: white;
+    border-radius: 1.5rem;
+    box-shadow: 0 4px 20px rgb(124 108 220 / 15%);
+    margin: 1rem 0 0.75rem 0;
+}
+
+#sticky-header.compact {
+    background: rgb(255 255 255 / 98%);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 6px 24px rgb(124 108 220 / 18%);
+    margin: 0.5rem 0 1rem 0;
+}
+
+.dark #sticky-header {
+    background: rgb(31 41 55);
+    box-shadow: 0 4px 20px rgb(0 0 0 / 30%);
+}
+
+.dark #sticky-header.compact {
+    background: rgb(31 41 55 / 98%);
+    box-shadow: 0 6px 24px rgb(0 0 0 / 35%);
+}
+
+/* ============================================
+   PILL-SHAPED TAB NAVIGATION
+   ============================================ */
+
+/* Tab navigation card container */
+.border-b.border-gray-200:has(nav) {
+    background: rgb(255 255 255 / 85%);
+    backdrop-filter: blur(20px) saturate(180%);
+    border-radius: 2rem;
+    box-shadow: 0 4px 20px rgb(124 108 220 / 12%), inset 0 1px 0 rgb(255 255 255 / 80%);
+    padding: 0.75rem 1.25rem;
+    margin-top: 0.5rem;
+    margin-bottom: 1.5rem;
+    border: 1px solid rgb(255 255 255 / 60%);
+    border-bottom: none !important;
+}
+
+.dark .border-b.border-gray-200:has(nav) {
+    background: rgb(31 41 55 / 70%);
+    backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 20px rgb(0 0 0 / 25%), inset 0 1px 0 rgb(255 255 255 / 10%);
+    border: 1px solid rgb(255 255 255 / 10%);
+}
+
+/* Override default tab styles for pill design */
+.tab-link {
+    border: none !important;
+    border-radius: 2rem !important;
+    padding: 0.65rem 1.5rem !important;
+    margin: 0 0.25rem;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    background: transparent;
+    font-weight: 500;
+    font-size: 0.875rem !important;
+    position: relative;
+    overflow: hidden;
+}
+
+.tab-link:hover {
+    background: rgb(240 237 255 / 60%);
+    backdrop-filter: blur(10px);
+    transform: translateY(-1px) scale(1.02);
+    box-shadow: 0 2px 8px rgb(124 108 220 / 15%);
+}
+
+.dark .tab-link:hover {
+    background: rgb(99 102 241 / 25%);
+    backdrop-filter: blur(10px);
+}
+
+/* Active tab - purple pill with glassmorphic effect */
+.tab-link.border-indigo-500 {
+    background: linear-gradient(135deg, rgb(124 108 220 / 90%), rgb(139 116 230 / 85%)) !important;
+    backdrop-filter: blur(16px) saturate(180%);
+    color: white !important;
+    font-weight: 600;
+    box-shadow:
+        0 4px 16px rgb(124 108 220 / 40%),
+        0 2px 8px rgb(124 108 220 / 30%),
+        inset 0 1px 0 rgb(255 255 255 / 20%);
+    border: 1px solid rgb(255 255 255 / 20%) !important;
+    border-radius: 2rem !important;
+}
+
+.tab-link.border-indigo-500:hover {
+    background: linear-gradient(135deg, rgb(124 108 220 / 95%), rgb(139 116 230 / 90%)) !important;
+    transform: translateY(-2px) scale(1.02);
+    box-shadow:
+        0 6px 20px rgb(124 108 220 / 50%),
+        0 3px 10px rgb(124 108 220 / 35%),
+        inset 0 1px 0 rgb(255 255 255 / 25%);
+    border-radius: 2rem !important;
+}
+
+/* Inactive tabs */
+.tab-link.border-transparent {
+    background: rgb(255 255 255 / 30%);
+    backdrop-filter: blur(8px);
+    color: rgb(107 114 128);
+    border: 1px solid rgb(0 0 0 / 5%) !important;
+    border-radius: 2rem !important;
+}
+
+.dark .tab-link.border-transparent {
+    background: rgb(55 65 81 / 20%);
+    backdrop-filter: blur(8px);
+    color: rgb(156 163 175);
+    border: 1px solid rgb(255 255 255 / 5%) !important;
+    border-radius: 2rem !important;
+}
+
+/* ============================================
    RESPONSIVE TABS
    ============================================ */
 
 /* Tab navigation container - prevent horizontal overflow */
 nav[class*="-mb-px"] {
-    overflow: auto hidden;
+    /* overflow: auto hidden; */
     scrollbar-width: thin;
     scrollbar-color: rgb(156 163 175 / 50%) transparent;
     -webkit-overflow-scrolling: touch;
 
     /* Ensure tabs don't wrap */
     flex-wrap: nowrap;
+
+    /* Center align all tabs */
+    justify-content: center;
 }
 
 /* Hide scrollbar on webkit browsers for cleaner look */
