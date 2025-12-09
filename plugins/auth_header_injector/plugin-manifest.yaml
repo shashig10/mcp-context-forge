@@ -1,0 +1,10 @@
+description: "Injects authentication headers for HTTP requests to specific URL paths."
+author: "ContextForge"
+version: "0.1.0"
+tags: ["authentication", "http", "headers", "middleware"]
+available_hooks:
+  - "http_pre_request"
+default_config:
+  url_path_patterns: []
+  headers: {}
+  case_sensitive: false
