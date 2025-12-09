@@ -58,18 +58,18 @@ NAMESPACE_GSI_NAME = "namespace-index"
 
 table = dynamodb.Table(TABLE_NAME)
 
-# class PathHeaderMapping(BaseModel):
-#     """Configuration for a URL path pattern and its associated headers.
+class PathHeaderMapping(BaseModel):
+    """Configuration for a URL path pattern and its associated headers.
 
-#     Attributes:
-#         pattern: URL path pattern (supports wildcards * and regex).
-#         headers: Dictionary of headers to inject for matching paths.
-#         description: Optional description of this mapping.
-#     """
+    Attributes:
+        pattern: URL path pattern (supports wildcards * and regex).
+        headers: Dictionary of headers to inject for matching paths.
+        description: Optional description of this mapping.
+    """
 
-#     pattern: str = Field(..., description="URL path pattern (supports wildcards * and regex)")
-#     headers: Dict[str, str] = Field(default_factory=dict, description="Headers to inject")
-#     description: str | None = Field(None, description="Optional description")
+    pattern: str = Field(..., description="URL path pattern (supports wildcards * and regex)")
+    headers: Dict[str, str] = Field(default_factory=dict, description="Headers to inject")
+    description: str | None = Field(None, description="Optional description")
 
 
 class AuthHeaderInjectorConfig(BaseModel):
