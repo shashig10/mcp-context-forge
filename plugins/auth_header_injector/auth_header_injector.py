@@ -24,8 +24,10 @@ Hook: http_pre_request
 from __future__ import annotations
 
 # Standard
+import asyncio
 import logging
 import re
+import time
 from typing import Dict
 
 # Third-Party
@@ -46,30 +48,31 @@ from typing import Optional, Dict, List
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
-
-dynamodb = boto3.resource("dynamodb", region_name="eu-central-1")
 TABLE_NAME = "agentcore"
 NAMESPACE_GSI_NAME = "namespace-index"
+DYNAMODB_REGION = "eu-central-1"
 
+# Initialize DynamoDB resource (reused across requests)
+dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
 table = dynamodb.Table(TABLE_NAME)
 
-# class PathHeaderMapping(BaseModel):
-#     """Configuration for a URL path pattern and its associated headers.
+class PathHeaderMapping(BaseModel):
+    """Configuration for a URL path pattern and its associated headers.
 
-#     Attributes:
-#         pattern: URL path pattern (supports wildcards * and regex).
-#         headers: Dictionary of headers to inject for matching paths.
-#         description: Optional description of this mapping.
-#     """
+    Attributes:
+        pattern: URL path pattern (supports wildcards * and regex).
+        headers: Dictionary of headers to inject for matching paths.
+        description: Optional description of this mapping.
+    """
 
-#     pattern: str = Field(..., description="URL path pattern (supports wildcards * and regex)")
-#     headers: Dict[str, str] = Field(default_factory=dict, description="Headers to inject")
-#     description: str | None = Field(None, description="Optional description")
+    pattern: str = Field(..., description="URL path pattern (supports wildcards * and regex)")
+    headers: Dict[str, str] = Field(default_factory=dict, description="Headers to inject")
+    description: str | None = Field(None, description="Optional description")
 
 
 class AuthHeaderInjectorConfig(BaseModel):
@@ -79,6 +82,8 @@ class AuthHeaderInjectorConfig(BaseModel):
         url_path_patterns: List of path patterns with their associated headers.
         headers: Global headers to inject for all requests (optional).
         case_sensitive: Whether URL path matching should be case-sensitive.
+        bearer_token_ttl_seconds: TTL for bearer token cache in seconds (default: 3000 = 50 minutes).
+        namespace_ttl_seconds: TTL for namespace record cache in seconds (default: 600 = 10 minutes).
     """
 
     url_path_patterns: list[PathHeaderMapping] = Field(
@@ -86,14 +91,24 @@ class AuthHeaderInjectorConfig(BaseModel):
     )
     headers: Dict[str, str] = Field(default_factory=dict, description="Global headers for all requests")
     case_sensitive: bool = Field(default=False, description="Case-sensitive path matching")
+    bearer_token_ttl_seconds: float = Field(
+        default=3000.0,
+        description="TTL for bearer token cache in seconds (default: 3000 = 50 minutes)",
+        gt=0
+    )
+    namespace_ttl_seconds: float = Field(
+        default=600.0,
+        description="TTL for namespace record cache in seconds (default: 600 = 10 minutes)",
+        gt=0
+    )
 
-def get_record_by_namespace(
+def _get_record_by_namespace_sync(
     namespace: str,
     active_only: bool = False,
 ) -> Optional[Dict]:
     """
-    Retrieve the first record matching the provided namespace via the GSI.
-
+    Synchronous helper to retrieve record by namespace.
+    
     Args:
         namespace: The namespace string to search for.
         active_only: If True, only return "active" items
@@ -131,8 +146,26 @@ def get_record_by_namespace(
         }
 
     except ClientError as e:
-        print(f"Error getting record by namespace: {e}")
+        logger.error(f"Error getting record by namespace: {e}")
         raise
+
+
+async def get_record_by_namespace(
+    namespace: str,
+    active_only: bool = False,
+) -> Optional[Dict]:
+    """
+    Async wrapper to retrieve the first record matching the provided namespace via the GSI.
+
+    Args:
+        namespace: The namespace string to search for.
+        active_only: If True, only return "active" items
+                     (is_active is True or not set).
+
+    Returns:
+        A normalized dict representing the record, or None if not found.
+    """
+    return await asyncio.to_thread(_get_record_by_namespace_sync, namespace, active_only)
 
 class AuthHeaderInjectorPlugin(Plugin):
     """Plugin that injects authentication headers based on URL path patterns.
@@ -164,9 +197,19 @@ class AuthHeaderInjectorPlugin(Plugin):
             compiled = re.compile(pattern_str, flags)
             self._compiled_patterns.append((compiled, mapping.headers, mapping.description))
 
+        # Initialize caches for bearer tokens and namespace records
+        # Cache structure: {key: (value, expiry_timestamp)}
+        self._bearer_token_cache: Dict[str, tuple[str, float]] = {}
+        self._namespace_cache: Dict[str, tuple[Dict, float]] = {}
+        
+        # Cache TTL in seconds from configuration
+        self._bearer_token_ttl: float = self._cfg.bearer_token_ttl_seconds
+        self._namespace_ttl: float = self._cfg.namespace_ttl_seconds
+
         logger.error(
-            f"AuthHeaderInjectorPlugin initialized with {len(self._compiled_patterns)} path patterns "
-            f"and {len(self._cfg.headers)} global headers"
+            f"AuthHeaderInjectorPlugin initialized with {len(self._compiled_patterns)} path patterns, "
+            f"{len(self._cfg.headers)} global headers, "
+            f"bearer_token_ttl={self._bearer_token_ttl}s, namespace_ttl={self._namespace_ttl}s"
         )
 
     def _matches_pattern(self, path: str) -> list[tuple[Dict[str, str], str | None]]:
@@ -198,22 +241,41 @@ class AuthHeaderInjectorPlugin(Plugin):
         runtime = parts[-2]
         return runtime
 
-    def get_bearer_token(self, uid: str) -> str:
+    async def get_bearer_token(self, uid: str) -> str:
         """
-        Retrieve bearer token for the given UID.
+        Retrieve bearer token for the given UID with caching.
 
         Args:
             uid: The UID to get the bearer token for.
         Returns:
             The bearer token as a string.
         """
+        current_time = time.time()
+        
+        # Check cache first
+        if uid in self._bearer_token_cache:
+            cached_token, expiry = self._bearer_token_cache[uid]
+            if current_time < expiry:
+                logger.error(f"Using cached bearer token for uid: {uid}")
+                return cached_token
+            else:
+                logger.error(f"Bearer token cache expired for uid: {uid}")
+        
+        # Fetch new token
         BASE_URL = "https://api.nlp.dev.uptimize.merckgroup.com"
-
-        headers = {"api-key": uid,
-                    "content-type": "application/json"}
-        response = requests.post(f"{BASE_URL}/aws/runtime/bearer", headers=headers)
-
-        return response.json()["AccessToken"]
+        headers = {"api-key": uid, "content-type": "application/json"}
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{BASE_URL}/aws/runtime/bearer", headers=headers)
+            response.raise_for_status()
+            token = response.json()["AccessToken"]
+        
+        # Cache the token with expiry
+        expiry_time = current_time + self._bearer_token_ttl
+        self._bearer_token_cache[uid] = (token, expiry_time)
+        logger.error(f"Cached bearer token for uid: {uid}, expires at: {expiry_time}")
+        
+        return token
 
 
 
@@ -237,20 +299,33 @@ class AuthHeaderInjectorPlugin(Plugin):
 
         headers: dict[str, str] = payload.headers.model_dump() if payload.headers else {}
 
-
         URL = context.dict().get("global_context").get("metadata").get("tool").get("url")
 
         runtime = self.extract_nameSpace(str(URL))
+        namespace = runtime.split("-")[0]
+        
+        # Check namespace cache first
+        current_time = time.time()
+        if namespace in self._namespace_cache:
+            cached_record, expiry = self._namespace_cache[namespace]
+            if current_time < expiry:
+                logger.debug(f"Using cached namespace record for: {namespace}")
+                record = cached_record
+            else:
+                logger.debug(f"Namespace cache expired for: {namespace}")
+                record = await get_record_by_namespace(namespace)
+                self._namespace_cache[namespace] = (record, current_time + self._namespace_ttl)
+        else:
+            record = await get_record_by_namespace(namespace)
+            self._namespace_cache[namespace] = (record, current_time + self._namespace_ttl)
+        
+        uid = record.get("uid")
 
-        uid = get_record_by_namespace(runtime.split("-")[0]).get("uid")
-
-        bearer_token = self.get_bearer_token(uid)
+        bearer_token = await self.get_bearer_token(uid)
 
         # logger.error(f"AuthHeaderInjectorPlugin tool_pre_invoke fetched bearer token - {bearer_token}")
 
-
-        headers[
-            "Authorization"] = f"Bearer {bearer_token}"
+        headers["Authorization"] = f"Bearer {bearer_token}"
 
         payload.headers = HttpHeaderPayload(root=headers)
 

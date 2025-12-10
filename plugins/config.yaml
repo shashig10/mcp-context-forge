@@ -34,3 +34,7 @@ plugins:
 
      # Case-sensitive path matching (default: false)
      case_sensitive: false
+     
+     # Cache TTL configuration (in seconds)
+     # bearer_token_ttl_seconds: 3000  # 50 minutes (default)
+     # namespace_ttl_seconds: 600      # 10 minutes (default)
