@@ -12796,7 +12796,16 @@ function generateConfig(server, configType) {
         window.location.port ||
         (window.location.protocol === "https:" ? "443" : "80");
     const protocol = window.location.protocol;
-    const baseUrl = `${protocol}//${currentHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}`;
+    const currentURL = new URL(window.location.href);
+    // Take first path after the base url from current URL
+    const pathSegments = currentURL.pathname.split("/").filter(Boolean);
+    let baseUrl = "";
+    if (pathSegments.length > 0) {
+        baseUrl = `${protocol}//${currentHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}/${pathSegments[0]}`;
+    }
+    else {
+        baseUrl = `${protocol}//${currentHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}`;
+    }
 
     // Clean server name for use as config key (alphanumeric and hyphens only)
     const cleanServerName = server.name
