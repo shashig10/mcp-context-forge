@@ -337,7 +337,7 @@ table thead th {
 
 /* Description and Owner column - Resources Panel */
 #resources-panel table td:nth-child(2), /* URI */
-#resources-panel table td:nth-child(7), /* Owner */ 
+#resources-panel table td:nth-child(7), /* Owner */
 #resources-panel table td:nth-child(8) /* Team */{
     max-width: 200px !important;
     max-height: 160px !important;
@@ -359,7 +359,7 @@ table thead th {
     text-overflow: ellipsis !important;
 }
 
-#resources-panel table td:nth-child(2), /* URI */ 
+#resources-panel table td:nth-child(2), /* URI */
 #resources-panel table td:nth-child(7) /* Owner */ {
 /* #resources-panel table td:nth-child(8) Team{ */
     min-width: 125px !important;
@@ -922,6 +922,94 @@ button[type="submit"].inline-flex {
     transform 0.28s cubic-bezier(0.2, 0.9, 0.3, 1),
     opacity 0.28s ease,
     padding 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* Tab panel base styles */
+.tab-panel {
+  /* Panels handle their own internal padding */
+}
+
+/* Sidebar navigation */
+.sidebar-nav {
+  position: relative;
+  z-index: 50;
+  flex-shrink: 0;
+}
+
+/* Sidebar scrollbar */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(156 163 175 / 40%) transparent;
+}
+
+/* Sidebar link styling */
+.sidebar-link {
+  color: rgb(107 114 128);
+  text-decoration: none;
+  margin-left: 0.25rem;
+  margin-right: 0.25rem;
+}
+
+.sidebar-link:hover {
+  background-color: rgb(243 244 246);
+  color: rgb(17 24 39);
+}
+
+.dark .sidebar-link {
+  color: rgb(156 163 175);
+}
+
+.dark .sidebar-link:hover {
+  background-color: rgb(55 65 81);
+  color: rgb(243 244 246);
+}
+
+/* Active sidebar link */
+.sidebar-link.active {
+  background-color: rgb(238 242 255);
+  color: rgb(79 70 229);
+  font-weight: 600;
+}
+
+.dark .sidebar-link.active {
+  background-color: rgb(49 46 129 / 40%);
+  color: rgb(165 180 252);
+}
+
+/* Sidebar section headers */
+.sidebar-section {
+  padding-top: 0.5rem;
+  padding-bottom: 0.25rem;
+}
+
+/* Mobile sidebar overlay */
+@media (width <= 1023px) {
+  .sidebar-nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    z-index: 60;
+    box-shadow: 4px 0 6px -1px rgb(0 0 0 / 10%);
+  }
+}
+
+/* CodeMirror code example styling (for LLM API Info) */
+.code-example {
+  display: none;
+}
+
+/* stylelint-disable-next-line selector-class-pattern -- third-party library class */
+.code-example + .CodeMirror {
+  border-radius: 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  position: relative;
+}
+
+/* stylelint-disable-next-line selector-class-pattern -- third-party library class */
+.code-example + .CodeMirror.cm-s-monokai {
+  background: #272822;
 }
 
 /* COMPACT state after scrolling: reduce height, hide subtitle, apply glass */

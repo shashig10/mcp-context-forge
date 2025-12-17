@@ -121,6 +121,35 @@ document.addEventListener("DOMContentLoaded", function () {
             setTimeout(initializeCACertUpload, 100);
         });
     }
+
+    // Initialize search functionality for all entity types
+    initializeSearchInputs();
+
+    // Re-initialize search inputs when HTMX content loads
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+        setTimeout(() => {
+            initializeSearchInputs();
+        }, 200);
+    });
+
+    // Also listen for htmx:load event
+    document.body.addEventListener("htmx:load", function (event) {
+        setTimeout(() => {
+            initializeSearchInputs();
+        }, 200);
+    });
+
+    // Initialize search when switching tabs
+    document.addEventListener("click", function (event) {
+        if (
+            event.target.matches('[onclick*="showTab"]') ||
+            event.target.closest('[onclick*="showTab"]')
+        ) {
+            setTimeout(() => {
+                initializeSearchInputs();
+            }, 300);
+        }
+    });
 });
 /**
  * ====================================================================
@@ -271,6 +300,8 @@ function validateInputName(name, type = "input") {
 /**
  * Extracts content from various formats with fallback
  */
+
+/**
 function extractContent(content, fallback = "") {
     if (typeof content === "object" && content !== null) {
         if (content.text !== undefined && content.text !== null) {
@@ -285,6 +316,7 @@ function extractContent(content, fallback = "") {
     }
     return String(content || fallback);
 }
+ */
 
 /**
  * SECURITY: Validate URL inputs
@@ -676,6 +708,8 @@ function closeModal(modalId, clearId = null) {
             cleanupToolTestModal(); // ADD THIS LINE
         } else if (modalId === "prompt-test-modal") {
             cleanupPromptTestModal();
+        } else if (modalId === "resource-test-modal") {
+            cleanupResourceTestModal();
         }
 
         modal.classList.add("hidden");
@@ -2028,7 +2062,7 @@ function createStandardPaginationControls(
         get hasPrev() { return this.currentPage > 1; },
         get startItem() { return Math.min((this.currentPage - 1) * this.perPage + 1, this.totalItems); },
         get endItem() { return Math.min(this.currentPage * this.perPage, this.totalItems); },
-        
+
         goToPage(page) {
             if (page >= 1 && page <= this.totalPages && page !== this.currentPage) {
                 this.currentPage = page;
@@ -2556,6 +2590,7 @@ async function editTool(toolId) {
         }
 
         const tool = await response.json();
+
         const isInactiveCheckedBool = isInactiveChecked("tools");
         let hiddenField = safeGetElement("edit-show-inactive");
         if (!hiddenField) {
@@ -2603,6 +2638,10 @@ async function editTool(toolId) {
             urlField.value = urlValidation.value;
         }
         if (descField) {
+            tool.description = tool.description.slice(
+                0,
+                tool.description.indexOf("*"),
+            );
             descField.value = tool.description || "";
         }
         if (typeField) {
@@ -2612,7 +2651,14 @@ async function editTool(toolId) {
         // Set tags field
         const tagsField = safeGetElement("edit-tool-tags");
         if (tagsField) {
-            tagsField.value = tool.tags ? tool.tags.join(", ") : "";
+            const rawTags = tool.tags
+                ? tool.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
         const teamId = new URL(window.location.href).searchParams.get(
@@ -3262,7 +3308,14 @@ async function editA2AAgent(agentId) {
         // Set tags field
         const tagsField = safeGetElement("a2a-agent-tags-edit");
         if (tagsField) {
-            tagsField.value = agent.tags ? agent.tags.join(", ") : "";
+            const rawTags = agent.tags
+                ? agent.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
         const teamId = new URL(window.location.href).searchParams.get(
@@ -3521,24 +3574,323 @@ function toggleA2AAuthFields(authType) {
     }
 }
 
-/**
- * SECURE: View Resource function with safe display
- */
-async function viewResource(resourceUri) {
+// -------------------- Resource Testing ------------------ //
+
+// ----- URI Template Parsing -------------- //
+function parseUriTemplate(template) {
+    const regex = /{([^}]+)}/g;
+    const fields = [];
+    let match;
+
+    while ((match = regex.exec(template)) !== null) {
+        fields.push(match[1]); // capture inside {}
+    }
+    return fields;
+}
+
+async function testResource(resourceId) {
     try {
-        console.log(`Viewing resource: ${resourceUri}`);
+        console.log(`Testing the resource: ${resourceId}`);
 
         const response = await fetchWithTimeout(
-            `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceUri)}`,
+            `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceId)}`,
         );
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            let errorDetail = "";
+            try {
+                const errorJson = await response.json();
+                errorDetail = errorJson.detail || "";
+            } catch (_) {}
+
+            throw new Error(
+                `HTTP ${response.status}: ${errorDetail || response.statusText}`,
+            );
         }
 
         const data = await response.json();
         const resource = data.resource;
-        const content = data.content;
+        //  console.log("Resource JSON:\n", JSON.stringify(resource, null, 2));
+        openResourceTestModal(resource);
+    } catch (error) {
+        console.error("Error fetching resource details:", error);
+        const errorMessage = handleFetchError(error, "load resource details");
+        showErrorMessage(errorMessage);
+    }
+}
+
+function openResourceTestModal(resource) {
+    const title = document.getElementById("resource-test-modal-title");
+    const fieldsContainer = document.getElementById(
+        "resource-test-form-fields",
+    );
+    const resultBox = document.getElementById("resource-test-result");
+
+    title.textContent = `Test Resource: ${resource.name}`;
+
+    fieldsContainer.innerHTML = "";
+    resultBox.textContent = "Fill the fields and click Invoke Resource";
+
+    // 1️⃣ Build form fields ONLY if uriTemplate exists
+    if (resource.uriTemplate) {
+        const fieldNames = parseUriTemplate(resource.uriTemplate);
+
+        fieldNames.forEach((name) => {
+            const div = document.createElement("div");
+            div.className = "space-y-1";
+
+            div.innerHTML = `
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    ${name}
+                </label>
+                <input type="text"
+                       id="resource-field-${name}"
+                       class="mt-1 px-2 py-1 block w-full rounded-md border border-gray-300 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-300"
+                />
+            `;
+
+            fieldsContainer.appendChild(div);
+        });
+    } else {
+        // 2️⃣ If no template → show a simple message
+        fieldsContainer.innerHTML = `
+            <div class="text-gray-500 dark:text-gray-400 italic">
+                This resource has no URI template.
+                Click "Invoke Resource" to test directly.
+            </div>
+        `;
+    }
+
+    window.CurrentResourceUnderTest = resource;
+    openModal("resource-test-modal");
+}
+
+async function runResourceTest() {
+    const resource = window.CurrentResourceUnderTest;
+    if (!resource) {
+        return;
+    }
+
+    let finalUri = "";
+
+    if (resource.uriTemplate) {
+        finalUri = resource.uriTemplate;
+
+        const fieldNames = parseUriTemplate(resource.uriTemplate);
+        fieldNames.forEach((name) => {
+            const value = document.getElementById(
+                `resource-field-${name}`,
+            ).value;
+            finalUri = finalUri.replace(`{${name}}`, encodeURIComponent(value));
+        });
+    } else {
+        finalUri = resource.uri; // direct test
+    }
+
+    console.log("Final URI:", finalUri);
+
+    const response = await fetchWithTimeout(
+        `${window.ROOT_PATH}/admin/resources/test/${encodeURIComponent(finalUri)}`,
+    );
+
+    const json = await response.json();
+
+    const resultBox = document.getElementById("resource-test-result");
+    resultBox.innerHTML = ""; // clear previous
+
+    const container = document.createElement("div");
+    resultBox.appendChild(container);
+
+    // Extract the content text (fallback if missing)
+    const content = json.content || {};
+    let contentStr = content.text || JSON.stringify(content, null, 2);
+
+    // Try to prettify JSON content
+    try {
+        const parsed = JSON.parse(contentStr);
+        contentStr = JSON.stringify(parsed, null, 2);
+    } catch (_) {}
+
+    // ---- Content Section (same as prompt tester) ----
+    const contentSection = document.createElement("div");
+    contentSection.className = "mt-4";
+
+    // Header
+    const contentHeader = document.createElement("div");
+    contentHeader.className =
+        "flex items-center justify-between cursor-pointer select-none p-2 bg-gray-200 dark:bg-gray-700 rounded";
+    contentSection.appendChild(contentHeader);
+
+    // Title
+    const contentTitle = document.createElement("strong");
+    contentTitle.textContent = "Content";
+    contentHeader.appendChild(contentTitle);
+
+    // Right controls (arrow/copy/fullscreen/download)
+    const headerRight = document.createElement("div");
+    headerRight.className = "flex items-center space-x-2";
+    contentHeader.appendChild(headerRight);
+
+    // Arrow icon
+    const toggleIcon = document.createElement("span");
+    toggleIcon.innerHTML = "▶";
+    toggleIcon.className = "transform transition-transform text-xs";
+    headerRight.appendChild(toggleIcon);
+
+    // Copy button
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy";
+    copyBtn.className =
+        "text-xs px-2 py-1 rounded bg-gray-300 dark:bg-gray-600 hover:bg-gray-400 dark:hover:bg-gray-500";
+    headerRight.appendChild(copyBtn);
+
+    // Fullscreen button
+    const fullscreenBtn = document.createElement("button");
+    fullscreenBtn.textContent = "Fullscreen";
+    fullscreenBtn.className =
+        "text-xs px-2 py-1 rounded bg-blue-300 dark:bg-blue-600 hover:bg-blue-400 dark:hover:bg-blue-500";
+    headerRight.appendChild(fullscreenBtn);
+
+    // Download button
+    const downloadBtn = document.createElement("button");
+    downloadBtn.textContent = "Download";
+    downloadBtn.className =
+        "text-xs px-2 py-1 rounded bg-green-300 dark:bg-green-600 hover:bg-green-400 dark:hover:bg-green-500";
+    headerRight.appendChild(downloadBtn);
+
+    // Collapsible body
+    const contentBody = document.createElement("div");
+    contentBody.className = "hidden mt-2";
+    contentSection.appendChild(contentBody);
+
+    // Pre block
+    const contentPre = document.createElement("pre");
+    contentPre.className =
+        "bg-gray-100 p-2 rounded overflow-auto max-h-80 dark:bg-gray-800 dark:text-gray-100 text-sm whitespace-pre-wrap";
+    contentPre.textContent = contentStr;
+    contentBody.appendChild(contentPre);
+
+    // Auto-collapse if too large
+    const lineCount = contentStr.split("\n").length;
+
+    if (lineCount > 30) {
+        contentBody.classList.add("hidden");
+        toggleIcon.style.transform = "rotate(0deg)";
+        contentTitle.textContent = "Content (Large - Click to expand)";
+    } else {
+        contentBody.classList.remove("hidden");
+        toggleIcon.style.transform = "rotate(90deg)";
+    }
+
+    // Toggle expand/collapse
+    contentHeader.onclick = () => {
+        contentBody.classList.toggle("hidden");
+        toggleIcon.style.transform = contentBody.classList.contains("hidden")
+            ? "rotate(0deg)"
+            : "rotate(90deg)";
+    };
+
+    // Copy button
+    copyBtn.onclick = (event) => {
+        event.stopPropagation();
+        navigator.clipboard.writeText(contentStr).then(() => {
+            copyBtn.textContent = "Copied!";
+            setTimeout(() => (copyBtn.textContent = "Copy"), 1200);
+        });
+    };
+
+    // Fullscreen mode
+    fullscreenBtn.onclick = (event) => {
+        event.stopPropagation();
+
+        const overlay = document.createElement("div");
+        overlay.className =
+            "fixed inset-0 bg-black bg-opacity-70 z-[9999] flex items-center justify-center p-4";
+
+        const box = document.createElement("div");
+        box.className =
+            "bg-white dark:bg-gray-900 rounded-lg w-full h-full p-4 overflow-auto";
+
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "Close";
+        closeBtn.className =
+            "text-xs px-3 py-1 mb-2 rounded bg-red-400 hover:bg-red-500 dark:bg-red-700 dark:hover:bg-red-600";
+
+        closeBtn.onclick = () => overlay.remove();
+
+        const fsPre = document.createElement("pre");
+        fsPre.className =
+            "bg-gray-100 p-4 rounded overflow-auto h-full dark:bg-gray-800 dark:text-gray-100 text-sm whitespace-pre-wrap";
+        fsPre.textContent = contentStr;
+
+        box.appendChild(closeBtn);
+        box.appendChild(fsPre);
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+    };
+
+    // Download
+    downloadBtn.onclick = (event) => {
+        event.stopPropagation();
+
+        let blob;
+        let filename;
+
+        // JSON?
+        try {
+            JSON.parse(contentStr);
+            blob = new Blob([contentStr], { type: "application/json" });
+            filename = "resource.json";
+        } catch (_) {
+            blob = new Blob([contentStr], { type: "text/plain" });
+            filename = "resource.txt";
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
+    container.appendChild(contentSection);
+
+    // resultBox.textContent = JSON.stringify(json, null, 2);
+}
+
+// -------------------- Resource Testing ------------------ //
+
+/**
+ * SECURE: View Resource function with safe display
+ */
+async function viewResource(resourceId) {
+    try {
+        console.log(`Viewing resource: ${resourceId}`);
+
+        const response = await fetchWithTimeout(
+            `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceId)}`,
+        );
+
+        if (!response.ok) {
+            let errorDetail = "";
+            try {
+                const errorJson = await response.json();
+                errorDetail = errorJson.detail || "";
+            } catch (_) {}
+
+            throw new Error(
+                `HTTP ${response.status}: ${errorDetail || response.statusText}`,
+            );
+        }
+
+        const data = await response.json();
+        const resource = data.resource;
+
+        // console.log("Resource JSON:\n", JSON.stringify(resource, null, 2));
+        // const content = data.content;
 
         const resourceDetailsDiv = safeGetElement("resource-details");
         if (resourceDetailsDiv) {
@@ -3593,39 +3945,41 @@ async function viewResource(resourceUri) {
             statusStrong.textContent = "Status: ";
             statusP.appendChild(statusStrong);
 
+            const isActive = resource.enabled === true;
             const statusSpan = document.createElement("span");
             statusSpan.className = `px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                resource.isActive
+                isActive
                     ? "bg-green-100 text-green-800"
                     : "bg-red-100 text-red-800"
             }`;
-            statusSpan.textContent = resource.isActive ? "Active" : "Inactive";
+            statusSpan.textContent = isActive ? "Active" : "Inactive";
+
             statusP.appendChild(statusSpan);
             container.appendChild(statusP);
 
             // Content display - safely handle different types
-            const contentDiv = document.createElement("div");
-            const contentStrong = document.createElement("strong");
-            contentStrong.textContent = "Content:";
-            contentDiv.appendChild(contentStrong);
+            // const contentDiv = document.createElement("div");
+            // const contentStrong = document.createElement("strong");
+            // contentStrong.textContent = "Content:";
+            // contentDiv.appendChild(contentStrong);
 
-            const contentPre = document.createElement("pre");
-            contentPre.className =
-                "mt-1 bg-gray-100 p-2 rounded overflow-auto max-h-80 dark:bg-gray-800 dark:text-gray-100";
+            // const contentPre = document.createElement("pre");
+            // contentPre.className =
+            //     "mt-1 bg-gray-100 p-2 rounded overflow-auto max-h-80 dark:bg-gray-800 dark:text-gray-100";
 
-            // Handle content display - extract actual content from object if needed
-            let contentStr = extractContent(
-                content,
-                resource.description || "No content available",
-            );
+            // // Handle content display - extract actual content from object if needed
+            // let contentStr = extractContent(
+            //     content,
+            //     resource.description || "No content available",
+            // );
 
-            if (!contentStr.trim()) {
-                contentStr = resource.description || "No content available";
-            }
+            // if (!contentStr.trim()) {
+            //     contentStr = resource.description || "No content available";
+            // }
 
-            contentPre.textContent = contentStr;
-            contentDiv.appendChild(contentPre);
-            container.appendChild(contentDiv);
+            // contentPre.textContent = contentStr;
+            // contentDiv.appendChild(contentPre);
+            // container.appendChild(contentDiv);
 
             // Metrics display
             if (resource.metrics) {
@@ -3799,21 +4153,29 @@ async function viewResource(resourceUri) {
 /**
  * SECURE: Edit Resource function with validation
  */
-async function editResource(resourceUri) {
+async function editResource(resourceId) {
     try {
-        console.log(`Editing resource: ${resourceUri}`);
+        console.log(`Editing resource: ${resourceId}`);
 
         const response = await fetchWithTimeout(
-            `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceUri)}`,
+            `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceId)}`,
         );
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            let errorDetail = "";
+            try {
+                const errorJson = await response.json();
+                errorDetail = errorJson.detail || "";
+            } catch (_) {}
+
+            throw new Error(
+                `HTTP ${response.status}: ${errorDetail || response.statusText}`,
+            );
         }
 
         const data = await response.json();
         const resource = data.resource;
-        const content = data.content;
+        // const content = data.content;
         // Ensure hidden inactive flag is preserved
         const isInactiveCheckedBool = isInactiveChecked("resources");
         let hiddenField = safeGetElement("edit-resource-show-inactive");
@@ -3861,7 +4223,7 @@ async function editResource(resourceUri) {
 
         // Set form action and populate fields with validation
         if (editForm) {
-            editForm.action = `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceUri)}/edit`;
+            editForm.action = `${window.ROOT_PATH}/admin/resources/${encodeURIComponent(resourceId)}/edit`;
         }
 
         // Validate inputs
@@ -3872,7 +4234,7 @@ async function editResource(resourceUri) {
         const nameField = safeGetElement("edit-resource-name");
         const descField = safeGetElement("edit-resource-description");
         const mimeField = safeGetElement("edit-resource-mime-type");
-        const contentField = safeGetElement("edit-resource-content");
+        // const contentField = safeGetElement("edit-resource-content");
 
         if (uriField && uriValidation.valid) {
             uriField.value = uriValidation.value;
@@ -3890,36 +4252,43 @@ async function editResource(resourceUri) {
         // Set tags field
         const tagsField = safeGetElement("edit-resource-tags");
         if (tagsField) {
-            tagsField.value = resource.tags ? resource.tags.join(", ") : "";
+            const rawTags = resource.tags
+                ? resource.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
-        if (contentField) {
-            let contentStr = extractContent(
-                content,
-                resource.description || "No content available",
-            );
+        // if (contentField) {
+        //     let contentStr = extractContent(
+        //         content,
+        //         resource.description || "No content available",
+        //     );
 
-            if (!contentStr.trim()) {
-                contentStr = resource.description || "No content available";
-            }
+        //     if (!contentStr.trim()) {
+        //         contentStr = resource.description || "No content available";
+        //     }
 
-            contentField.value = contentStr;
-        }
+        //     contentField.value = contentStr;
+        // }
 
-        // Update CodeMirror editor if it exists
-        if (window.editResourceContentEditor) {
-            let contentStr = extractContent(
-                content,
-                resource.description || "No content available",
-            );
+        // // Update CodeMirror editor if it exists
+        // if (window.editResourceContentEditor) {
+        //     let contentStr = extractContent(
+        //         content,
+        //         resource.description || "No content available",
+        //     );
 
-            if (!contentStr.trim()) {
-                contentStr = resource.description || "No content available";
-            }
+        //     if (!contentStr.trim()) {
+        //         contentStr = resource.description || "No content available";
+        //     }
 
-            window.editResourceContentEditor.setValue(contentStr);
-            window.editResourceContentEditor.refresh();
-        }
+        //     window.editResourceContentEditor.setValue(contentStr);
+        //     window.editResourceContentEditor.refresh();
+        // }
 
         openModal("resource-edit-modal");
 
@@ -3992,7 +4361,11 @@ async function viewPrompt(promptName) {
                     const tagSpan = document.createElement("span");
                     tagSpan.className =
                         "inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1 dark:bg-blue-900 dark:text-blue-200";
-                    tagSpan.textContent = tag;
+                    const raw =
+                        typeof tag === "object" && tag !== null
+                            ? tag.id || tag.label
+                            : tag;
+                    tagSpan.textContent = raw;
                     tagsP.appendChild(tagSpan);
                 });
             } else {
@@ -4302,7 +4675,14 @@ async function editPrompt(promptId) {
         // Set tags field
         const tagsField = safeGetElement("edit-prompt-tags");
         if (tagsField) {
-            tagsField.value = prompt.tags ? prompt.tags.join(", ") : "";
+            const rawTags = prompt.tags
+                ? prompt.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
         if (templateField) {
@@ -4611,7 +4991,14 @@ async function editGateway(gatewayId) {
         // Set tags field
         const tagsField = safeGetElement("edit-gateway-tags");
         if (tagsField) {
-            tagsField.value = gateway.tags ? gateway.tags.join(", ") : "";
+            const rawTags = gateway.tags
+                ? gateway.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
         const teamId = new URL(window.location.href).searchParams.get(
@@ -4969,7 +5356,11 @@ async function viewServer(serverId) {
                     const tagSpan = document.createElement("span");
                     tagSpan.className =
                         "inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1 dark:bg-blue-900 dark:text-blue-200";
-                    tagSpan.textContent = tag;
+                    const raw =
+                        typeof tag === "object" && tag !== null
+                            ? tag.id || tag.label
+                            : tag;
+                    tagSpan.textContent = raw;
                     tagsP.appendChild(tagSpan);
                 });
             } else {
@@ -5449,7 +5840,14 @@ async function editServer(serverId) {
         // Set tags field
         const tagsField = safeGetElement("edit-server-tags");
         if (tagsField) {
-            tagsField.value = server.tags ? server.tags.join(", ") : "";
+            const rawTags = server.tags
+                ? server.tags.map((tag) =>
+                      typeof tag === "object" && tag !== null
+                          ? tag.label || tag.id
+                          : tag,
+                  )
+                : [];
+            tagsField.value = rawTags.join(", ");
         }
 
         // Set icon field
@@ -5493,8 +5891,20 @@ async function editServer(serverId) {
         }
 
         openModal("server-edit-modal");
+        // Initialize the select handlers for gateways, resources and prompts in the edit modal
+        // so that gateway changes will trigger filtering of associated items while editing.
+        if (document.getElementById("associatedEditGateways")) {
+            initGatewaySelect(
+                "associatedEditGateways",
+                "selectedEditGatewayPills",
+                "selectedEditGatewayWarning",
+                12,
+                "selectAllEditGatewayBtn",
+                "clearAllEditGatewayBtn",
+                "searchEditGateways",
+            );
+        }
 
-        // Initialize the select handlers for resources and prompts in the edit modal
         initResourceSelect(
             "edit-server-resources",
             "selectedEditResourcesPills",
@@ -5520,10 +5930,14 @@ async function editServer(serverId) {
 
         // Set associated items after modal is opened
         setTimeout(() => {
-            // Set associated tools checkboxes
-            const toolCheckboxes = document.querySelectorAll(
-                'input[name="associatedTools"]',
-            );
+            // Set associated tools checkboxes (scope to edit modal container only)
+            const editToolContainer =
+                document.getElementById("edit-server-tools");
+            const toolCheckboxes = editToolContainer
+                ? editToolContainer.querySelectorAll(
+                      'input[name="associatedTools"]',
+                  )
+                : document.querySelectorAll('input[name="associatedTools"]');
 
             toolCheckboxes.forEach((checkbox) => {
                 let isChecked = false;
@@ -5539,26 +5953,38 @@ async function editServer(serverId) {
                 checkbox.checked = isChecked;
             });
 
-            // Set associated resources checkboxes
-            const resourceCheckboxes = document.querySelectorAll(
-                'input[name="associatedResources"]',
+            // Set associated resources checkboxes (scope to edit modal container only)
+            const editResourceContainer = document.getElementById(
+                "edit-server-resources",
             );
+            const resourceCheckboxes = editResourceContainer
+                ? editResourceContainer.querySelectorAll(
+                      'input[name="associatedResources"]',
+                  )
+                : document.querySelectorAll(
+                      'input[name="associatedResources"]',
+                  );
 
             resourceCheckboxes.forEach((checkbox) => {
-                const checkboxValue = parseInt(checkbox.value);
+                const checkboxValue = checkbox.value;
                 const isChecked =
                     server.associatedResources &&
                     server.associatedResources.includes(checkboxValue);
                 checkbox.checked = isChecked;
             });
 
-            // Set associated prompts checkboxes
-            const promptCheckboxes = document.querySelectorAll(
-                'input[name="associatedPrompts"]',
+            // Set associated prompts checkboxes (scope to edit modal container only)
+            const editPromptContainer = document.getElementById(
+                "edit-server-prompts",
             );
+            const promptCheckboxes = editPromptContainer
+                ? editPromptContainer.querySelectorAll(
+                      'input[name="associatedPrompts"]',
+                  )
+                : document.querySelectorAll('input[name="associatedPrompts"]');
 
             promptCheckboxes.forEach((checkbox) => {
-                const checkboxValue = parseInt(checkbox.value);
+                const checkboxValue = checkbox.value;
                 const isChecked =
                     server.associatedPrompts &&
                     server.associatedPrompts.includes(checkboxValue);
@@ -5627,10 +6053,11 @@ async function editServer(serverId) {
 
 // Helper function to set edit server associations
 function setEditServerAssociations(server) {
-    // Set associated tools checkboxes
-    const toolCheckboxes = document.querySelectorAll(
-        'input[name="associatedTools"]',
-    );
+    // Set associated tools checkboxes (scope to edit modal container only)
+    const toolContainer = document.getElementById("edit-server-tools");
+    const toolCheckboxes = toolContainer
+        ? toolContainer.querySelectorAll('input[name="associatedTools"]')
+        : document.querySelectorAll('input[name="associatedTools"]');
 
     if (toolCheckboxes.length === 0) {
         return;
@@ -5649,26 +6076,30 @@ function setEditServerAssociations(server) {
         checkbox.checked = isChecked;
     });
 
-    // Set associated resources checkboxes
-    const resourceCheckboxes = document.querySelectorAll(
-        'input[name="associatedResources"]',
-    );
+    // Set associated resources checkboxes (scope to edit modal container only)
+    const resourceContainer = document.getElementById("edit-server-resources");
+    const resourceCheckboxes = resourceContainer
+        ? resourceContainer.querySelectorAll(
+              'input[name="associatedResources"]',
+          )
+        : document.querySelectorAll('input[name="associatedResources"]');
 
     resourceCheckboxes.forEach((checkbox) => {
-        const checkboxValue = parseInt(checkbox.value);
+        const checkboxValue = checkbox.value;
         const isChecked =
             server.associatedResources &&
             server.associatedResources.includes(checkboxValue);
         checkbox.checked = isChecked;
     });
 
-    // Set associated prompts checkboxes
-    const promptCheckboxes = document.querySelectorAll(
-        'input[name="associatedPrompts"]',
-    );
+    // Set associated prompts checkboxes (scope to edit modal container only)
+    const promptContainer = document.getElementById("edit-server-prompts");
+    const promptCheckboxes = promptContainer
+        ? promptContainer.querySelectorAll('input[name="associatedPrompts"]')
+        : document.querySelectorAll('input[name="associatedPrompts"]');
 
     promptCheckboxes.forEach((checkbox) => {
-        const checkboxValue = parseInt(checkbox.value);
+        const checkboxValue = checkbox.value;
         const isChecked =
             server.associatedPrompts &&
             server.associatedPrompts.includes(checkboxValue);
@@ -5854,6 +6285,38 @@ if (window.htmx && !window._toolsHtmxHandlerAttached) {
                             container.dispatchEvent(event);
                         }
                     }
+                    // If we're in the Add Server tools container, restore persisted selections
+                    else if (container.id === "associatedTools") {
+                        try {
+                            const dataAttr = container.getAttribute(
+                                "data-selected-tools",
+                            );
+                            if (dataAttr) {
+                                const selectedIds = JSON.parse(dataAttr);
+                                if (
+                                    Array.isArray(selectedIds) &&
+                                    selectedIds.length > 0
+                                ) {
+                                    newCheckboxes.forEach((cb) => {
+                                        if (selectedIds.includes(cb.value)) {
+                                            cb.checked = true;
+                                        }
+                                        cb.removeAttribute("data-auto-check");
+                                    });
+
+                                    const event = new Event("change", {
+                                        bubbles: true,
+                                    });
+                                    container.dispatchEvent(event);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn(
+                                "Error restoring associatedTools selections:",
+                                e,
+                            );
+                        }
+                    }
                 }
             }, 10); // Small delay to ensure DOM is updated
         }
@@ -5935,7 +6398,7 @@ if (window.htmx && !window._resourcesHtmxHandlerAttached) {
                         try {
                             const associatedResourceIds = JSON.parse(dataAttr);
                             newCheckboxes.forEach((cb) => {
-                                const checkboxValue = parseInt(cb.value);
+                                const checkboxValue = cb.value;
                                 if (
                                     associatedResourceIds.includes(
                                         checkboxValue,
@@ -5955,6 +6418,39 @@ if (window.htmx && !window._resourcesHtmxHandlerAttached) {
                         } catch (e) {
                             console.error(
                                 "Error parsing data-server-resources:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // If we're in the Add Server resources container, restore persisted selections
+                    else if (container.id === "associatedResources") {
+                        try {
+                            const dataAttr = container.getAttribute(
+                                "data-selected-resources",
+                            );
+                            if (dataAttr) {
+                                const selectedIds = JSON.parse(dataAttr);
+                                if (
+                                    Array.isArray(selectedIds) &&
+                                    selectedIds.length > 0
+                                ) {
+                                    newCheckboxes.forEach((cb) => {
+                                        if (selectedIds.includes(cb.value)) {
+                                            cb.checked = true;
+                                        }
+                                        cb.removeAttribute("data-auto-check");
+                                    });
+
+                                    const event = new Event("change", {
+                                        bubbles: true,
+                                    });
+                                    container.dispatchEvent(event);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn(
+                                "Error restoring associatedResources selections:",
                                 e,
                             );
                         }
@@ -6039,7 +6535,7 @@ if (window.htmx && !window._promptsHtmxHandlerAttached) {
                         try {
                             const associatedPromptIds = JSON.parse(dataAttr);
                             newCheckboxes.forEach((cb) => {
-                                const checkboxValue = parseInt(cb.value);
+                                const checkboxValue = cb.value;
                                 if (
                                     associatedPromptIds.includes(checkboxValue)
                                 ) {
@@ -6057,6 +6553,39 @@ if (window.htmx && !window._promptsHtmxHandlerAttached) {
                         } catch (e) {
                             console.error(
                                 "Error parsing data-server-prompts:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // If we're in the Add Server prompts container, restore persisted selections
+                    else if (container.id === "associatedPrompts") {
+                        try {
+                            const dataAttr = container.getAttribute(
+                                "data-selected-prompts",
+                            );
+                            if (dataAttr) {
+                                const selectedIds = JSON.parse(dataAttr);
+                                if (
+                                    Array.isArray(selectedIds) &&
+                                    selectedIds.length > 0
+                                ) {
+                                    newCheckboxes.forEach((cb) => {
+                                        if (selectedIds.includes(cb.value)) {
+                                            cb.checked = true;
+                                        }
+                                        cb.removeAttribute("data-auto-check");
+                                    });
+
+                                    const event = new Event("change", {
+                                        bubbles: true,
+                                    });
+                                    container.dispatchEvent(event);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn(
+                                "Error restoring associatedPrompts selections:",
                                 e,
                             );
                         }
@@ -6089,19 +6618,9 @@ function showTab(tabName) {
             }
         });
 
-        document.querySelectorAll(".tab-link").forEach((l) => {
+        document.querySelectorAll(".sidebar-link").forEach((l) => {
             if (l) {
-                l.classList.remove(
-                    "border-indigo-500",
-                    "text-indigo-600",
-                    "dark:text-indigo-500",
-                    "dark:border-indigo-400",
-                );
-                l.classList.add(
-                    "border-transparent",
-                    "text-gray-500",
-                    "dark:text-gray-400",
-                );
+                l.classList.remove("active");
             }
         });
 
@@ -6114,19 +6633,9 @@ function showTab(tabName) {
             return;
         }
 
-        const nav = document.querySelector(`[href="#${tabName}"]`);
+        const nav = document.querySelector(`.sidebar-link[href="#${tabName}"]`);
         if (nav) {
-            nav.classList.add(
-                "border-indigo-500",
-                "text-indigo-600",
-                "dark:text-indigo-500",
-                "dark:border-indigo-400",
-            );
-            nav.classList.remove(
-                "border-transparent",
-                "text-gray-500",
-                "dark:text-gray-400",
-            );
+            nav.classList.add("active");
         }
 
         // Debounced content loading
@@ -6140,6 +6649,14 @@ function showTab(tabName) {
                 }
                 if (tabName === "llm-chat") {
                     initializeLLMChat();
+                }
+
+                if (tabName === "logs") {
+                    // Load structured logs when tab is first opened
+                    const logsTbody = safeGetElement("logs-tbody");
+                    if (logsTbody && logsTbody.children.length === 0) {
+                        searchStructuredLogs();
+                    }
                 }
 
                 if (tabName === "teams") {
@@ -6260,7 +6777,7 @@ function showTab(tabName) {
 
                 if (tabName === "gateways") {
                     // Reload gateways list to show any newly registered servers
-                    const gatewaysSection = safeGetElement("gateways-section");
+                    const gatewaysSection = safeGetElement("gateways-panel");
                     if (gatewaysSection) {
                         const gatewaysTbody =
                             gatewaysSection.querySelector("tbody");
@@ -6902,6 +7419,45 @@ function initToolSelect(
         return;
     }
 
+    // Instrument changes to the data-selected-tools attribute for debugging
+    if (!container.dataset.attrObserverAttached) {
+        try {
+            const attrObserver = new MutationObserver((mutationsList) => {
+                for (const mut of mutationsList) {
+                    if (
+                        mut.type === "attributes" &&
+                        mut.attributeName === "data-selected-tools"
+                    ) {
+                        const oldVal = mut.oldValue;
+                        const newVal = container.getAttribute(
+                            "data-selected-tools",
+                        );
+                        console.info(
+                            `[DATA-INSTRUMENT] ${selectId} data-selected-tools changed — old: ${oldVal} new: ${newVal}`,
+                        );
+                    }
+                }
+            });
+
+            // Observe attribute changes and capture previous value
+            attrObserver.observe(container, {
+                attributes: true,
+                attributeOldValue: true,
+                attributeFilter: ["data-selected-tools"],
+            });
+
+            // Prevent double attaching
+            container.dataset.attrObserverAttached = "true";
+            // Keep a reference so it doesn't get GC'd (and so we could disconnect if needed)
+            container._dbgAttrObserver = attrObserver;
+        } catch (e) {
+            console.error(
+                "[DATA-INSTRUMENT] failed to attach attribute observer:",
+                e,
+            );
+        }
+    }
+
     const pillClasses =
         "inline-block bg-green-100 text-green-800 text-xs px-2 py-1 rounded-full dark:bg-green-900 dark:text-green-200";
 
@@ -6935,7 +7491,27 @@ function initToolSelect(
                 }
             }
 
+            // Get persisted selections for Add Server mode
+            let persistedToolIds = [];
+            if (selectId === "associatedTools") {
+                const dataAttr = container.getAttribute("data-selected-tools");
+                if (dataAttr) {
+                    try {
+                        persistedToolIds = JSON.parse(dataAttr);
+                    } catch (e) {
+                        console.error("Error parsing data-selected-tools:", e);
+                    }
+                }
+                if (
+                    (!persistedToolIds || persistedToolIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedTools)
+                ) {
+                    persistedToolIds = window._selectedAssociatedTools.slice();
+                }
+            }
+
             let count = checked.length;
+            const pillsData = [];
 
             // If Select All mode is active, use the count from allToolIds
             if (
@@ -6958,34 +7534,67 @@ function initToolSelect(
             ) {
                 count = serverTools.length;
             }
+            // If in Add Server mode with persisted selections, use persisted count and build pills from persisted data
+            else if (
+                selectId === "associatedTools" &&
+                persistedToolIds &&
+                persistedToolIds.length > 0
+            ) {
+                count = persistedToolIds.length;
+                // Build pill data from persisted IDs using toolMapping
+                if (window.toolMapping) {
+                    persistedToolIds.forEach((id) => {
+                        const toolName = window.toolMapping[id];
+                        if (toolName) {
+                            pillsData.push({ id, name: toolName });
+                        }
+                    });
+                }
+            }
 
             // Rebuild pills safely - show first 3, then summarize the rest
             pillsBox.innerHTML = "";
             const maxPillsToShow = 3;
 
-            // In edit server mode, we want to show the server tools rather than just currently checked ones
-            let pillsToDisplay = checked;
-            if (
+            // Determine which pills to display based on mode
+            if (selectId === "associatedTools" && pillsData.length > 0) {
+                // In Add Server mode with persisted data, show pills from persisted selections
+                pillsData.slice(0, maxPillsToShow).forEach((item) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent = item.name || "Unnamed";
+                    span.title = item.name;
+                    pillsBox.appendChild(span);
+                });
+            } else if (
                 isEditServerMode &&
                 serverTools &&
                 Array.isArray(serverTools) &&
                 window.toolMapping
             ) {
-                // Create a list of tools that exist both in serverTools and currently loaded tools
+                // In edit server mode, show the server tools rather than just currently checked ones
                 const allLoadedTools = Array.from(checkboxes);
-                pillsToDisplay = allLoadedTools.filter((checkbox) => {
+                const pillsToDisplay = allLoadedTools.filter((checkbox) => {
                     const toolName = window.toolMapping[checkbox.value];
                     return toolName && serverTools.includes(toolName);
                 });
+                pillsToDisplay.slice(0, maxPillsToShow).forEach((cb) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent =
+                        cb.nextElementSibling?.textContent?.trim() || "Unnamed";
+                    pillsBox.appendChild(span);
+                });
+            } else {
+                // Default: show pills from currently checked checkboxes
+                checked.slice(0, maxPillsToShow).forEach((cb) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent =
+                        cb.nextElementSibling?.textContent?.trim() || "Unnamed";
+                    pillsBox.appendChild(span);
+                });
             }
-
-            pillsToDisplay.slice(0, maxPillsToShow).forEach((cb) => {
-                const span = document.createElement("span");
-                span.className = pillClasses;
-                span.textContent =
-                    cb.nextElementSibling?.textContent?.trim() || "Unnamed";
-                pillsBox.appendChild(span);
-            });
 
             // If more than maxPillsToShow, show a summary pill
             if (count > maxPillsToShow) {
@@ -7222,6 +7831,82 @@ function initToolSelect(
                         );
                     }
                 }
+                // If we're in the Add Server tools container, persist selected IDs
+                else if (selectId === "associatedTools") {
+                    try {
+                        // Incrementally update persisted selection instead of
+                        // replacing it wholesale. This preserves selections made
+                        // in previous filtered views where those checkboxes are
+                        // not present in the current DOM.
+                        const changedEl = e.target;
+                        const changedId = changedEl.value;
+
+                        // Load existing persisted set: prefer container attribute,
+                        // fall back to the in-memory window variable.
+                        let persisted = [];
+                        const dataAttr = container.getAttribute(
+                            "data-selected-tools",
+                        );
+                        if (dataAttr) {
+                            try {
+                                const parsed = JSON.parse(dataAttr);
+                                if (Array.isArray(parsed)) {
+                                    persisted = parsed.slice();
+                                }
+                            } catch (parseErr) {
+                                console.error(
+                                    "Error parsing existing data-selected-tools:",
+                                    parseErr,
+                                );
+                            }
+                        } else if (
+                            Array.isArray(window._selectedAssociatedTools)
+                        ) {
+                            persisted = window._selectedAssociatedTools.slice();
+                        }
+
+                        if (changedEl.checked) {
+                            if (!persisted.includes(changedId)) {
+                                persisted.push(changedId);
+                            }
+                        } else {
+                            persisted = persisted.filter(
+                                (x) => x !== changedId,
+                            );
+                        }
+
+                        // Ensure any currently visible checked boxes are included
+                        const visibleChecked = Array.from(
+                            container.querySelectorAll(
+                                'input[type="checkbox"]:checked',
+                            ),
+                        ).map((cb) => cb.value);
+                        visibleChecked.forEach((id) => {
+                            if (!persisted.includes(id)) {
+                                persisted.push(id);
+                            }
+                        });
+
+                        // Persist back to both the container attribute and global fallback
+                        container.setAttribute(
+                            "data-selected-tools",
+                            JSON.stringify(persisted),
+                        );
+                        try {
+                            window._selectedAssociatedTools = persisted.slice();
+                        } catch (e) {
+                            console.error(
+                                "Error persisting window._selectedAssociatedTools:",
+                                e,
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error updating data-selected-tools (incremental):",
+                            err,
+                        );
+                    }
+                }
 
                 update();
             }
@@ -7259,7 +7944,6 @@ function initResourceSelect(
                 'input[type="checkbox"]',
             );
             const checked = Array.from(checkboxes).filter((cb) => cb.checked);
-            // const count = checked.length;
 
             // Select All handling
             const selectAllInput = container.querySelector(
@@ -7269,7 +7953,35 @@ function initResourceSelect(
                 'input[name="allResourceIds"]',
             );
 
+            // Get persisted selections for Add Server mode
+            let persistedResourceIds = [];
+            if (selectId === "associatedResources") {
+                const dataAttr = container.getAttribute(
+                    "data-selected-resources",
+                );
+                if (dataAttr) {
+                    try {
+                        persistedResourceIds = JSON.parse(dataAttr);
+                    } catch (e) {
+                        console.error(
+                            "Error parsing data-selected-resources:",
+                            e,
+                        );
+                    }
+                }
+                if (
+                    (!persistedResourceIds ||
+                        persistedResourceIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedResources)
+                ) {
+                    persistedResourceIds =
+                        window._selectedAssociatedResources.slice();
+                }
+            }
+
             let count = checked.length;
+            const pillsData = [];
+
             if (
                 selectAllInput &&
                 selectAllInput.value === "true" &&
@@ -7282,18 +7994,51 @@ function initResourceSelect(
                     console.error("Error parsing allResourceIds:", e);
                 }
             }
+            // If in Add Server mode with persisted selections, use persisted count and build pills from persisted data
+            else if (
+                selectId === "associatedResources" &&
+                persistedResourceIds &&
+                persistedResourceIds.length > 0
+            ) {
+                count = persistedResourceIds.length;
+                // Build pill data from persisted IDs - find matching checkboxes or use ID as fallback
+                const checkboxMap = new Map();
+                checkboxes.forEach((cb) => {
+                    checkboxMap.set(
+                        cb.value,
+                        cb.nextElementSibling?.textContent?.trim() || cb.value,
+                    );
+                });
+                persistedResourceIds.forEach((id) => {
+                    const name = checkboxMap.get(id) || id;
+                    pillsData.push({ id, name });
+                });
+            }
 
             // Rebuild pills safely - show first 3, then summarize the rest
             pillsBox.innerHTML = "";
             const maxPillsToShow = 3;
 
-            checked.slice(0, maxPillsToShow).forEach((cb) => {
-                const span = document.createElement("span");
-                span.className = pillClasses;
-                span.textContent =
-                    cb.nextElementSibling?.textContent?.trim() || "Unnamed";
-                pillsBox.appendChild(span);
-            });
+            // Determine which pills to display based on mode
+            if (selectId === "associatedResources" && pillsData.length > 0) {
+                // In Add Server mode with persisted data, show pills from persisted selections
+                pillsData.slice(0, maxPillsToShow).forEach((item) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent = item.name || "Unnamed";
+                    span.title = item.name;
+                    pillsBox.appendChild(span);
+                });
+            } else {
+                // Default: show pills from currently checked checkboxes
+                checked.slice(0, maxPillsToShow).forEach((cb) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent =
+                        cb.nextElementSibling?.textContent?.trim() || "Unnamed";
+                    pillsBox.appendChild(span);
+                });
+            }
 
             // If more than maxPillsToShow, show a summary pill
             if (count > maxPillsToShow) {
@@ -7478,6 +8223,121 @@ function initResourceSelect(
                     }
                 }
 
+                // If we're in the edit-server-resources container, maintain the
+                // `data-server-resources` attribute so user selections persist
+                // across gateway-filtered reloads.
+                else if (selectId === "edit-server-resources") {
+                    try {
+                        let serverResources = [];
+                        const dataAttr = container.getAttribute(
+                            "data-server-resources",
+                        );
+                        if (dataAttr) {
+                            try {
+                                serverResources = JSON.parse(dataAttr);
+                            } catch (e) {
+                                console.error(
+                                    "Error parsing data-server-resources:",
+                                    e,
+                                );
+                            }
+                        }
+
+                        const idVal = e.target.value;
+                        if (!Number.isNaN(idVal)) {
+                            if (e.target.checked) {
+                                if (!serverResources.includes(idVal)) {
+                                    serverResources.push(idVal);
+                                }
+                            } else {
+                                serverResources = serverResources.filter(
+                                    (x) => x !== idVal,
+                                );
+                            }
+
+                            container.setAttribute(
+                                "data-server-resources",
+                                JSON.stringify(serverResources),
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error updating data-server-resources:",
+                            err,
+                        );
+                    }
+                }
+                // If we're in the Add Server resources container, persist selected IDs incrementally
+                else if (selectId === "associatedResources") {
+                    try {
+                        const changedEl = e.target;
+                        const changedId = changedEl.value;
+
+                        let persisted = [];
+                        const dataAttr = container.getAttribute(
+                            "data-selected-resources",
+                        );
+                        if (dataAttr) {
+                            try {
+                                const parsed = JSON.parse(dataAttr);
+                                if (Array.isArray(parsed)) {
+                                    persisted = parsed.slice();
+                                }
+                            } catch (parseErr) {
+                                console.error(
+                                    "Error parsing existing data-selected-resources:",
+                                    parseErr,
+                                );
+                            }
+                        } else if (
+                            Array.isArray(window._selectedAssociatedResources)
+                        ) {
+                            persisted =
+                                window._selectedAssociatedResources.slice();
+                        }
+
+                        if (changedEl.checked) {
+                            if (!persisted.includes(changedId)) {
+                                persisted.push(changedId);
+                            }
+                        } else {
+                            persisted = persisted.filter(
+                                (x) => x !== changedId,
+                            );
+                        }
+
+                        const visibleChecked = Array.from(
+                            container.querySelectorAll(
+                                'input[type="checkbox"]:checked',
+                            ),
+                        ).map((cb) => cb.value);
+                        visibleChecked.forEach((id) => {
+                            if (!persisted.includes(id)) {
+                                persisted.push(id);
+                            }
+                        });
+
+                        container.setAttribute(
+                            "data-selected-resources",
+                            JSON.stringify(persisted),
+                        );
+                        try {
+                            window._selectedAssociatedResources =
+                                persisted.slice();
+                        } catch (err) {
+                            console.error(
+                                "Error persisting window._selectedAssociatedResources:",
+                                err,
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error updating data-selected-resources (incremental):",
+                            err,
+                        );
+                    }
+                }
+
                 update();
             }
         });
@@ -7523,7 +8383,34 @@ function initPromptSelect(
                 'input[name="allPromptIds"]',
             );
 
+            // Get persisted selections for Add Server mode
+            let persistedPromptIds = [];
+            if (selectId === "associatedPrompts") {
+                const dataAttr = container.getAttribute(
+                    "data-selected-prompts",
+                );
+                if (dataAttr) {
+                    try {
+                        persistedPromptIds = JSON.parse(dataAttr);
+                    } catch (e) {
+                        console.error(
+                            "Error parsing data-selected-prompts:",
+                            e,
+                        );
+                    }
+                }
+                if (
+                    (!persistedPromptIds || persistedPromptIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedPrompts)
+                ) {
+                    persistedPromptIds =
+                        window._selectedAssociatedPrompts.slice();
+                }
+            }
+
             let count = checked.length;
+            const pillsData = [];
+
             if (
                 selectAllInput &&
                 selectAllInput.value === "true" &&
@@ -7536,18 +8423,51 @@ function initPromptSelect(
                     console.error("Error parsing allPromptIds:", e);
                 }
             }
+            // If in Add Server mode with persisted selections, use persisted count and build pills from persisted data
+            else if (
+                selectId === "associatedPrompts" &&
+                persistedPromptIds &&
+                persistedPromptIds.length > 0
+            ) {
+                count = persistedPromptIds.length;
+                // Build pill data from persisted IDs - find matching checkboxes or use ID as fallback
+                const checkboxMap = new Map();
+                checkboxes.forEach((cb) => {
+                    checkboxMap.set(
+                        cb.value,
+                        cb.nextElementSibling?.textContent?.trim() || cb.value,
+                    );
+                });
+                persistedPromptIds.forEach((id) => {
+                    const name = checkboxMap.get(id) || id;
+                    pillsData.push({ id, name });
+                });
+            }
 
             // Rebuild pills safely - show first 3, then summarize the rest
             pillsBox.innerHTML = "";
             const maxPillsToShow = 3;
 
-            checked.slice(0, maxPillsToShow).forEach((cb) => {
-                const span = document.createElement("span");
-                span.className = pillClasses;
-                span.textContent =
-                    cb.nextElementSibling?.textContent?.trim() || "Unnamed";
-                pillsBox.appendChild(span);
-            });
+            // Determine which pills to display based on mode
+            if (selectId === "associatedPrompts" && pillsData.length > 0) {
+                // In Add Server mode with persisted data, show pills from persisted selections
+                pillsData.slice(0, maxPillsToShow).forEach((item) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent = item.name || "Unnamed";
+                    span.title = item.name;
+                    pillsBox.appendChild(span);
+                });
+            } else {
+                // Default: show pills from currently checked checkboxes
+                checked.slice(0, maxPillsToShow).forEach((cb) => {
+                    const span = document.createElement("span");
+                    span.className = pillClasses;
+                    span.textContent =
+                        cb.nextElementSibling?.textContent?.trim() || "Unnamed";
+                    pillsBox.appendChild(span);
+                });
+            }
 
             // If more than maxPillsToShow, show a summary pill
             if (count > maxPillsToShow) {
@@ -7728,6 +8648,122 @@ function initPromptSelect(
                         allIdsInput.value = JSON.stringify(allIds);
                     } catch (err) {
                         console.error("Error updating allPromptIds:", err);
+                    }
+                }
+
+                // If we're in the edit-server-prompts container, maintain the
+                // `data-server-prompts` attribute so user selections persist
+                // across gateway-filtered reloads.
+                else if (selectId === "edit-server-prompts") {
+                    try {
+                        let serverPrompts = [];
+                        const dataAttr = container.getAttribute(
+                            "data-server-prompts",
+                        );
+                        if (dataAttr) {
+                            try {
+                                serverPrompts = JSON.parse(dataAttr);
+                            } catch (e) {
+                                console.error(
+                                    "Error parsing data-server-prompts:",
+                                    e,
+                                );
+                            }
+                        }
+
+                        const idVal = e.target.value;
+                        if (!Number.isNaN(idVal)) {
+                            if (e.target.checked) {
+                                if (!serverPrompts.includes(idVal)) {
+                                    serverPrompts.push(idVal);
+                                }
+                            } else {
+                                serverPrompts = serverPrompts.filter(
+                                    (x) => x !== idVal,
+                                );
+                            }
+
+                            container.setAttribute(
+                                "data-server-prompts",
+                                JSON.stringify(serverPrompts),
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error updating data-server-prompts:",
+                            err,
+                        );
+                    }
+                }
+
+                // If we're in the Add Server prompts container, persist selected IDs incrementally
+                else if (selectId === "associatedPrompts") {
+                    try {
+                        const changedEl = e.target;
+                        const changedId = changedEl.value;
+
+                        let persisted = [];
+                        const dataAttr = container.getAttribute(
+                            "data-selected-prompts",
+                        );
+                        if (dataAttr) {
+                            try {
+                                const parsed = JSON.parse(dataAttr);
+                                if (Array.isArray(parsed)) {
+                                    persisted = parsed.slice();
+                                }
+                            } catch (parseErr) {
+                                console.error(
+                                    "Error parsing existing data-selected-prompts:",
+                                    parseErr,
+                                );
+                            }
+                        } else if (
+                            Array.isArray(window._selectedAssociatedPrompts)
+                        ) {
+                            persisted =
+                                window._selectedAssociatedPrompts.slice();
+                        }
+
+                        if (changedEl.checked) {
+                            if (!persisted.includes(changedId)) {
+                                persisted.push(changedId);
+                            }
+                        } else {
+                            persisted = persisted.filter(
+                                (x) => x !== changedId,
+                            );
+                        }
+
+                        const visibleChecked = Array.from(
+                            container.querySelectorAll(
+                                'input[type="checkbox"]:checked',
+                            ),
+                        ).map((cb) => cb.value);
+                        visibleChecked.forEach((id) => {
+                            if (!persisted.includes(id)) {
+                                persisted.push(id);
+                            }
+                        });
+
+                        container.setAttribute(
+                            "data-selected-prompts",
+                            JSON.stringify(persisted),
+                        );
+                        try {
+                            window._selectedAssociatedPrompts =
+                                persisted.slice();
+                        } catch (err) {
+                            console.error(
+                                "Error persisting window._selectedAssociatedPrompts:",
+                                err,
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error updating data-selected-prompts (incremental):",
+                            err,
+                        );
                     }
                 }
 
@@ -8025,7 +9061,14 @@ function initGatewaySelect(
         container.addEventListener("change", (e) => {
             if (e.target.type === "checkbox") {
                 // Log gateway_id when checkbox is clicked
-                const gatewayId = e.target.value;
+                // Normalize the special null-gateway checkbox to the literal string "null"
+                let gatewayId = e.target.value;
+                if (
+                    e.target.dataset &&
+                    e.target.dataset.gatewayNull === "true"
+                ) {
+                    gatewayId = "null";
+                }
                 const gatewayName =
                     e.target.nextElementSibling?.textContent?.trim() ||
                     "Unknown";
@@ -8092,12 +9135,38 @@ function initGatewaySelect(
  * @returns {string[]} Array of selected gateway IDs
  */
 function getSelectedGatewayIds() {
-    const container = document.getElementById("associatedGateways");
-    console.log("[Gateway Selection DEBUG] Container found:", !!container);
+    // Prefer the gateway selection belonging to the currently active form.
+    // If the edit-server modal is open, use the edit modal's gateway container
+    // (`associatedEditGateways`). Otherwise use the create form container
+    // (`associatedGateways`). This allows the same filtering logic to work
+    // for both Add and Edit flows.
+    let container = document.getElementById("associatedGateways");
+    const editContainer = document.getElementById("associatedEditGateways");
+
+    const editModal = document.getElementById("server-edit-modal");
+    const isEditModalOpen =
+        editModal && !editModal.classList.contains("hidden");
+
+    if (isEditModalOpen && editContainer) {
+        container = editContainer;
+    } else if (
+        editContainer &&
+        editContainer.offsetParent !== null &&
+        !container
+    ) {
+        // If edit container is visible (e.g. modal rendered) and associatedGateways
+        // not present, prefer edit container.
+        container = editContainer;
+    }
+
+    console.log(
+        "[Gateway Selection DEBUG] Container used:",
+        container ? container.id : null,
+    );
 
     if (!container) {
         console.warn(
-            "[Gateway Selection DEBUG] associatedGateways container not found",
+            "[Gateway Selection DEBUG] No gateway container found (associatedGateways or associatedEditGateways)",
         );
         return [];
     }
@@ -8174,19 +9243,46 @@ function reloadAssociatedItems() {
         selectedGatewayIds,
     );
 
+    // Determine whether to reload the 'create server' containers (associated*)
+    // or the 'edit server' containers (edit-server-*). Prefer the edit
+    // containers when the edit modal is open or the edit-gateway selector
+    // exists and is visible.
+    const editModal = document.getElementById("server-edit-modal");
+    const isEditModalOpen =
+        editModal && !editModal.classList.contains("hidden");
+    const editGateways = document.getElementById("associatedEditGateways");
+
+    const useEditContainers =
+        isEditModalOpen || (editGateways && editGateways.offsetParent !== null);
+
+    const toolsContainerId = useEditContainers
+        ? "edit-server-tools"
+        : "associatedTools";
+    const resourcesContainerId = useEditContainers
+        ? "edit-server-resources"
+        : "associatedResources";
+    const promptsContainerId = useEditContainers
+        ? "edit-server-prompts"
+        : "associatedPrompts";
+
     // Reload tools
-    const toolsContainer = document.getElementById("associatedTools");
+    const toolsContainer = document.getElementById(toolsContainerId);
     if (toolsContainer) {
         const toolsUrl = gatewayIdParam
             ? `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
             : `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector`;
 
-        console.log("[Filter Update DEBUG] Tools URL:", toolsUrl);
+        console.log(
+            "[Filter Update DEBUG] Tools URL:",
+            toolsUrl,
+            "-> target:",
+            `#${toolsContainerId}`,
+        );
 
-        // Use HTMX to reload the content
+        // Use HTMX to reload the content into the chosen container
         if (window.htmx) {
             htmx.ajax("GET", toolsUrl, {
-                target: "#associatedTools",
+                target: `#${toolsContainerId}`,
                 swap: "innerHTML",
             })
                 .then(() => {
@@ -8194,13 +9290,26 @@ function reloadAssociatedItems() {
                         "[Filter Update DEBUG] Tools reloaded successfully",
                     );
                     // Re-initialize the tool select after content is loaded
+                    const pillsId = useEditContainers
+                        ? "selectedEditToolsPills"
+                        : "selectedToolsPills";
+                    const warnId = useEditContainers
+                        ? "selectedEditToolsWarning"
+                        : "selectedToolsWarning";
+                    const selectBtn = useEditContainers
+                        ? "selectAllEditToolsBtn"
+                        : "selectAllToolsBtn";
+                    const clearBtn = useEditContainers
+                        ? "clearAllEditToolsBtn"
+                        : "clearAllToolsBtn";
+
                     initToolSelect(
-                        "associatedTools",
-                        "selectedToolsPills",
-                        "selectedToolsWarning",
+                        toolsContainerId,
+                        pillsId,
+                        warnId,
                         6,
-                        "selectAllToolsBtn",
-                        "clearAllToolsBtn",
+                        selectBtn,
+                        clearBtn,
                     );
                 })
                 .catch((err) => {
@@ -8215,11 +9324,14 @@ function reloadAssociatedItems() {
             );
         }
     } else {
-        console.warn("[Filter Update DEBUG] Tools container not found");
+        console.warn(
+            "[Filter Update DEBUG] Tools container not found ->",
+            toolsContainerId,
+        );
     }
 
     // Reload resources - use fetch directly to avoid HTMX race conditions
-    const resourcesContainer = document.getElementById("associatedResources");
+    const resourcesContainer = document.getElementById(resourcesContainerId);
     if (resourcesContainer) {
         const resourcesUrl = gatewayIdParam
             ? `${window.ROOT_PATH}/admin/resources/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
@@ -8248,7 +9360,59 @@ function reloadAssociatedItems() {
                     "[Filter Update DEBUG] Resources fetch successful, HTML length:",
                     html.length,
                 );
+                // Persist current selections to window fallback before replacing container
+                // AND preserve the data-selected-resources attribute
+                let persistedResourceIds = [];
+                try {
+                    // First, try to get from the container's data attribute
+                    const dataAttr = resourcesContainer.getAttribute(
+                        "data-selected-resources",
+                    );
+                    if (dataAttr) {
+                        try {
+                            const parsed = JSON.parse(dataAttr);
+                            if (Array.isArray(parsed)) {
+                                persistedResourceIds = parsed.slice();
+                            }
+                        } catch (e) {
+                            console.error(
+                                "Error parsing data-selected-resources:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // Merge with currently checked items
+                    const currentChecked = Array.from(
+                        resourcesContainer.querySelectorAll(
+                            'input[type="checkbox"]:checked',
+                        ),
+                    ).map((cb) => cb.value);
+                    const merged = new Set([
+                        ...persistedResourceIds,
+                        ...currentChecked,
+                    ]);
+                    persistedResourceIds = Array.from(merged);
+
+                    // Update window fallback
+                    window._selectedAssociatedResources =
+                        persistedResourceIds.slice();
+                } catch (e) {
+                    console.error(
+                        "Error capturing current resource selections before reload:",
+                        e,
+                    );
+                }
+
                 resourcesContainer.innerHTML = html;
+
+                // Immediately restore the data-selected-resources attribute after innerHTML replacement
+                if (persistedResourceIds.length > 0) {
+                    resourcesContainer.setAttribute(
+                        "data-selected-resources",
+                        JSON.stringify(persistedResourceIds),
+                    );
+                }
                 // If HTMX is available, process the newly-inserted HTML so hx-*
                 // triggers (like the infinite-scroll 'intersect' trigger) are
                 // initialized. To avoid HTMX re-triggering the container's
@@ -8303,14 +9467,152 @@ function reloadAssociatedItems() {
                 }
 
                 // Re-initialize the resource select after content is loaded
+                const resPills = useEditContainers
+                    ? "selectedEditResourcesPills"
+                    : "selectedResourcesPills";
+                const resWarn = useEditContainers
+                    ? "selectedEditResourcesWarning"
+                    : "selectedResourcesWarning";
+                const resSelectBtn = useEditContainers
+                    ? "selectAllEditResourcesBtn"
+                    : "selectAllResourcesBtn";
+                const resClearBtn = useEditContainers
+                    ? "clearAllEditResourcesBtn"
+                    : "clearAllResourcesBtn";
+
+                // The data-selected-resources attribute should already be restored above,
+                // but double-check and merge with window fallback if needed
+                try {
+                    const dataAttr = resourcesContainer.getAttribute(
+                        "data-selected-resources",
+                    );
+                    let selectedIds = [];
+                    if (dataAttr) {
+                        try {
+                            const parsed = JSON.parse(dataAttr);
+                            if (Array.isArray(parsed)) {
+                                selectedIds = parsed.slice();
+                            }
+                        } catch (e) {
+                            console.error(
+                                "Error parsing data-selected-resources:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // Merge with window fallback if it has additional selections
+                    if (
+                        Array.isArray(window._selectedAssociatedResources) &&
+                        window._selectedAssociatedResources.length > 0
+                    ) {
+                        const merged = new Set([
+                            ...selectedIds,
+                            ...window._selectedAssociatedResources,
+                        ]);
+                        const mergedArray = Array.from(merged);
+                        if (mergedArray.length > selectedIds.length) {
+                            resourcesContainer.setAttribute(
+                                "data-selected-resources",
+                                JSON.stringify(mergedArray),
+                            );
+                            console.log(
+                                "[Filter Update DEBUG] Merged additional selections from window fallback",
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring data-selected-resources after fetch reload:",
+                        e,
+                    );
+                }
+
+                // First restore persisted selections from data-selected-resources (Add Server mode)
+                try {
+                    const dataAttr = resourcesContainer.getAttribute(
+                        "data-selected-resources",
+                    );
+                    if (
+                        dataAttr &&
+                        resourcesContainerId === "associatedResources"
+                    ) {
+                        const selectedIds = JSON.parse(dataAttr);
+                        if (
+                            Array.isArray(selectedIds) &&
+                            selectedIds.length > 0
+                        ) {
+                            const resourceCheckboxes =
+                                resourcesContainer.querySelectorAll(
+                                    'input[type="checkbox"][name="associatedResources"]',
+                                );
+                            resourceCheckboxes.forEach((cb) => {
+                                if (selectedIds.includes(cb.value)) {
+                                    cb.checked = true;
+                                }
+                            });
+                            console.log(
+                                "[Filter Update DEBUG] Restored",
+                                selectedIds.length,
+                                "persisted resource selections",
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.warn(
+                        "Error restoring persisted resource selections:",
+                        e,
+                    );
+                }
+
                 initResourceSelect(
-                    "associatedResources",
-                    "selectedResourcesPills",
-                    "selectedResourcesWarning",
+                    resourcesContainerId,
+                    resPills,
+                    resWarn,
                     6,
-                    "selectAllResourcesBtn",
-                    "clearAllResourcesBtn",
+                    resSelectBtn,
+                    resClearBtn,
                 );
+
+                // Re-apply server-associated resource selections so selections
+                // persist across gateway-filtered reloads (Edit Server mode).
+                // The resources partial replaces checkbox inputs; use the container's
+                // `data-server-resources` attribute (set when opening edit modal)
+                // to restore checked state.
+                try {
+                    const dataAttr = resourcesContainer.getAttribute(
+                        "data-server-resources",
+                    );
+                    if (dataAttr) {
+                        const associated = JSON.parse(dataAttr);
+                        if (
+                            Array.isArray(associated) &&
+                            associated.length > 0
+                        ) {
+                            const resourceCheckboxes =
+                                resourcesContainer.querySelectorAll(
+                                    'input[type="checkbox"][name="associatedResources"]',
+                                );
+                            resourceCheckboxes.forEach((cb) => {
+                                const val = cb.value;
+                                if (
+                                    !Number.isNaN(val) &&
+                                    associated.includes(val)
+                                ) {
+                                    cb.checked = true;
+                                }
+                            });
+
+                            // Trigger change so pills and counts update
+                            const event = new Event("change", {
+                                bubbles: true,
+                            });
+                            resourcesContainer.dispatchEvent(event);
+                        }
+                    }
+                } catch (e) {
+                    console.warn("Error restoring associated resources:", e);
+                }
                 console.log(
                     "[Filter Update DEBUG] Resources reloaded successfully via fetch",
                 );
@@ -8326,25 +9628,118 @@ function reloadAssociatedItems() {
     }
 
     // Reload prompts
-    const promptsContainer = document.getElementById("associatedPrompts");
+    const promptsContainer = document.getElementById(promptsContainerId);
     if (promptsContainer) {
         const promptsUrl = gatewayIdParam
             ? `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
             : `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector`;
 
+        // Persist current prompt selections before HTMX replaces the container
+        try {
+            const currentCheckedPrompts = Array.from(
+                promptsContainer.querySelectorAll(
+                    'input[type="checkbox"]:checked',
+                ),
+            ).map((cb) => cb.value);
+            if (
+                !Array.isArray(window._selectedAssociatedPrompts) ||
+                window._selectedAssociatedPrompts.length === 0
+            ) {
+                window._selectedAssociatedPrompts =
+                    currentCheckedPrompts.slice();
+            } else {
+                const merged = new Set([
+                    ...(window._selectedAssociatedPrompts || []),
+                    ...currentCheckedPrompts,
+                ]);
+                window._selectedAssociatedPrompts = Array.from(merged);
+            }
+        } catch (e) {
+            console.error(
+                "Error capturing current prompt selections before reload:",
+                e,
+            );
+        }
+
         if (window.htmx) {
             htmx.ajax("GET", promptsUrl, {
-                target: "#associatedPrompts",
+                target: `#${promptsContainerId}`,
                 swap: "innerHTML",
             }).then(() => {
+                try {
+                    const containerEl =
+                        document.getElementById(promptsContainerId);
+                    if (containerEl) {
+                        const existingAttr = containerEl.getAttribute(
+                            "data-selected-prompts",
+                        );
+                        let existingIds = null;
+                        if (existingAttr) {
+                            try {
+                                existingIds = JSON.parse(existingAttr);
+                            } catch (e) {
+                                console.error(
+                                    "Error parsing existing data-selected-prompts after reload:",
+                                    e,
+                                );
+                            }
+                        }
+
+                        if (
+                            (!existingIds ||
+                                !Array.isArray(existingIds) ||
+                                existingIds.length === 0) &&
+                            Array.isArray(window._selectedAssociatedPrompts) &&
+                            window._selectedAssociatedPrompts.length > 0
+                        ) {
+                            containerEl.setAttribute(
+                                "data-selected-prompts",
+                                JSON.stringify(
+                                    window._selectedAssociatedPrompts.slice(),
+                                ),
+                            );
+                        } else if (
+                            Array.isArray(existingIds) &&
+                            Array.isArray(window._selectedAssociatedPrompts) &&
+                            window._selectedAssociatedPrompts.length > 0
+                        ) {
+                            const merged = new Set([
+                                ...(existingIds || []),
+                                ...window._selectedAssociatedPrompts,
+                            ]);
+                            containerEl.setAttribute(
+                                "data-selected-prompts",
+                                JSON.stringify(Array.from(merged)),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring data-selected-prompts after HTMX reload:",
+                        e,
+                    );
+                }
                 // Re-initialize the prompt select after content is loaded
+                const pPills = useEditContainers
+                    ? "selectedEditPromptsPills"
+                    : "selectedPromptsPills";
+                const pWarn = useEditContainers
+                    ? "selectedEditPromptsWarning"
+                    : "selectedPromptsWarning";
+                const pSelectBtn = useEditContainers
+                    ? "selectAllEditPromptsBtn"
+                    : "selectAllPromptsBtn";
+                const pClearBtn = useEditContainers
+                    ? "clearAllEditPromptsBtn"
+                    : "clearAllPromptsBtn";
+
                 initPromptSelect(
-                    "associatedPrompts",
-                    "selectedPromptsPills",
-                    "selectedPromptsWarning",
+                    promptsContainerId,
+                    pPills,
+                    pWarn,
                     6,
-                    "selectAllPromptsBtn",
-                    "clearAllPromptsBtn",
+                    pSelectBtn,
+                    pClearBtn,
                 );
             });
         }
@@ -8389,6 +9784,23 @@ function toggleInactiveItems(type) {
         window.history.replaceState({}, document.title, urlObj.toString());
     } catch (e) {
         // ignore (shouldn't happen)
+    }
+
+    // For servers (catalog), use loadServers function if available, otherwise reload page
+    if (type === "servers") {
+        if (typeof window.loadServers === "function") {
+            window.loadServers();
+            return;
+        }
+        // Fallback to page reload
+        const fallbackUrl = new URL(window.location);
+        if (checkbox.checked) {
+            fallbackUrl.searchParams.set("include_inactive", "true");
+        } else {
+            fallbackUrl.searchParams.delete("include_inactive");
+        }
+        window.location = fallbackUrl;
+        return;
     }
 
     // Try to find the HTMX container that loads this entity's partial
@@ -8895,6 +10307,1755 @@ async function testTool(toolId) {
             testButton.disabled = false;
             testButton.textContent = "Test";
             testButton.classList.remove("opacity-50", "cursor-not-allowed");
+        }
+    }
+}
+
+async function loadTools() {
+    const toolBody = document.getElementById("toolBody");
+    console.log("Loading tools...");
+    try {
+        if (toolBody !== null) {
+            toolBody.innerHTML = `
+                <tr>
+                    <td colspan="5" class="text-center py-4 text-gray-500">Loading tools...</td>
+                </tr>
+                `;
+            const response = await fetch(`${window.ROOT_PATH}/admin/tools`, {
+                method: "GET",
+            });
+
+            if (!response.ok) {
+                throw new Error("Failed to load tools");
+            }
+            let tools = await response.json(); // 👈 expect JSON array
+            if ("data" in tools) {
+                tools = tools.data;
+            }
+            console.log("Fetched tools:", tools);
+
+            //   document.getElementById("temp_lable").innerText = `Loaded ${tools.length} tools`;
+
+            if (!tools.length) {
+                toolBody.innerHTML = `
+                <tr><td colspan="5" class="text-center py-4 text-gray-500">No tools found.</td></tr>
+                `;
+                return;
+            }
+
+            // ✅ Build HTML rows dynamically
+            const rows = tools
+                .map((tool) => {
+                    const { id, name, integrationType, enabled, reachable } =
+                        tool;
+                    let statusText = "";
+                    let statusClass = "";
+                    if (enabled && reachable) {
+                        statusText = "Online";
+                        statusClass = "bg-green-100 text-green-800";
+                    } else if (enabled) {
+                        statusText = "Offline";
+                        statusClass = "bg-yellow-100 text-yellow-800";
+                    } else {
+                        statusText = "Inactive";
+                        statusClass = "bg-red-100 text-red-800";
+                    }
+                    return `
+                <tr data-name="${name.toLowerCase()}" data-status="${enabled ? "enabled" : "disabled"}">
+                    <td class="px-4 py-3">
+                    <input type="checkbox" class="tool-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded"
+                            data-tool="${name}###${id}">
+                    </td>
+                    <td class="px-4 py-3">${name}</td>
+                    <td class="px-4 py-3">${integrationType || "-"}</td>
+                    <td class="px-2 py-4 whitespace-nowrap text-sm w-12">
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${statusClass}">
+                        ${statusText}
+                    </span>
+                    </td>
+                    <td class="px-2 py-4 whitespace-nowrap text-sm font-medium w-32">
+                    <div class="grid grid-cols-2 gap-x-2 gap-y-0 max-w-48">
+                        <button onclick="enrichTool('${id}')"
+                        class="col-span-2 px-2 py-1 text-xs font-medium rounded-md text-teal-600 hover:bg-teal-50">
+                        Enrich
+                        </button>
+                        <button onclick="generateToolTestCases('${id}')"
+                        class="col-span-2 px-2 py-1 text-[11px] font-small rounded-md text-purple-600 hover:bg-purple-50">
+                        Generate Test Cases
+                        </button>
+                        <button onclick="validateTool('${id}')"
+                        class="col-span-2 px-2 py-1 text-xs font-medium rounded-md text-yellow-600 hover:bg-yellow-50">
+                        Validate
+                        </button>
+                        <button onclick="viewTool('${id}')"
+                        class="px-2 py-1 text-xs font-medium rounded-md text-indigo-600 hover:bg-indigo-50">
+                        View
+                        </button>
+                        <button onclick="editTool('${id}')"
+                        class="px-2 py-1 text-xs font-medium rounded-md text-green-600 hover:bg-green-50">
+                        Edit
+                        </button>
+                    </div>
+                    </td>
+                </tr>
+                `;
+                })
+                .join("");
+            toolBody.innerHTML = rows;
+        }
+    } catch (error) {
+        console.error("Error loading tools:", error);
+        if (toolBody !== null) {
+            toolBody.innerHTML = `
+                <tr>
+                <td colspan="5" class="text-center py-4 text-red-500">Failed to load tools. Please try again.</td>
+                </tr>
+            `;
+        }
+    }
+}
+
+document.addEventListener("DOMContentLoaded", loadTools);
+
+async function enrichTool(toolId) {
+    try {
+        console.log(`Enriching tool ID: ${toolId}`);
+        const now = Date.now();
+        const lastRequest = toolTestState.lastRequestTime.get(toolId) || 0;
+        const timeSinceLastRequest = now - lastRequest;
+        const enhancedDebounceDelay = 2000; // Increased from 1000ms
+
+        if (timeSinceLastRequest < enhancedDebounceDelay) {
+            console.log(
+                `Tool ${toolId} test request debounced (${timeSinceLastRequest}ms ago)`,
+            );
+            const waitTime = Math.ceil(
+                (enhancedDebounceDelay - timeSinceLastRequest) / 1000,
+            );
+            showErrorMessage(
+                `Please wait ${waitTime} more second${waitTime > 1 ? "s" : ""} before testing again`,
+            );
+            return;
+        }
+
+        // 3. BUTTON STATE: Immediate feedback with better state management
+        const enrichButton = document.querySelector(
+            `[onclick*="enrichTool('${toolId}')"]`,
+        );
+        if (enrichButton) {
+            if (enrichButton.disabled) {
+                console.log(
+                    "Test button already disabled, request in progress",
+                );
+                return;
+            }
+            enrichButton.disabled = true;
+            enrichButton.textContent = "Enriching...";
+            enrichButton.classList.add("opacity-50", "cursor-not-allowed");
+        }
+
+        // 4. REQUEST CANCELLATION: Enhanced cleanup
+        const existingController = toolTestState.activeRequests.get(toolId);
+        if (existingController) {
+            console.log(`Cancelling existing request for tool ${toolId}`);
+            existingController.abort();
+            toolTestState.activeRequests.delete(toolId);
+        }
+
+        // 5. CREATE NEW REQUEST with longer timeout
+        const controller = new AbortController();
+        toolTestState.activeRequests.set(toolId, controller);
+        toolTestState.lastRequestTime.set(toolId, now);
+
+        // 6. MAKE REQUEST with increased timeout
+        //    const response = await fetchWithTimeout(`/enrich_tools_util`, {
+        const response = await fetchWithTimeout(
+            `/toolops/enrichment/enrich_tool?tool_id=${toolId}`,
+            {
+                method: "POST",
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ tool_id: toolId }),
+            },
+            toolTestState.requestTimeout, // Use the increased timeout
+        );
+        if (!response.ok) {
+            if (response.status === 404) {
+                throw new Error(
+                    `Tool with ID ${toolId} not found. It may have been deleted.`,
+                );
+            } else if (response.status === 429) {
+                throw new Error(
+                    "Too many requests. Please wait a moment before validating again.",
+                );
+            } else if (response.status >= 500) {
+                throw new Error(
+                    `Server error (${response.status}). The server may be overloaded. Please try again in a few seconds.`,
+                );
+            } else {
+                throw new Error(
+                    `HTTP ${response.status}: ${response.statusText}`,
+                );
+            }
+        }
+
+        const data = await response.json();
+        enrichButton.disabled = false;
+        enrichButton.textContent = "Enrich";
+        enrichButton.classList.remove("opacity-50", "cursor-not-allowed");
+        console.log(`Tool ${toolId} enriched successfully`, data);
+        // showSuccessMessage(`Tool ${toolId} enriched successfully`);
+
+        const newDesc = safeGetElement("view-new-description");
+        const oldDesc = safeGetElement("view-old-description");
+
+        if (newDesc) {
+            newDesc.textContent = data.enriched_desc || "";
+        }
+        if (oldDesc) {
+            oldDesc.textContent =
+                data.original_desc.slice(0, data.original_desc.indexOf("*")) ||
+                "";
+        }
+        openModal("description-view-modal");
+        // showSuccessMessage(`Tool enriched successfully`);
+    } catch (error) {
+        console.error("Error fetching tool details for testing:", error);
+        showErrorMessage(error.message);
+    } finally {
+        const testButton = document.querySelector(
+            `[onclick*="enrichTool('${toolId}')"]`,
+        );
+        if (testButton) {
+            testButton.disabled = false;
+            testButton.textContent = "Enrich";
+            testButton.classList.remove("opacity-50", "cursor-not-allowed");
+        }
+    }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+    const toolBody = document.getElementById("toolBody");
+    const selectedList = document.getElementById("selectedList");
+    const selectedCount = document.getElementById("selectedCount");
+    const searchBox = document.getElementById("searchBox");
+
+    let selectedTools = [];
+    let selectedToolIds = [];
+
+    if (toolBody !== null) {
+        // ✅ Use event delegation for dynamically added checkboxes
+        toolBody.addEventListener("change", (event) => {
+            const cb = event.target;
+            if (cb.classList.contains("tool-checkbox")) {
+                const toolName = cb.getAttribute("data-tool");
+                if (cb.checked) {
+                    if (!selectedTools.includes(toolName)) {
+                        selectedTools.push(toolName.split("###")[0]);
+                        selectedToolIds.push(toolName.split("###")[1]);
+                    }
+                } else {
+                    selectedTools = selectedTools.filter(
+                        (t) => t !== toolName.split("###")[0],
+                    );
+                    selectedToolIds = selectedToolIds.filter(
+                        (t) => t !== toolName.split("###")[1],
+                    );
+                }
+                updateSelectedList();
+            }
+        });
+    }
+
+    function updateSelectedList() {
+        selectedList.innerHTML = "";
+        if (selectedTools.length === 0) {
+            selectedList.textContent = "No tools selected";
+        } else {
+            selectedTools.forEach((tool) => {
+                const item = document.createElement("div");
+                item.className =
+                    "flex items-center justify-between bg-indigo-100 text-indigo-800 px-3 py-1 rounded-md";
+                item.innerHTML = `
+                    <span>${tool}</span>
+                    <button class="text-indigo-500 hover:text-indigo-700 font-bold remove-btn">&times;</button>
+                `;
+                item.querySelector(".remove-btn").addEventListener(
+                    "click",
+                    () => {
+                        selectedTools = selectedTools.filter((t) => t !== tool);
+                        const box = document.querySelector(`
+                            .tool-checkbox[data-tool="${tool}"]`);
+                        if (box) {
+                            box.checked = false;
+                        }
+                        updateSelectedList();
+                    },
+                );
+                selectedList.appendChild(item);
+            });
+        }
+        selectedCount.textContent = selectedTools.length;
+    }
+
+    // --- Search logic ---
+    if (searchBox !== null) {
+        searchBox.addEventListener("input", () => {
+            const query = searchBox.value.trim().toLowerCase();
+            document.querySelectorAll("#toolBody tr").forEach((row) => {
+                const name = row.dataset.name;
+                row.style.display = name.includes(query) ? "" : "none";
+            });
+        });
+    }
+    // Generic API call for Enrich/Validate
+    async function callEnrichment() {
+        // const selectedTools = getSelectedTools();
+
+        if (selectedTools.length === 0) {
+            showErrorMessage("⚠️ Please select at least one tool.");
+            return;
+        }
+        try {
+            console.log(selectedToolIds);
+            selectedToolIds.forEach((toolId) => {
+                console.log(toolId);
+                fetch(`/toolops/enrichment/enrich_tool?tool_id=${toolId}`, {
+                    method: "POST",
+                    headers: {
+                        "Cache-Control": "no-cache",
+                        Pragma: "no-cache",
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ tool_id: toolId }),
+                });
+            });
+            showSuccessMessage("Tool description enrichment has started.");
+            // Uncheck all checkboxes
+            document.querySelectorAll(".tool-checkbox").forEach((cb) => {
+                cb.checked = false;
+            });
+
+            // Empty the selected tools array
+            selectedTools = [];
+            selectedToolIds = [];
+
+            // Update the selected tools list UI
+            updateSelectedList();
+        } catch (err) {
+            //   responseDiv.textContent = `❌ Error: ${err.message}`;
+            showErrorMessage(`❌ Error: ${err.message}`);
+        }
+    }
+
+    function openTestCaseModal() {
+        if (selectedToolIds.length === 0) {
+            showErrorMessage("⚠️ Please select at least one tool.");
+            return;
+        }
+
+        // Show modal
+        document
+            .getElementById("bulk-testcase-gen-modal")
+            .classList.remove("hidden");
+        document
+            .getElementById("bulk-generate-btn")
+            .addEventListener("click", generateBulkTestCases);
+    }
+
+    async function generateBulkTestCases() {
+        const testCases = parseInt(
+            document.getElementById("gen-bulk-testcase-count").value,
+        );
+        const variations = parseInt(
+            document.getElementById("gen-bulk-nl-variation-count").value,
+        );
+
+        if (!testCases || !variations || testCases < 1 || variations < 1) {
+            showErrorMessage(
+                "⚠️ Please enter valid numbers for test cases and variations.",
+            );
+            return;
+        }
+
+        try {
+            for (const toolId of selectedToolIds) {
+                fetch(
+                    `/toolops/validation/generate_testcases?tool_id=${toolId}&number_of_test_cases=${testCases}&number_of_nl_variations=${variations}&mode=generate`,
+                    {
+                        method: "POST",
+                        headers: {
+                            "Cache-Control": "no-cache",
+                            Pragma: "no-cache",
+                            "Content-Type": "application/json",
+                        },
+                        body: JSON.stringify({ tool_id: toolId }),
+                    },
+                );
+            }
+            showSuccessMessage(
+                "Test case generation for tool validation has started.",
+            );
+            // Reset selections
+            document.querySelectorAll(".tool-checkbox").forEach((cb) => {
+                cb.checked = false;
+            });
+            selectedTools = [];
+            selectedToolIds = [];
+            updateSelectedList();
+
+            // Close modal immediately after clicking Generate
+            closeModal("bulk-testcase-gen-modal");
+        } catch (err) {
+            showErrorMessage(`❌ Error: ${err.message}`);
+        }
+    }
+    window.generateBulkTestCases = generateBulkTestCases;
+
+    function clearAllSelections() {
+        // Uncheck all checkboxes
+        document.querySelectorAll(".tool-checkbox").forEach((cb) => {
+            cb.checked = false;
+        });
+
+        // Empty the selected tools array
+        selectedTools = [];
+        selectedToolIds = [];
+
+        // Update the selected tools list UI
+        updateSelectedList();
+    }
+    // Button listeners
+    const enrichToolsBtn = document.getElementById("enrichToolsBtn");
+
+    if (enrichToolsBtn !== null) {
+        document
+            .getElementById("enrichToolsBtn")
+            .addEventListener("click", () => callEnrichment());
+        document
+            .getElementById("validateToolsBtn")
+            .addEventListener("click", () => openTestCaseModal());
+        document
+            .getElementById("clearToolsBtn")
+            .addEventListener("click", () => clearAllSelections());
+    }
+});
+
+async function generateToolTestCases(toolId) {
+    try {
+        console.log(`Generating Test cases for tool ID: ${toolId}`);
+        const now = Date.now();
+        const lastRequest = toolTestState.lastRequestTime.get(toolId) || 0;
+        const timeSinceLastRequest = now - lastRequest;
+        const enhancedDebounceDelay = 2000; // Increased from 1000ms
+
+        if (timeSinceLastRequest < enhancedDebounceDelay) {
+            console.log(
+                `Tool ${toolId} test request debounced (${timeSinceLastRequest}ms ago)`,
+            );
+            const waitTime = Math.ceil(
+                (enhancedDebounceDelay - timeSinceLastRequest) / 1000,
+            );
+            showErrorMessage(
+                `Please wait ${waitTime} more second${waitTime > 1 ? "s" : ""} before testing again`,
+            );
+            return;
+        }
+
+        // 3. BUTTON STATE: Immediate feedback with better state management
+        const tcgButton = document.querySelector(
+            `[onclick*="generateToolTestCases('${toolId}')"]`,
+        );
+        if (tcgButton) {
+            if (tcgButton.disabled) {
+                console.log(
+                    "Generate Test Cases button already disabled, request in progress",
+                );
+                return;
+            }
+            tcgButton.disabled = true;
+            tcgButton.textContent = "Generating Test Cases...";
+            tcgButton.classList.add("opacity-50", "cursor-not-allowed");
+        }
+
+        // 4. REQUEST CANCELLATION: Enhanced cleanup
+        const existingController = toolTestState.activeRequests.get(toolId);
+        if (existingController) {
+            console.log(`Cancelling existing request for tool ${toolId}`);
+            existingController.abort();
+            toolTestState.activeRequests.delete(toolId);
+        }
+
+        // 5. CREATE NEW REQUEST with longer timeout
+        const controller = new AbortController();
+        toolTestState.activeRequests.set(toolId, controller);
+        toolTestState.lastRequestTime.set(toolId, now);
+
+        const toolIdElement = safeGetElement("gen-test-tool-id");
+        if (toolIdElement) {
+            toolIdElement.textContent = toolId || "Unknown";
+        }
+        document.getElementById("gen-test-tool-id").style.display = "none";
+        // document.getElementById("gen-test-tool-id").style.display = 'block';
+
+        openModal("testcase-gen-modal");
+
+        tcgButton.disabled = false;
+        tcgButton.textContent = "Generate Test Cases";
+        tcgButton.classList.remove("opacity-50", "cursor-not-allowed");
+    } catch (error) {
+        console.error("Error fetching tool details for testing:", error);
+        showErrorMessage(error.message);
+    } finally {
+        const testButton = document.querySelector(
+            `[onclick*="generateToolTestCases('${toolId}')"]`,
+        );
+        if (testButton) {
+            testButton.disabled = false;
+            testButton.textContent = "Generate Test Cases";
+            testButton.classList.remove("opacity-50", "cursor-not-allowed");
+        }
+    }
+}
+
+async function generateTestCases() {
+    const testCases = document.getElementById("gen-testcase-count").value;
+    const variations = document.getElementById("gen-nl-variation-count").value;
+    let toolId;
+    // const toolId = document.getElementById("gen-test-tool-id").value;
+    const toolIdElement = safeGetElement("gen-test-tool-id");
+    if (toolIdElement) {
+        toolId = toolIdElement.textContent || "Unknown";
+    }
+    console.log(
+        `Generate ${testCases} test cases with ${variations} variations for tool ${toolId}`,
+    );
+
+    try {
+        showSuccessMessage(
+            "Test case generation started successfully for the tool.",
+        );
+        closeModal("testcase-gen-modal");
+        const response = await fetch(
+            `/toolops/validation/generate_testcases?tool_id=${toolId}&number_of_test_cases=${testCases}&number_of_nl_variations=${variations}&mode=generate`,
+            {
+                method: "POST",
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ tool_id: toolId }),
+            },
+        );
+
+        if (!response.ok) {
+            if (response.status === 404) {
+                throw new Error(
+                    `Tool with ID ${toolId} not found. It may have been deleted.`,
+                );
+            } else if (response.status === 429) {
+                throw new Error(
+                    "Too many requests. Please wait a moment before validating again.",
+                );
+            } else if (response.status >= 500) {
+                throw new Error(
+                    `Server error (${response.status}). The server may be overloaded. Please try again in a few seconds.`,
+                );
+            } else {
+                throw new Error(
+                    `HTTP ${response.status}: ${response.statusText}`,
+                );
+            }
+        }
+        // const data = await response.json();
+        // console.log(data)
+        // showSuccessMessage(`Tool ${toolId} enriched successfully`);
+    } catch (error) {
+        console.error("Error fetching tool details for testing:", error);
+        showErrorMessage(error.message);
+    } finally {
+        const testButton = document.querySelector(
+            `[onclick*="generateToolTestCases('${toolId}')"]`,
+        );
+        if (testButton) {
+            testButton.disabled = false;
+            testButton.textContent = "Generate Test Cases";
+            testButton.classList.remove("opacity-50", "cursor-not-allowed");
+        }
+    }
+}
+
+async function validateTool(toolId) {
+    try {
+        console.log(`Validating tool ID: ${toolId}`);
+
+        // 1. ENHANCED DEBOUNCING: More aggressive to prevent rapid clicking
+        const now = Date.now();
+        const lastRequest = toolTestState.lastRequestTime.get(toolId) || 0;
+        const timeSinceLastRequest = now - lastRequest;
+        const enhancedDebounceDelay = 2000; // Increased from 1000ms
+
+        if (timeSinceLastRequest < enhancedDebounceDelay) {
+            console.log(
+                `Tool ${toolId} test request debounced (${timeSinceLastRequest}ms ago)`,
+            );
+            const waitTime = Math.ceil(
+                (enhancedDebounceDelay - timeSinceLastRequest) / 1000,
+            );
+            showErrorMessage(
+                `Please wait ${waitTime} more second${waitTime > 1 ? "s" : ""} before testing again`,
+            );
+            return;
+        }
+
+        // 2. MODAL PROTECTION: Enhanced check
+        if (AppState.isModalActive("tool-validation-modal")) {
+            console.warn("Tool validation modal is already active");
+            return; // Silent fail for better UX
+        }
+
+        // 3. BUTTON STATE: Immediate feedback with better state management
+        const validateButton = document.querySelector(
+            `[onclick*="validateTool('${toolId}')"]`,
+        );
+        if (validateButton) {
+            if (validateButton.disabled) {
+                console.log(
+                    "Test button already disabled, request in progress",
+                );
+                return;
+            }
+            validateButton.disabled = true;
+            validateButton.textContent = "Generating Test Cases...";
+            validateButton.classList.add("opacity-50", "cursor-not-allowed");
+        }
+
+        // 4. REQUEST CANCELLATION: Enhanced cleanup
+        const existingController = toolTestState.activeRequests.get(toolId);
+        if (existingController) {
+            console.log(`Cancelling existing request for tool ${toolId}`);
+            existingController.abort();
+            toolTestState.activeRequests.delete(toolId);
+        }
+
+        // 5. CREATE NEW REQUEST with longer timeout
+        const controller = new AbortController();
+        toolTestState.activeRequests.set(toolId, controller);
+        toolTestState.lastRequestTime.set(toolId, now);
+
+        // 6. MAKE REQUEST with increased timeout
+        const response = await fetchWithTimeout(
+            `${window.ROOT_PATH}/admin/tools/${toolId}`,
+            {
+                signal: controller.signal,
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                },
+            },
+            toolTestState.requestTimeout, // Use the increased timeout
+        );
+
+        if (!response.ok) {
+            if (response.status === 404) {
+                throw new Error(
+                    `Tool with ID ${toolId} not found. It may have been deleted.`,
+                );
+            } else if (response.status === 429) {
+                throw new Error(
+                    "Too many requests. Please wait a moment before validating again.",
+                );
+            } else if (response.status >= 500) {
+                throw new Error(
+                    `Server error (${response.status}). The server may be overloaded. Please try again in a few seconds.`,
+                );
+            } else {
+                throw new Error(
+                    `HTTP ${response.status}: ${response.statusText}`,
+                );
+            }
+        }
+        const tool = await response.json();
+        console.log(`Tool ${toolId} fetched successfully`, tool);
+        toolInputSchemaRegistry = tool;
+
+        // 7. CLEAN STATE before proceeding
+        toolTestState.activeRequests.delete(toolId);
+
+        // Store in safe state
+        AppState.currentTestTool = tool;
+
+        // Set modal title and description safely - NO DOUBLE ESCAPING
+        const titleElement = safeGetElement("tool-validation-modal-title");
+        const descElement = safeGetElement("tool-validation-modal-description");
+
+        if (titleElement) {
+            titleElement.textContent = "Test Tool: " + (tool.name || "Unknown");
+        }
+        if (descElement) {
+            if (tool.description) {
+                // Escape HTML and then replace newlines with <br/> tags
+                tool.description = tool.description.slice(
+                    0,
+                    tool.description.indexOf("*"),
+                );
+                descElement.innerHTML = escapeHtml(tool.description).replace(
+                    /\n/g,
+                    "<br/>",
+                );
+            } else {
+                descElement.textContent = "No description available.";
+            }
+        }
+
+        const container = safeGetElement("tool-validation-form-fields");
+        if (!container) {
+            console.error("Tool validation form fields container not found");
+            return;
+        }
+
+        container.innerHTML = ""; // Clear previous fields
+
+        // Parse the input schema safely
+        let schema = tool.inputSchema;
+        if (typeof schema === "string") {
+            try {
+                schema = JSON.parse(schema);
+            } catch (e) {
+                console.error("Invalid JSON schema", e);
+                schema = {};
+            }
+        }
+
+        // Modal setup
+        const title = safeGetElement("tool-validation-modal-title");
+        const desc = safeGetElement("tool-validation-modal-description");
+        if (title) {
+            title.textContent = `Test Tool: ${tool.name || "Unknown"}`;
+        }
+        if (desc) {
+            desc.textContent = tool.description || "No description available.";
+        }
+        if (!container) {
+            return;
+        }
+
+        container.innerHTML = "";
+
+        // Parse schema safely
+        if (typeof schema === "string") {
+            try {
+                schema = JSON.parse(schema);
+            } catch (e) {
+                console.error("Invalid schema JSON", e);
+                schema = {};
+            }
+        }
+
+        // Example validat cases (you can replace this with API-provided cases)
+        let testCases = tool.testCases || [
+            { id: "t1", name: "Test Case 1", input_parameters: {} },
+            { id: "t2", name: "Test Case 2", input_parameters: {} },
+        ];
+
+        const validationStatusResponse = await fetchWithTimeout(
+            `/toolops/validation/generate_testcases?tool_id=${toolId}&mode=status`,
+            {
+                method: "POST",
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ tool_id: toolId }),
+            },
+            toolTestState.requestTimeout, // Use the increased timeout
+        );
+
+        if (validationStatusResponse.ok) {
+            const vsres = await validationStatusResponse.json();
+            console.log(JSON.stringify(vsres));
+            let validationStatus = await vsres;
+
+            if (validationStatus.constructor === Array) {
+                validationStatus = validationStatus[0].status;
+                if (validationStatus === "not-initiated") {
+                    showErrorMessage(
+                        "Please generate test cases before running validation.",
+                    );
+                } else if (validationStatus === "in-progress") {
+                    showErrorMessage(
+                        "Test case generation is in progress. Please try validation once it is complete.",
+                    );
+                } else if (validationStatus === "failed") {
+                    showErrorMessage(
+                        "Test case generation failed. Please check your LLM connection and try again.",
+                    );
+                    console.log(
+                        "Previous error while generating test cases: ",
+                        vsres[0].error_message,
+                    );
+                } else {
+                    const validationResponse = await fetchWithTimeout(
+                        `/toolops/validation/generate_testcases?tool_id=${toolId}&mode=query`,
+                        {
+                            method: "POST",
+                            headers: {
+                                "Cache-Control": "no-cache",
+                                Pragma: "no-cache",
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({ tool_id: toolId }),
+                        },
+                        toolTestState.requestTimeout, // Use the increased timeout
+                    );
+
+                    if (validationResponse.ok) {
+                        const vres = await validationResponse.json();
+                        // console.log(JSON.stringify(vres))
+                        testCases = await vres;
+                    }
+
+                    // Render accordion-style test cases
+                    testCases.forEach((test, index) => {
+                        const inputParameters = test.input_parameters;
+                        const acc = document.createElement("div");
+                        acc.className =
+                            "border border-gray-300 dark:border-gray-700 rounded-lg overflow-hidden";
+
+                        const header = document.createElement("button");
+                        header.type = "button";
+                        header.className =
+                            "w-full flex justify-between items-center px-4 py-3 bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-gray-100 font-medium";
+                        header.innerHTML = `
+                            <span>${`Test Case ${index + 1}`}</span>
+                            <span class="toggle-icon">+</span>
+                        `;
+
+                        const body = document.createElement("div");
+                        body.className =
+                            "hidden bg-white dark:bg-gray-900 px-4 py-4 space-y-3";
+
+                        // Toggle open/close
+                        header.addEventListener("click", () => {
+                            const isOpen = !body.classList.contains("hidden");
+                            body.classList.toggle("hidden", isOpen);
+                            header.querySelector(".toggle-icon").textContent =
+                                isOpen ? "+" : "−";
+                        });
+
+                        acc.appendChild(header);
+                        acc.appendChild(body);
+                        container.appendChild(acc);
+
+                        // Render fields
+                        const formDiv = document.createElement("form");
+                        formDiv.id = `tool-validation-form-${index}`;
+                        formDiv.className = "space-y-3";
+
+                        if (schema && schema.properties) {
+                            for (const key in schema.properties) {
+                                const prop = schema.properties[key];
+
+                                // Validate the property name
+                                const keyValidation = validateInputName(
+                                    key,
+                                    "schema property",
+                                );
+                                if (!keyValidation.valid) {
+                                    console.warn(
+                                        `Skipping invalid schema property: ${key}`,
+                                    );
+                                    continue;
+                                }
+
+                                const fieldDiv = document.createElement("div");
+                                fieldDiv.className = "mb-4";
+
+                                // Field label - use textContent to avoid double escaping
+                                const label = document.createElement("label");
+                                // label.textContent = key;
+                                label.className =
+                                    "block text-sm font-medium text-gray-700 dark:text-gray-300";
+                                // Create span for label text
+                                const labelText =
+                                    document.createElement("span");
+                                labelText.textContent = keyValidation.value;
+                                label.appendChild(labelText);
+                                let defaultValue = "";
+                                if (keyValidation.value in inputParameters) {
+                                    defaultValue =
+                                        inputParameters[keyValidation.value];
+                                }
+
+                                // Add red star if field is required
+                                if (
+                                    schema.required &&
+                                    schema.required.includes(key)
+                                ) {
+                                    const requiredMark =
+                                        document.createElement("span");
+                                    requiredMark.textContent = " *";
+                                    requiredMark.className = "text-red-500";
+                                    label.appendChild(requiredMark);
+                                }
+
+                                fieldDiv.appendChild(label);
+
+                                // Description help text - use textContent
+                                if (prop.description) {
+                                    const description =
+                                        document.createElement("small");
+                                    description.textContent = prop.description;
+                                    description.className =
+                                        "text-gray-500 block mb-1";
+                                    fieldDiv.appendChild(description);
+                                }
+
+                                // const input = document.createElement("input");
+                                // input.name = key;
+                                // input.className =
+                                // "mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-800 text-gray-200";
+                                // input.value = test.inputs[key] || prop.default || "";
+                                // fieldDiv.appendChild(input);
+
+                                if (prop.type === "array") {
+                                    const arrayContainer =
+                                        document.createElement("div");
+                                    arrayContainer.className = "space-y-2";
+
+                                    function createArrayInput(value = "") {
+                                        const wrapper =
+                                            document.createElement("div");
+                                        wrapper.className =
+                                            "flex items-center space-x-2";
+
+                                        const input =
+                                            document.createElement("input");
+                                        input.name = keyValidation.value;
+                                        input.required =
+                                            schema.required &&
+                                            schema.required.includes(key);
+                                        input.className =
+                                            "mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 text-gray-700 dark:text-gray-300 dark:border-gray-700 dark:focus:border-indigo-400 dark:focus:ring-indigo-400";
+
+                                        const itemTypes = Array.isArray(
+                                            prop.items?.anyOf,
+                                        )
+                                            ? prop.items.anyOf.map(
+                                                  (t) => t.type,
+                                              )
+                                            : [prop.items?.type];
+
+                                        if (
+                                            itemTypes.includes("number") ||
+                                            itemTypes.includes("integer")
+                                        ) {
+                                            input.type = "number";
+                                            input.step = itemTypes.includes(
+                                                "integer",
+                                            )
+                                                ? "1"
+                                                : "any";
+                                        } else if (
+                                            itemTypes.includes("boolean")
+                                        ) {
+                                            input.type = "checkbox";
+                                            input.value = "true";
+                                            input.checked =
+                                                value === true ||
+                                                value === "true";
+                                        } else {
+                                            input.type = "text";
+                                        }
+
+                                        if (
+                                            typeof value === "string" ||
+                                            typeof value === "number"
+                                        ) {
+                                            input.value = value;
+                                        }
+
+                                        const delBtn =
+                                            document.createElement("button");
+                                        delBtn.type = "button";
+                                        delBtn.className =
+                                            "ml-2 text-red-600 hover:text-red-800 focus:outline-none";
+                                        delBtn.title = "Delete";
+                                        delBtn.textContent = "×";
+                                        delBtn.addEventListener("click", () => {
+                                            arrayContainer.removeChild(wrapper);
+                                        });
+
+                                        wrapper.appendChild(input);
+
+                                        if (itemTypes.includes("boolean")) {
+                                            const hidden =
+                                                document.createElement("input");
+                                            hidden.type = "hidden";
+                                            hidden.name = keyValidation.value;
+                                            hidden.value = "false";
+                                            wrapper.appendChild(hidden);
+                                        }
+
+                                        wrapper.appendChild(delBtn);
+                                        return wrapper;
+                                    }
+
+                                    const addBtn =
+                                        document.createElement("button");
+                                    addBtn.type = "button";
+                                    addBtn.className =
+                                        "mt-2 px-2 py-1 bg-indigo-500 text-white rounded hover:bg-indigo-600 focus:outline-none";
+                                    addBtn.textContent = "Add items";
+                                    addBtn.addEventListener("click", () => {
+                                        arrayContainer.appendChild(
+                                            createArrayInput(),
+                                        );
+                                    });
+
+                                    defaultValue = defaultValue[0];
+                                    if (Array.isArray(defaultValue)) {
+                                        if (defaultValue.length > 0) {
+                                            defaultValue.forEach((val) => {
+                                                arrayContainer.appendChild(
+                                                    createArrayInput(val),
+                                                );
+                                            });
+                                        } else {
+                                            // Create one empty input for empty default arrays
+                                            arrayContainer.appendChild(
+                                                createArrayInput(),
+                                            );
+                                        }
+                                    } else {
+                                        arrayContainer.appendChild(
+                                            createArrayInput(),
+                                        );
+                                    }
+
+                                    fieldDiv.appendChild(arrayContainer);
+                                    fieldDiv.appendChild(addBtn);
+                                } else {
+                                    // Input field with validation (with multiline support)
+                                    let fieldInput;
+                                    const isTextType = prop.type === "text";
+                                    if (isTextType) {
+                                        fieldInput =
+                                            document.createElement("textarea");
+                                        fieldInput.rows = 4;
+                                    } else {
+                                        fieldInput =
+                                            document.createElement("input");
+                                        if (
+                                            prop.type === "number" ||
+                                            prop.type === "integer"
+                                        ) {
+                                            fieldInput.type = "number";
+                                        } else if (prop.type === "boolean") {
+                                            fieldInput.type = "checkbox";
+                                            fieldInput.value = "true";
+                                        } else {
+                                            fieldInput =
+                                                document.createElement(
+                                                    "textarea",
+                                                );
+                                            fieldInput.rows = 1;
+                                        }
+                                    }
+
+                                    fieldInput.name = keyValidation.value;
+                                    fieldInput.required =
+                                        schema.required &&
+                                        schema.required.includes(key);
+                                    fieldInput.className =
+                                        prop.type === "boolean"
+                                            ? "mt-1 h-4 w-4 text-indigo-600 dark:text-indigo-200 border border-gray-300 rounded"
+                                            : "mt-1 block w-full rounded-md border border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 dark:bg-gray-900 text-gray-700 dark:text-gray-300 dark:border-gray-700 dark:focus:border-indigo-400 dark:focus:ring-indigo-400";
+
+                                    // Set default values here
+                                    if (prop.default !== undefined) {
+                                        if (fieldInput.type === "checkbox") {
+                                            fieldInput.checked =
+                                                prop.default === true;
+                                        } else if (isTextType) {
+                                            fieldInput.value = prop.default;
+                                        } else {
+                                            fieldInput.value = prop.default;
+                                        }
+                                    }
+                                    fieldInput.value = defaultValue;
+                                    fieldDiv.appendChild(fieldInput);
+                                    if (prop.default !== undefined) {
+                                        if (fieldInput.type === "checkbox") {
+                                            const hiddenInput =
+                                                document.createElement("input");
+                                            hiddenInput.type = "hidden";
+                                            hiddenInput.value = "false";
+                                            hiddenInput.name =
+                                                keyValidation.value;
+                                            fieldDiv.appendChild(hiddenInput);
+                                        }
+                                    }
+                                }
+                                formDiv.appendChild(fieldDiv);
+                            }
+                        }
+
+                        // First section - Passthrough Headers
+                        const headerSection = document.createElement("div");
+                        headerSection.className = "mt-4 border-t pt-4";
+
+                        const headerDiv = document.createElement("div");
+
+                        const label = document.createElement("label");
+                        label.setAttribute(
+                            "for",
+                            "validation-passthrough-headers",
+                        );
+                        label.className =
+                            "block text-sm font-medium text-gray-700 dark:text-gray-400";
+                        label.textContent = "Passthrough Headers (Optional)";
+
+                        const small = document.createElement("small");
+                        small.className =
+                            "text-gray-500 dark:text-gray-400 block mb-2";
+                        small.textContent =
+                            'Additional headers to send with the request (format: "Header-Name: Value", one per line)';
+
+                        const textarea = document.createElement("textarea");
+                        textarea.id = "validation-passthrough-headers";
+                        textarea.name = "passthrough_headers";
+                        textarea.rows = 3;
+                        textarea.placeholder =
+                            "Authorization: Bearer your-token\nX-Tenant-Id: tenant-123\nX-Trace-Id: trace-456";
+                        textarea.className =
+                            "w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200";
+
+                        headerDiv.appendChild(label);
+                        headerDiv.appendChild(small);
+                        headerDiv.appendChild(textarea);
+                        headerSection.appendChild(headerDiv);
+
+                        const nlUtteranceSection =
+                            document.createElement("div");
+                        nlUtteranceSection.className = "mt-4 border-t pt-4";
+                        const nlUtteranceDiv = document.createElement("div");
+                        const nlUtterancelabel =
+                            document.createElement("label");
+                        nlUtterancelabel.setAttribute(
+                            "for",
+                            "test-passthrough-nlUtterances",
+                        );
+                        nlUtterancelabel.className =
+                            "block text-sm font-bold text-green-700 dark:text-green-400";
+                        nlUtterancelabel.textContent =
+                            "Generated Test Utterance";
+
+                        const nlUtterancesmall =
+                            document.createElement("small");
+                        nlUtterancesmall.className =
+                            "text-gray-500 dark:text-gray-400 block mb-2";
+                        nlUtterancesmall.textContent =
+                            "Modify or add new utterances to test using the agent.";
+
+                        const nlutextarea = document.createElement("textarea");
+                        nlutextarea.id = `validation-passthrough-nlUtterances-${index}`;
+                        nlutextarea.name = "passthrough_nlUtterances";
+                        nlutextarea.rows = 3;
+                        nlutextarea.value = test.nl_utterance.join("\n\n");
+                        nlutextarea.className =
+                            "w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200";
+
+                        nlUtteranceDiv.appendChild(nlUtterancelabel);
+                        nlUtteranceDiv.appendChild(nlUtterancesmall);
+                        nlUtteranceDiv.appendChild(nlutextarea);
+                        nlUtteranceSection.appendChild(nlUtteranceDiv);
+
+                        // // Result area
+                        // const resultBox = document.createElement("pre");
+                        // resultBox.id = `test-result-${index}`;
+                        // resultBox.className =
+                        // "bg-gray-50 dark:bg-gray-800 text-sm text-gray-700 dark:text-gray-200 p-3 rounded overflow-x-auto hidden border border-gray-200 dark:border-gray-700";
+
+                        // Run button
+                        const runBtn = document.createElement("button");
+                        runBtn.textContent = "Run Test";
+                        runBtn.className =
+                            "mt-2 mr-2 px-3 py-2 bg-green-600 text-white rounded hover:bg-green-700";
+                        // Added: mr-2 for spacing
+                        runBtn.addEventListener("click", async () => {
+                            await runToolValidation(index);
+                        });
+
+                        // Run Agent button
+                        const runAgentBtn = document.createElement("button");
+                        runAgentBtn.textContent = "Run With Agent";
+                        runAgentBtn.className =
+                            "mt-2 px-3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700";
+                        // Changed color to blue
+                        runAgentBtn.addEventListener("click", async () => {
+                            await runToolAgentValidation(index);
+                        });
+
+                        // Loading spinner
+                        const loadingDiv = document.createElement("div");
+                        loadingDiv.id = `tool-validation-loading-${index}`;
+                        loadingDiv.style.display = "none";
+
+                        const spinner = document.createElement("div");
+                        spinner.className = "spinner";
+                        loadingDiv.appendChild(spinner);
+
+                        // Result area
+                        const resultDiv = document.createElement("div");
+                        resultDiv.id = `tool-validation-result-${index}`;
+                        resultDiv.className =
+                            "mt-4 bg-gray-100 p-2 rounded overflow-auto dark:bg-gray-900 dark:text-gray-300";
+                        resultDiv.style.height = "400px";
+
+                        body.appendChild(formDiv);
+                        body.appendChild(headerSection);
+                        body.appendChild(nlUtteranceSection);
+                        body.appendChild(runBtn);
+                        body.appendChild(runAgentBtn);
+                        body.appendChild(loadingDiv);
+                        body.appendChild(resultDiv);
+                    });
+
+                    // Run All Tests button
+                    const runAllDiv = document.createElement("div");
+                    runAllDiv.className = "mt-6 text-center";
+                    runAllDiv.innerHTML = `
+                        <button id="run-all-tests-btn"
+                        class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">
+                        Run All Tests
+                        </button>`;
+                    container.appendChild(runAllDiv);
+
+                    // Run All Tests wit hAgent button
+                    // const runAGentAllDiv = document.createElement("div");
+                    // runAGentAllDiv.className = "mt-6 text-center";
+                    // runAGentAllDiv.innerHTML = `
+                    //     <button id="run-all-agent-tests-btn"
+                    //     class="px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700">
+                    //     Run With Agent
+                    //     </button>`;
+                    // container.appendChild(runAGentAllDiv);
+
+                    // Hook up Run All button
+                    document
+                        .getElementById("run-all-tests-btn")
+                        ?.addEventListener("click", async () => {
+                            showSuccessMessage(
+                                "🔍 Validation in progress; View results by expanding each test case.",
+                            );
+                            const total = testCases.length;
+                            document
+                                .querySelectorAll(
+                                    "#tool-validation-form-fields > div",
+                                )
+                                .forEach((acc) => {
+                                    const body =
+                                        acc.querySelector("div.hidden");
+                                    const icon =
+                                        acc.querySelector(".toggle-icon");
+                                    if (body) {
+                                        body.classList.remove("hidden");
+                                    }
+                                    if (icon) {
+                                        icon.textContent = "−";
+                                    }
+                                });
+                            for (let i = 0; i < total; i++) {
+                                await runToolValidation(i);
+                            }
+                        });
+
+                    openModal("tool-validation-modal");
+                    console.log(
+                        "✓ Test modal with accordions loaded successfully",
+                    );
+                }
+            } else {
+                showErrorMessage(
+                    "Test case generation failed. Please check your LLM connection and try again.",
+                );
+            }
+        }
+    } catch (error) {
+        console.error("Error fetching tool details for testing:", error);
+        showErrorMessage(error.message);
+    } finally {
+        const testButton = document.querySelector(
+            `[onclick*="validateTool('${toolId}')"]`,
+        );
+        if (testButton) {
+            testButton.disabled = false;
+            testButton.textContent = "Validate";
+            testButton.classList.remove("opacity-50", "cursor-not-allowed");
+        }
+    }
+}
+
+async function runToolValidation(testIndex) {
+    const form = document.querySelector(`#tool-validation-form-${testIndex}`);
+    const resultContainer = document.querySelector(
+        `#tool-validation-result-${testIndex}`,
+    );
+    const loadingElement = safeGetElement(
+        `tool-validation-loading-${testIndex}`,
+    );
+    const runButton = document.querySelector(
+        'button[onclick="runToolValidation()"]',
+    );
+
+    if (!form || !AppState.currentTestTool) {
+        console.error("Tool test form or current tool not found");
+        showErrorMessage("Tool test form not available");
+        return;
+    }
+
+    // Prevent multiple concurrent test runs
+    if (runButton && runButton.disabled) {
+        console.log("Tool test already running");
+        return;
+    }
+
+    try {
+        // Disable run button
+        if (runButton) {
+            runButton.disabled = true;
+            runButton.textContent = "Running...";
+            runButton.classList.add("opacity-50");
+        }
+
+        // Show loading
+        if (loadingElement) {
+            loadingElement.style.display = "block";
+        }
+        if (resultContainer) {
+            resultContainer.innerHTML = "";
+        }
+
+        const formData = new FormData(form);
+        // const formData = {};
+        // form.querySelectorAll("input, textarea, select").forEach((input) => {
+        // formData[input.name] =
+        //     input.type === "checkbox" ? input.checked : input.value;
+        // });
+        const params = {};
+
+        const schema = toolInputSchemaRegistry.inputSchema;
+
+        if (schema && schema.properties) {
+            for (const key in schema.properties) {
+                const prop = schema.properties[key];
+                const keyValidation = validateInputName(key, "parameter");
+                if (!keyValidation.valid) {
+                    console.warn(`Skipping invalid parameter: ${key}`);
+                    continue;
+                }
+                let value;
+                if (prop.type === "array") {
+                    const inputValues = formData.getAll(key);
+                    try {
+                        // Convert values based on the items schema type
+                        if (prop.items) {
+                            const itemType = Array.isArray(prop.items.anyOf)
+                                ? prop.items.anyOf.map((t) => t.type)
+                                : [prop.items.type];
+
+                            if (
+                                itemType.includes("number") ||
+                                itemType.includes("integer")
+                            ) {
+                                value = inputValues.map((v) => {
+                                    const num = Number(v);
+                                    if (isNaN(num)) {
+                                        throw new Error(`Invalid number: ${v}`);
+                                    }
+                                    return num;
+                                });
+                            } else if (itemType.includes("boolean")) {
+                                value = inputValues.map(
+                                    (v) => v === "true" || v === true,
+                                );
+                            } else if (itemType.includes("object")) {
+                                value = inputValues.map((v) => {
+                                    try {
+                                        const parsed = JSON.parse(v);
+                                        if (
+                                            typeof parsed !== "object" ||
+                                            Array.isArray(parsed)
+                                        ) {
+                                            throw new Error(
+                                                "Value must be an object",
+                                            );
+                                        }
+                                        return parsed;
+                                    } catch {
+                                        throw new Error(
+                                            `Invalid object format for ${key}`,
+                                        );
+                                    }
+                                });
+                            } else {
+                                value = inputValues;
+                            }
+                        }
+
+                        // Handle empty values
+                        if (
+                            value.length === 0 ||
+                            (value.length === 1 && value[0] === "")
+                        ) {
+                            if (
+                                schema.required &&
+                                schema.required.includes(key)
+                            ) {
+                                params[keyValidation.value] = [];
+                            }
+                            continue;
+                        }
+                        params[keyValidation.value] = value;
+                    } catch (error) {
+                        console.error(
+                            `Error parsing array values for ${key}:`,
+                            error,
+                        );
+                        showErrorMessage(
+                            `Invalid input format for ${key}. Please check the values are in correct format.`,
+                        );
+                        throw error;
+                    }
+                } else {
+                    value = formData.get(key);
+                    if (value === null || value === undefined || value === "") {
+                        if (schema.required && schema.required.includes(key)) {
+                            params[keyValidation.value] = "";
+                        }
+                        continue;
+                    }
+                    if (prop.type === "number" || prop.type === "integer") {
+                        params[keyValidation.value] = Number(value);
+                    } else if (prop.type === "boolean") {
+                        params[keyValidation.value] =
+                            value === "true" || value === true;
+                    } else if (prop.enum) {
+                        if (prop.enum.includes(value)) {
+                            params[keyValidation.value] = value;
+                        }
+                    } else {
+                        params[keyValidation.value] = value;
+                    }
+                }
+            }
+        }
+
+        const payload = {
+            jsonrpc: "2.0",
+            id: Date.now(),
+            method: AppState.currentTestTool.name,
+            params,
+        };
+
+        // Parse custom headers from the passthrough headers field
+        const requestHeaders = {
+            "Content-Type": "application/json",
+        };
+
+        // Authentication will be handled automatically by the JWT cookie
+        // that was set when the admin UI loaded. The 'credentials: "include"'
+        // in the fetch request ensures the cookie is sent with the request.
+
+        const passthroughHeadersField = document.getElementById(
+            "validation-passthrough-headers",
+        );
+        if (passthroughHeadersField && passthroughHeadersField.value.trim()) {
+            const headerLines = passthroughHeadersField.value
+                .trim()
+                .split("\n");
+            for (const line of headerLines) {
+                const trimmedLine = line.trim();
+                if (trimmedLine) {
+                    const colonIndex = trimmedLine.indexOf(":");
+                    if (colonIndex > 0) {
+                        const headerName = trimmedLine
+                            .substring(0, colonIndex)
+                            .trim();
+                        const headerValue = trimmedLine
+                            .substring(colonIndex + 1)
+                            .trim();
+
+                        // Validate header name and value
+                        const validation = validatePassthroughHeader(
+                            headerName,
+                            headerValue,
+                        );
+                        if (!validation.valid) {
+                            showErrorMessage(
+                                `Invalid header: ${validation.error}`,
+                            );
+                            return;
+                        }
+
+                        if (headerName && headerValue) {
+                            requestHeaders[headerName] = headerValue;
+                        }
+                    } else if (colonIndex === -1) {
+                        showErrorMessage(
+                            `Invalid header format: "${trimmedLine}". Expected format: "Header-Name: Value"`,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Use longer timeout for test execution
+        const response = await fetchWithTimeout(
+            `${window.ROOT_PATH}/rpc`,
+            {
+                method: "POST",
+                headers: requestHeaders,
+                body: JSON.stringify(payload),
+                credentials: "include",
+            },
+            window.MCPGATEWAY_UI_TOOL_TEST_TIMEOUT || 60000, // Use configurable timeout
+        );
+
+        const result = await response.json();
+        const resultStr = JSON.stringify(result, null, 2);
+
+        if (resultContainer && window.CodeMirror) {
+            try {
+                AppState.toolTestResultEditor = window.CodeMirror(
+                    resultContainer,
+                    {
+                        value: resultStr,
+                        mode: "application/json",
+                        theme: "monokai",
+                        readOnly: true,
+                        lineNumbers: true,
+                    },
+                );
+            } catch (editorError) {
+                console.error("Error creating CodeMirror editor:", editorError);
+                // Fallback to plain text
+                const pre = document.createElement("pre");
+                pre.className =
+                    "bg-gray-900 text-green-400 p-4 rounded overflow-auto max-h-96";
+                pre.textContent = resultStr;
+                resultContainer.appendChild(pre);
+            }
+        } else if (resultContainer) {
+            const pre = document.createElement("pre");
+            pre.className =
+                "bg-gray-100 p-4 rounded overflow-auto max-h-96 dark:bg-gray-800 dark:text-gray-100";
+            pre.textContent = resultStr;
+            resultContainer.appendChild(pre);
+        }
+
+        console.log("✓ Tool test completed successfully");
+    } catch (error) {
+        console.error("Tool test error:", error);
+        if (resultContainer) {
+            const errorMessage = handleFetchError(error, "run tool test");
+            const errorDiv = document.createElement("div");
+            errorDiv.className = "text-red-600 p-4";
+            errorDiv.textContent = `Error: ${errorMessage}`;
+            resultContainer.appendChild(errorDiv);
+        }
+    } finally {
+        // Always restore UI state
+        if (loadingElement) {
+            loadingElement.style.display = "none";
+        }
+        if (runButton) {
+            runButton.disabled = false;
+            runButton.textContent = "Run Tool";
+            runButton.classList.remove("opacity-50");
+        }
+    }
+}
+
+async function runToolAgentValidation(testIndex) {
+    const form = document.querySelector(`#tool-validation-form-${testIndex}`);
+    const resultContainer = document.querySelector(
+        `#tool-validation-result-${testIndex}`,
+    );
+    const loadingElement = safeGetElement(
+        `tool-validation-loading-${testIndex}`,
+    );
+    const runButton = document.querySelector(
+        'button[onclick="runToolAgentValidation()"]',
+    );
+
+    if (!form || !AppState.currentTestTool) {
+        console.error("Tool test form or current tool not found");
+        showErrorMessage("Tool test form not available");
+        return;
+    }
+
+    // Prevent multiple concurrent test runs
+    if (runButton && runButton.disabled) {
+        console.log("Tool test already running");
+        return;
+    }
+
+    try {
+        // Disable run button
+        if (runButton) {
+            runButton.disabled = true;
+            runButton.textContent = "Running...";
+            runButton.classList.add("opacity-50");
+        }
+
+        // Show loading
+        if (loadingElement) {
+            loadingElement.style.display = "block";
+        }
+        if (resultContainer) {
+            resultContainer.innerHTML = "";
+        }
+
+        const nlTestCases = document
+            .getElementById(`validation-passthrough-nlUtterances-${testIndex}`)
+            .value.split(/\r?\n\r?\n/);
+        const toolId = AppState.currentTestTool.id;
+
+        console.log(nlTestCases);
+        console.log(
+            "Running validation for the Tool: ",
+            AppState.currentTestTool.name,
+        );
+        console.log("Running validation for the Tool Id: ", toolId);
+
+        const payload = { tool_id: toolId, tool_nl_test_cases: nlTestCases };
+
+        // Parse custom headers from the passthrough headers field
+        const requestHeaders = {
+            "Content-Type": "application/json",
+        };
+
+        // Authentication will be handled automatically by the JWT cookie
+        // that was set when the admin UI loaded. The 'credentials: "include"'
+        // in the fetch request ensures the cookie is sent with the request.
+
+        const passthroughHeadersField = document.getElementById(
+            "validation-passthrough-headers",
+        );
+        if (passthroughHeadersField && passthroughHeadersField.value.trim()) {
+            const headerLines = passthroughHeadersField.value
+                .trim()
+                .split("\n");
+            for (const line of headerLines) {
+                const trimmedLine = line.trim();
+                if (trimmedLine) {
+                    const colonIndex = trimmedLine.indexOf(":");
+                    if (colonIndex > 0) {
+                        const headerName = trimmedLine
+                            .substring(0, colonIndex)
+                            .trim();
+                        const headerValue = trimmedLine
+                            .substring(colonIndex + 1)
+                            .trim();
+
+                        // Validate header name and value
+                        const validation = validatePassthroughHeader(
+                            headerName,
+                            headerValue,
+                        );
+                        if (!validation.valid) {
+                            showErrorMessage(
+                                `Invalid header: ${validation.error}`,
+                            );
+                            return;
+                        }
+
+                        if (headerName && headerValue) {
+                            requestHeaders[headerName] = headerValue;
+                        }
+                    } else if (colonIndex === -1) {
+                        showErrorMessage(
+                            `Invalid header format: "${trimmedLine}". Expected format: "Header-Name: Value"`,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        const response = await fetchWithTimeout(
+            "/toolops/validation/execute_tool_nl_testcases",
+            {
+                method: "POST",
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(payload),
+            },
+            toolTestState.requestTimeout, // Use the increased timeout
+        );
+
+        const result = await response.json();
+        const resultStr = JSON.stringify(result, null, 2);
+
+        if (resultContainer && window.CodeMirror) {
+            try {
+                AppState.toolTestResultEditor = window.CodeMirror(
+                    resultContainer,
+                    {
+                        value: resultStr,
+                        mode: "application/json",
+                        theme: "monokai",
+                        readOnly: true,
+                        lineNumbers: true,
+                    },
+                );
+            } catch (editorError) {
+                console.error("Error creating CodeMirror editor:", editorError);
+                // Fallback to plain text
+                const pre = document.createElement("pre");
+                pre.className =
+                    "bg-gray-900 text-green-400 p-4 rounded overflow-auto max-h-96";
+                pre.textContent = resultStr;
+                resultContainer.appendChild(pre);
+            }
+        } else if (resultContainer) {
+            const pre = document.createElement("pre");
+            pre.className =
+                "bg-gray-100 p-4 rounded overflow-auto max-h-96 dark:bg-gray-800 dark:text-gray-100";
+            pre.textContent = resultStr;
+            resultContainer.appendChild(pre);
+        }
+
+        console.log("✓ Tool test completed successfully");
+    } catch (error) {
+        console.error("Tool test error:", error);
+        if (resultContainer) {
+            const errorMessage = handleFetchError(error, "run tool test");
+            const errorDiv = document.createElement("div");
+            errorDiv.className = "text-red-600 p-4";
+            errorDiv.textContent = `Error: ${errorMessage}`;
+            resultContainer.appendChild(errorDiv);
+        }
+    } finally {
+        // Always restore UI state
+        if (loadingElement) {
+            loadingElement.style.display = "none";
+        }
+        if (runButton) {
+            runButton.disabled = false;
+            runButton.textContent = "Run Tool";
+            runButton.classList.remove("opacity-50");
         }
     }
 }
@@ -9489,7 +12650,7 @@ async function runPromptTest() {
 
         // Call the prompt API endpoint
         const response = await fetch(
-            `${window.ROOT_PATH}/prompts/${encodeURIComponent(promptTestState.currentTestPrompt.name)}`,
+            `${window.ROOT_PATH}/prompts/${encodeURIComponent(promptTestState.currentTestPrompt.id)}`,
             {
                 method: "POST",
                 headers: {
@@ -9566,6 +12727,42 @@ async function runPromptTest() {
             runButton.disabled = false;
             runButton.textContent = "Render Prompt";
         }
+    }
+}
+
+/**
+ * Clean up resource test modal state
+ */
+function cleanupResourceTestModal() {
+    try {
+        // Clear stored state
+        window.CurrentResourceUnderTest = null;
+
+        // Reset form fields container
+        const fieldsContainer = safeGetElement("resource-test-form-fields");
+        if (fieldsContainer) {
+            fieldsContainer.innerHTML = "";
+        }
+
+        // Reset result box
+        const resultBox = safeGetElement("resource-test-result");
+        if (resultBox) {
+            resultBox.innerHTML = `
+                <div class="text-gray-500 dark:text-gray-400 italic">
+                    Fill the fields and click Invoke Resource
+                </div>
+            `;
+        }
+
+        // Hide loading if exists
+        const loading = safeGetElement("resource-test-loading");
+        if (loading) {
+            loading.classList.add("hidden");
+        }
+
+        console.log("✓ Resource test modal cleaned up");
+    } catch (err) {
+        console.error("Error cleaning up resource test modal:", err);
     }
 }
 
@@ -9938,7 +13135,6 @@ async function viewTool(toolId) {
         }
 
         const tool = await response.json();
-
         // Build auth HTML safely with new styling
         let authHTML = "";
         if (tool.auth?.username && tool.auth?.password) {
@@ -10218,6 +13414,10 @@ async function viewTool(toolId) {
             setTextSafely(
                 ".tool-display-name",
                 tool.displayName || tool.customName || tool.name,
+            );
+            tool.description = tool.description.slice(
+                0,
+                tool.description.indexOf("*"),
             );
             setTextSafely(".tool-name", tool.name);
             setTextSafely(".tool-url", tool.url);
@@ -10549,6 +13749,14 @@ async function handleResourceFormSubmit(e) {
         // Validate inputs
         const name = formData.get("name");
         const uri = formData.get("uri");
+        let template = null;
+        // Check if URI contains '{' and '}'
+        if (uri && uri.includes("{") && uri.includes("}")) {
+            template = uri;
+            // append uri_template only when uri is a templatized resource
+            formData.append("uri_template", template);
+        }
+
         const nameValidation = validateInputName(name, "resource");
         const uriValidation = validateInputName(uri, "resource URI");
 
@@ -11353,6 +14561,12 @@ async function handleEditResFormSubmit(e) {
         // Validate inputs
         const name = formData.get("name");
         const uri = formData.get("uri");
+        let template = null;
+        // Check if URI contains '{' and '}'
+        if (uri && uri.includes("{") && uri.includes("}")) {
+            template = uri;
+        }
+        formData.append("uri_template", template);
         const nameValidation = validateInputName(name, "resource");
         const uriValidation = validateInputName(uri, "resource URI");
 
@@ -12209,18 +15423,44 @@ function setupSelectorSearch() {
         });
     }
 
-    // Resources search
-    const searchResources = safeGetElement("searchResources", true);
-    if (searchResources) {
-        searchResources.addEventListener("input", function () {
-            filterSelectorItems(
-                this.value,
-                "#associatedResources",
-                ".resource-item",
-                "noResourcesMessage",
-                "searchResourcesQuery",
-            );
+    // Edit-server tools search (server-side, mirror of searchTools)
+    const searchEditTools = safeGetElement("searchEditTools", true);
+    if (searchEditTools) {
+        let editSearchTimeout;
+        searchEditTools.addEventListener("input", function () {
+            const searchTerm = this.value;
+            if (editSearchTimeout) {
+                clearTimeout(editSearchTimeout);
+            }
+            editSearchTimeout = setTimeout(() => {
+                serverSideEditToolSearch(searchTerm);
+            }, 300);
         });
+
+        // If HTMX swaps/paginates the edit tools container, re-run server-side search
+        const editToolsContainer = document.getElementById("edit-server-tools");
+        if (editToolsContainer) {
+            editToolsContainer.addEventListener("htmx:afterSwap", function () {
+                try {
+                    const current = searchEditTools.value || "";
+                    if (current && current.trim() !== "") {
+                        serverSideEditToolSearch(current);
+                    } else {
+                        // No active search — ensure the selector is initialized
+                        initToolSelect(
+                            "edit-server-tools",
+                            "selectedEditToolsPills",
+                            "selectedEditToolsWarning",
+                            6,
+                            "selectAllEditToolsBtn",
+                            "clearAllEditToolsBtn",
+                        );
+                    }
+                } catch (err) {
+                    console.error("Error handling edit-tools afterSwap:", err);
+                }
+            });
+        }
     }
 
     // Prompts search (server-side)
@@ -12237,63 +15477,115 @@ function setupSelectorSearch() {
             }, 300);
         });
     }
-}
 
-/**
- * Generic function to filter items in multi-select dropdowns with no results message
- */
-function filterSelectorItems(
-    searchText,
-    containerSelector,
-    itemSelector,
-    noResultsId,
-    searchQueryId,
-) {
-    const container = document.querySelector(containerSelector);
-    if (!container) {
-        return;
-    }
-
-    const items = container.querySelectorAll(itemSelector);
-    const search = searchText.toLowerCase().trim();
-    let hasVisibleItems = false;
-
-    items.forEach((item) => {
-        let textContent = "";
-
-        // Get text from all text nodes within the item
-        const textElements = item.querySelectorAll(
-            "span, .text-xs, .font-medium",
-        );
-        textElements.forEach((el) => {
-            textContent += " " + el.textContent;
+    // Edit-server prompts search (server-side, mirror of searchPrompts)
+    const searchEditPrompts = safeGetElement("searchEditPrompts", true);
+    if (searchEditPrompts) {
+        let editSearchTimeout;
+        searchEditPrompts.addEventListener("input", function () {
+            const searchTerm = this.value;
+            if (editSearchTimeout) {
+                clearTimeout(editSearchTimeout);
+            }
+            editSearchTimeout = setTimeout(() => {
+                serverSideEditPromptsSearch(searchTerm);
+            }, 300);
         });
 
-        // Also get direct text content
-        textContent += " " + item.textContent;
-
-        if (search === "" || textContent.toLowerCase().includes(search)) {
-            item.style.display = "";
-            hasVisibleItems = true;
-        } else {
-            item.style.display = "none";
+        // If HTMX swaps/paginates the edit prompts container, re-run server-side search
+        const editPromptsContainer = document.getElementById(
+            "edit-server-prompts",
+        );
+        if (editPromptsContainer) {
+            editPromptsContainer.addEventListener(
+                "htmx:afterSwap",
+                function () {
+                    try {
+                        const current = searchEditPrompts.value || "";
+                        if (current && current.trim() !== "") {
+                            serverSideEditPromptsSearch(current);
+                        } else {
+                            // No active search — ensure the selector is initialized
+                            initPromptSelect(
+                                "edit-server-prompts",
+                                "selectedEditPromptsPills",
+                                "selectedEditPromptsWarning",
+                                6,
+                                "selectAllEditPromptsBtn",
+                                "clearAllEditPromptsBtn",
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error handling edit-prompts afterSwap:",
+                            err,
+                        );
+                    }
+                },
+            );
         }
-    });
+    }
 
-    // Handle no results message
-    const noResultsMessage = safeGetElement(noResultsId, true);
-    const searchQuerySpan = safeGetElement(searchQueryId, true);
+    // Resources search (server-side)
+    const searchResources = safeGetElement("searchResources", true);
+    if (searchResources) {
+        let resourceSearchTimeout;
+        searchResources.addEventListener("input", function () {
+            const searchTerm = this.value;
+            if (resourceSearchTimeout) {
+                clearTimeout(resourceSearchTimeout);
+            }
+            resourceSearchTimeout = setTimeout(() => {
+                serverSideResourceSearch(searchTerm);
+            }, 300);
+        });
+    }
 
-    if (search !== "" && !hasVisibleItems) {
-        if (noResultsMessage) {
-            noResultsMessage.style.display = "block";
-        }
-        if (searchQuerySpan) {
-            searchQuerySpan.textContent = searchText;
-        }
-    } else {
-        if (noResultsMessage) {
-            noResultsMessage.style.display = "none";
+    // Edit-server resources search (server-side, mirror of searchResources)
+    const searchEditResources = safeGetElement("searchEditResources", true);
+    if (searchEditResources) {
+        let editSearchTimeout;
+        searchEditResources.addEventListener("input", function () {
+            const searchTerm = this.value;
+            if (editSearchTimeout) {
+                clearTimeout(editSearchTimeout);
+            }
+            editSearchTimeout = setTimeout(() => {
+                serverSideEditResourcesSearch(searchTerm);
+            }, 300);
+        });
+
+        // If HTMX swaps/paginates the edit resources container, re-run server-side search
+        const editResourcesContainer = document.getElementById(
+            "edit-server-resources",
+        );
+        if (editResourcesContainer) {
+            editResourcesContainer.addEventListener(
+                "htmx:afterSwap",
+                function () {
+                    try {
+                        const current = searchEditResources.value || "";
+                        if (current && current.trim() !== "") {
+                            serverSideEditResourcesSearch(current);
+                        } else {
+                            // No active search — ensure the selector is initialized
+                            initResourceSelect(
+                                "edit-server-resources",
+                                "selectedEditResourcesPills",
+                                "selectedEditResourcesWarning",
+                                6,
+                                "selectAllEditResourcesBtn",
+                                "clearAllEditResourcesBtn",
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            "Error handling edit-resources afterSwap:",
+                            err,
+                        );
+                    }
+                },
+            );
         }
     }
 }
@@ -12317,13 +15609,28 @@ function filterServerTable(searchText) {
         rows.forEach((row) => {
             let textContent = "";
 
-            // Get text from all cells in the row
+            // Get text from all searchable cells (exclude only Actions column)
+            // Table columns: Icon(0), S.No.(1), UUID(2), Name(3), Description(4), Tools(5), Resources(6), Prompts(7), Tags(8), Owner(9), Team(10), Visibility(11), Actions(12)
             const cells = row.querySelectorAll("td");
-            cells.forEach((cell) => {
-                textContent += " " + cell.textContent;
+            // Search all columns except Icon and Actions columns
+            const searchableColumnIndices = [];
+            for (let i = 1; i < cells.length - 1; i++) {
+                searchableColumnIndices.push(i);
+            }
+
+            searchableColumnIndices.forEach((index) => {
+                if (cells[index]) {
+                    // Clean the text content and make it searchable
+                    const cellText = cells[index].textContent
+                        .replace(/\s+/g, " ")
+                        .trim();
+                    textContent += " " + cellText;
+                }
             });
 
-            if (search === "" || textContent.toLowerCase().includes(search)) {
+            const isMatch =
+                search === "" || textContent.toLowerCase().includes(search);
+            if (isMatch) {
                 row.style.display = "";
             } else {
                 row.style.display = "none";
@@ -12336,6 +15643,564 @@ function filterServerTable(searchText) {
 
 // Make server search function available globally
 window.filterServerTable = filterServerTable;
+
+/**
+ * Filter Tools table based on search text
+ */
+function filterToolsTable(searchText) {
+    try {
+        const tbody = document.querySelector("#tools-table-body");
+        if (!tbody) {
+            console.warn("Tools table body not found");
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        const search = searchText.toLowerCase().trim();
+
+        rows.forEach((row) => {
+            let textContent = "";
+
+            // Get text from searchable cells (exclude S.No. and Actions columns)
+            // Tools columns: S.No.(0), Gateway Name(1), Name(2), URL(3), Type(4), Request Type(5), Description(6), Annotations(7), Tags(8), Owner(9), Team(10), Visibility(11), Status(12), Actions(13)
+            const cells = row.querySelectorAll("td");
+            const searchableColumns = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // Exclude S.No. and Actions
+
+            searchableColumns.forEach((index) => {
+                if (cells[index]) {
+                    // Clean the text content and make it searchable
+                    const cellText = cells[index].textContent
+                        .replace(/\s+/g, " ")
+                        .trim();
+                    textContent += " " + cellText;
+                }
+            });
+
+            const isMatch =
+                search === "" || textContent.toLowerCase().includes(search);
+            if (isMatch) {
+                row.style.display = "";
+            } else {
+                row.style.display = "none";
+            }
+        });
+    } catch (error) {
+        console.error("Error filtering tools table:", error);
+    }
+}
+
+/**
+ * Filter Resources table based on search text
+ */
+function filterResourcesTable(searchText) {
+    try {
+        const tbody = document.querySelector("#resources-table-body");
+        if (!tbody) {
+            console.warn("Resources table body not found");
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        const search = searchText.toLowerCase().trim();
+
+        rows.forEach((row) => {
+            let textContent = "";
+
+            // Get text from searchable cells (exclude Actions column)
+            // Resources columns: ID(0), URI(1), Name(2), Description(3), MIME Type(4), Tags(5), Owner(6), Team(7), Visibility(8), Status(9), Actions(10)
+            const cells = row.querySelectorAll("td");
+            const searchableColumns = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; // All except Actions
+
+            searchableColumns.forEach((index) => {
+                if (cells[index]) {
+                    textContent += " " + cells[index].textContent;
+                }
+            });
+
+            if (search === "" || textContent.toLowerCase().includes(search)) {
+                row.style.display = "";
+            } else {
+                row.style.display = "none";
+            }
+        });
+    } catch (error) {
+        console.error("Error filtering resources table:", error);
+    }
+}
+
+/**
+ * Filter Prompts table based on search text
+ */
+function filterPromptsTable(searchText) {
+    try {
+        const tbody = document.querySelector("#prompts-table-body");
+        if (!tbody) {
+            console.warn("Prompts table body not found");
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        const search = searchText.toLowerCase().trim();
+
+        rows.forEach((row) => {
+            let textContent = "";
+
+            // Get text from searchable cells (exclude Actions column)
+            // Prompts columns: S.No.(0), Name(1), Description(2), Tags(3), Owner(4), Team(5), Visibility(6), Status(7), Actions(8)
+            const cells = row.querySelectorAll("td");
+            const searchableColumns = [0, 1, 2, 3, 4, 5, 6, 7]; // All except Actions
+
+            searchableColumns.forEach((index) => {
+                if (cells[index]) {
+                    textContent += " " + cells[index].textContent;
+                }
+            });
+
+            if (search === "" || textContent.toLowerCase().includes(search)) {
+                row.style.display = "";
+            } else {
+                row.style.display = "none";
+            }
+        });
+    } catch (error) {
+        console.error("Error filtering prompts table:", error);
+    }
+}
+
+/**
+ * Filter A2A Agents table based on search text
+ */
+function filterA2AAgentsTable(searchText) {
+    try {
+        const tbody = document.querySelector("#a2a-agents-panel tbody");
+        if (!tbody) {
+            console.warn("A2A Agents table body not found");
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        const search = searchText.toLowerCase().trim();
+
+        rows.forEach((row) => {
+            let textContent = "";
+
+            // Get text from searchable cells (exclude ID and Actions columns)
+            // A2A Agents columns: ID(0), Name(1), Description(2), Endpoint(3), Tags(4), Type(5), Status(6), Reachability(7), Owner(8), Team(9), Visibility(10), Actions(11)
+            const cells = row.querySelectorAll("td");
+            const searchableColumns = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // Exclude ID and Actions
+
+            searchableColumns.forEach((index) => {
+                if (cells[index]) {
+                    textContent += " " + cells[index].textContent;
+                }
+            });
+
+            if (search === "" || textContent.toLowerCase().includes(search)) {
+                row.style.display = "";
+            } else {
+                row.style.display = "none";
+            }
+        });
+    } catch (error) {
+        console.error("Error filtering A2A agents table:", error);
+    }
+}
+
+/**
+ * Filter MCP Servers (Gateways) table based on search text
+ */
+function filterGatewaysTable(searchText) {
+    try {
+        console.log("🔍 Starting MCP Servers search for:", searchText);
+
+        // Find the MCP servers table - use multiple strategies
+        let table = null;
+
+        // Strategy 1: Direct selector for gateways panel
+        const gatewaysPanel = document.querySelector("#gateways-panel");
+        if (gatewaysPanel) {
+            table = gatewaysPanel.querySelector("table");
+            console.log("✅ Found table in gateways panel");
+        }
+
+        // Strategy 2: Look for table in currently visible tab
+        if (!table) {
+            const visiblePanel = document.querySelector(
+                ".tab-panel:not(.hidden)",
+            );
+            if (visiblePanel) {
+                table = visiblePanel.querySelector("table");
+                console.log("✅ Found table in visible panel");
+            }
+        }
+
+        // Strategy 3: Just look for any table with MCP server structure
+        if (!table) {
+            const allTables = document.querySelectorAll("table");
+            for (const t of allTables) {
+                const headers = t.querySelectorAll("thead th");
+                if (headers.length >= 8) {
+                    // Check for MCP server specific headers
+                    const headerTexts = Array.from(headers).map((h) =>
+                        h.textContent.toLowerCase().trim(),
+                    );
+                    if (
+                        headerTexts.includes("name") &&
+                        headerTexts.includes("url") &&
+                        headerTexts.includes("status")
+                    ) {
+                        table = t;
+                        console.log("✅ Found MCP table by header matching");
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!table) {
+            console.warn("❌ No MCP servers table found");
+            return;
+        }
+
+        const tbody = table.querySelector("tbody");
+        if (!tbody) {
+            console.warn("❌ No tbody found");
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        if (rows.length === 0) {
+            console.warn("❌ No rows found");
+            return;
+        }
+
+        const search = searchText.toLowerCase().trim();
+        console.log(`🔍 Searching ${rows.length} rows for: "${search}"`);
+
+        let visibleCount = 0;
+
+        rows.forEach((row, index) => {
+            const cells = row.querySelectorAll("td");
+
+            if (cells.length === 0) {
+                return;
+            }
+
+            // Combine text from all cells except the last one (Actions column)
+            let searchContent = "";
+            for (let i = 0; i < cells.length - 1; i++) {
+                if (cells[i]) {
+                    const cellText = cells[i].textContent.trim();
+                    searchContent += " " + cellText;
+                }
+            }
+
+            const fullText = searchContent.trim().toLowerCase();
+            const shouldShow = search === "" || fullText.includes(search);
+
+            // Debug first few rows
+            if (index < 3) {
+                console.log(
+                    `Row ${index + 1}: "${fullText.substring(0, 50)}..." -> Match: ${shouldShow}`,
+                );
+            }
+
+            // Show/hide the row
+            if (shouldShow) {
+                row.style.display = "";
+                row.style.visibility = "visible";
+                visibleCount++;
+            } else {
+                row.style.display = "none";
+                row.style.visibility = "hidden";
+            }
+        });
+
+        console.log(
+            `✅ Search complete: ${visibleCount}/${rows.length} rows visible`,
+        );
+    } catch (error) {
+        console.error("❌ Error in filterGatewaysTable:", error);
+    }
+}
+
+// Make filter functions available globally
+window.filterServerTable = filterServerTable;
+window.filterToolsTable = filterToolsTable;
+window.filterResourcesTable = filterResourcesTable;
+window.filterPromptsTable = filterPromptsTable;
+window.filterA2AAgentsTable = filterA2AAgentsTable;
+window.filterGatewaysTable = filterGatewaysTable;
+
+// Add a test function for debugging
+window.testGatewaySearch = function (searchTerm = "Cou") {
+    console.log("🧪 Testing gateway search with:", searchTerm);
+    console.log("Available tables:", document.querySelectorAll("table").length);
+
+    // Test the search input exists
+    const searchInput = document.getElementById("gateways-search-input");
+    console.log("Search input found:", !!searchInput);
+
+    if (searchInput) {
+        searchInput.value = searchTerm;
+        console.log("Set search input value to:", searchInput.value);
+    }
+
+    filterGatewaysTable(searchTerm);
+};
+
+// Simple fallback search function
+window.simpleGatewaySearch = function (searchTerm) {
+    console.log("🔧 Simple gateway search for:", searchTerm);
+
+    // Find any table in the current tab/page
+    const tables = document.querySelectorAll("table");
+    console.log("Found tables:", tables.length);
+
+    tables.forEach((table, tableIndex) => {
+        const tbody = table.querySelector("tbody");
+        if (!tbody) {
+            return;
+        }
+
+        const rows = tbody.querySelectorAll("tr");
+        console.log(`Table ${tableIndex}: ${rows.length} rows`);
+
+        if (rows.length > 0) {
+            // Check if this looks like the MCP servers table
+            const firstRow = rows[0];
+            const cells = firstRow.querySelectorAll("td");
+
+            if (cells.length >= 8) {
+                // MCP servers table should have many columns
+                console.log(
+                    `Table ${tableIndex} looks like MCP servers table with ${cells.length} columns`,
+                );
+
+                const search = searchTerm.toLowerCase().trim();
+                let visibleCount = 0;
+
+                rows.forEach((row) => {
+                    const cells = row.querySelectorAll("td");
+                    let rowText = "";
+
+                    // Get text from all cells except last (Actions)
+                    for (let i = 0; i < cells.length - 1; i++) {
+                        rowText += " " + cells[i].textContent.trim();
+                    }
+
+                    const shouldShow =
+                        search === "" || rowText.toLowerCase().includes(search);
+
+                    if (shouldShow) {
+                        row.style.display = "";
+                        visibleCount++;
+                    } else {
+                        row.style.display = "none";
+                    }
+                });
+
+                console.log(
+                    `✅ Simple search complete: ${visibleCount}/${rows.length} rows visible`,
+                );
+                // Found the table, stop searching
+            }
+        }
+    });
+};
+
+// Add initialization test function
+window.testSearchInit = function () {
+    console.log("🧪 Testing search initialization...");
+    initializeSearchInputs();
+};
+
+/**
+ * Clear search functionality for different entity types
+ */
+function clearSearch(entityType) {
+    try {
+        if (entityType === "catalog") {
+            const searchInput = document.getElementById("catalog-search-input");
+            if (searchInput) {
+                searchInput.value = "";
+                filterServerTable(""); // Clear the filter
+            }
+        } else if (entityType === "tools") {
+            const searchInput = document.getElementById("tools-search-input");
+            if (searchInput) {
+                searchInput.value = "";
+                filterToolsTable(""); // Clear the filter
+            }
+        } else if (entityType === "resources") {
+            const searchInput = document.getElementById(
+                "resources-search-input",
+            );
+            if (searchInput) {
+                searchInput.value = "";
+                filterResourcesTable(""); // Clear the filter
+            }
+        } else if (entityType === "prompts") {
+            const searchInput = document.getElementById("prompts-search-input");
+            if (searchInput) {
+                searchInput.value = "";
+                filterPromptsTable(""); // Clear the filter
+            }
+        } else if (entityType === "a2a-agents") {
+            const searchInput = document.getElementById(
+                "a2a-agents-search-input",
+            );
+            if (searchInput) {
+                searchInput.value = "";
+                filterA2AAgentsTable(""); // Clear the filter
+            }
+        } else if (entityType === "gateways") {
+            const searchInput = document.getElementById(
+                "gateways-search-input",
+            );
+            if (searchInput) {
+                searchInput.value = "";
+                filterGatewaysTable(""); // Clear the filter
+            }
+        } else if (entityType === "gateways") {
+            const searchInput = document.getElementById(
+                "gateways-search-input",
+            );
+            if (searchInput) {
+                searchInput.value = "";
+                filterGatewaysTable(""); // Clear the filter
+            }
+        }
+    } catch (error) {
+        console.error("Error clearing search:", error);
+    }
+}
+
+// Make clearSearch function available globally
+window.clearSearch = clearSearch;
+
+/**
+ * Initialize search inputs for all entity types
+ * This function also handles re-initialization after HTMX content loads
+ */
+function initializeSearchInputs() {
+    console.log("🔍 Initializing search inputs...");
+
+    // Remove existing event listeners to prevent duplicates
+    const searchInputs = [
+        "catalog-search-input",
+        "gateways-search-input",
+        "tools-search-input",
+        "resources-search-input",
+        "prompts-search-input",
+        "a2a-agents-search-input",
+    ];
+
+    searchInputs.forEach((inputId) => {
+        const input = document.getElementById(inputId);
+        if (input) {
+            // Clone the input to remove all event listeners, then replace it
+            const newInput = input.cloneNode(true);
+            input.parentNode.replaceChild(newInput, input);
+        }
+    });
+
+    // Get fresh references to all search inputs after cloning
+
+    // Virtual Servers search
+    const catalogSearchInput = document.getElementById("catalog-search-input");
+    if (catalogSearchInput) {
+        catalogSearchInput.addEventListener("input", function () {
+            filterServerTable(this.value);
+        });
+        console.log("✅ Virtual Servers search initialized");
+    }
+
+    // MCP Servers (Gateways) search
+    const gatewaysSearchInput = document.getElementById(
+        "gateways-search-input",
+    );
+    if (gatewaysSearchInput) {
+        console.log("✅ Found MCP Servers search input");
+
+        // Use addEventListener instead of direct assignment
+        gatewaysSearchInput.addEventListener("input", function (e) {
+            const searchValue = e.target.value;
+            console.log("🔍 MCP Servers search triggered:", searchValue);
+            filterGatewaysTable(searchValue);
+        });
+
+        // Add keyup as backup
+        gatewaysSearchInput.addEventListener("keyup", function (e) {
+            const searchValue = e.target.value;
+            filterGatewaysTable(searchValue);
+        });
+
+        // Add change as backup
+        gatewaysSearchInput.addEventListener("change", function (e) {
+            const searchValue = e.target.value;
+            filterGatewaysTable(searchValue);
+        });
+
+        console.log("✅ MCP Servers search events attached");
+
+        // Test the function works
+        filterGatewaysTable("");
+    } else {
+        console.error("❌ MCP Servers search input not found!");
+
+        // Debug available inputs
+        const allInputs = document.querySelectorAll('input[type="text"]');
+        console.log(
+            "Available text inputs:",
+            Array.from(allInputs).map((input) => ({
+                id: input.id,
+                placeholder: input.placeholder,
+                className: input.className,
+            })),
+        );
+    }
+
+    // Tools search
+    const toolsSearchInput = document.getElementById("tools-search-input");
+    if (toolsSearchInput) {
+        toolsSearchInput.addEventListener("input", function () {
+            filterToolsTable(this.value);
+        });
+        console.log("✅ Tools search initialized");
+    }
+
+    // Resources search
+    const resourcesSearchInput = document.getElementById(
+        "resources-search-input",
+    );
+    if (resourcesSearchInput) {
+        resourcesSearchInput.addEventListener("input", function () {
+            filterResourcesTable(this.value);
+        });
+        console.log("✅ Resources search initialized");
+    }
+
+    // Prompts search
+    const promptsSearchInput = document.getElementById("prompts-search-input");
+    if (promptsSearchInput) {
+        promptsSearchInput.addEventListener("input", function () {
+            filterPromptsTable(this.value);
+        });
+        console.log("✅ Prompts search initialized");
+    }
+
+    // A2A Agents search
+    const agentsSearchInput = document.getElementById(
+        "a2a-agents-search-input",
+    );
+    if (agentsSearchInput) {
+        agentsSearchInput.addEventListener("input", function () {
+            filterA2AAgentsTable(this.value);
+        });
+        console.log("✅ A2A Agents search initialized");
+    }
+}
 
 function handleAuthTypeChange() {
     const authType = this.value;
@@ -12583,7 +16448,7 @@ function initializeTabState() {
     if (hash) {
         showTab(hash.slice(1));
     } else {
-        showTab("catalog");
+        showTab("gateways");
     }
 
     // Pre-load version info if that's the initial tab
@@ -12636,13 +16501,37 @@ function initializeTabState() {
 // GLOBAL EXPORTS - Make functions available to HTML onclick handlers
 // ===================================================================
 
+/**
+ * Load servers (Virtual Servers / Catalog) with optional include_inactive parameter
+ */
+async function loadServers() {
+    const checkbox = safeGetElement("show-inactive-servers");
+    const includeInactive = checkbox ? checkbox.checked : false;
+
+    // Build URL with include_inactive parameter
+    const url = new URL(window.location);
+    if (includeInactive) {
+        url.searchParams.set("include_inactive", "true");
+    } else {
+        url.searchParams.delete("include_inactive");
+    }
+
+    // Reload the page with the updated parameters
+    // Since the catalog panel is server-side rendered, we need a full page reload
+    window.location.href = url.toString();
+}
+
 window.toggleInactiveItems = toggleInactiveItems;
+window.loadServers = loadServers;
 window.handleToggleSubmit = handleToggleSubmit;
 window.handleSubmitWithConfirmation = handleSubmitWithConfirmation;
 window.viewTool = viewTool;
 window.editTool = editTool;
 window.testTool = testTool;
+window.validateTool = validateTool;
 window.viewResource = viewResource;
+window.runResourceTest = runResourceTest;
+window.testResource = testResource;
 window.editResource = editResource;
 window.viewPrompt = viewPrompt;
 window.editPrompt = editPrompt;
@@ -12657,6 +16546,9 @@ window.testPrompt = testPrompt;
 window.runPromptTest = runPromptTest;
 window.closeModal = closeModal;
 window.testGateway = testGateway;
+window.generateToolTestCases = generateToolTestCases;
+window.generateTestCases = generateTestCases;
+window.enrichTool = enrichTool;
 
 // ===============================================
 // CONFIG EXPORT FUNCTIONALITY
@@ -14594,6 +18486,134 @@ function showNotification(message, type = "info") {
 }
 
 /**
+ * Show a modal dialog with copyable content.
+ *
+ * @param {string} title - The modal title.
+ * @param {string} message - The message to display (can be multi-line).
+ * @param {string} type - The type of modal: 'success', 'error', or 'info'.
+ */
+function showCopyableModal(title, message, type = "info") {
+    // Remove any existing modal
+    const existingModal = document.getElementById("copyable-modal-overlay");
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    // Color schemes based on type
+    const colors = {
+        success: {
+            bg: "bg-green-50 dark:bg-green-900/20",
+            border: "border-green-500",
+            title: "text-green-800 dark:text-green-200",
+            icon: `<svg class="h-6 w-6 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg>`,
+        },
+        error: {
+            bg: "bg-red-50 dark:bg-red-900/20",
+            border: "border-red-500",
+            title: "text-red-800 dark:text-red-200",
+            icon: `<svg class="h-6 w-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>`,
+        },
+        info: {
+            bg: "bg-blue-50 dark:bg-blue-900/20",
+            border: "border-blue-500",
+            title: "text-blue-800 dark:text-blue-200",
+            icon: `<svg class="h-6 w-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>`,
+        },
+    };
+
+    const colorScheme = colors[type] || colors.info;
+
+    // Create modal overlay
+    const overlay = document.createElement("div");
+    overlay.id = "copyable-modal-overlay";
+    overlay.className =
+        "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50";
+    overlay.onclick = (e) => {
+        if (e.target === overlay) {
+            overlay.remove();
+        }
+    };
+
+    // Create modal content
+    const modal = document.createElement("div");
+    modal.className = `${colorScheme.bg} border-l-4 ${colorScheme.border} rounded-lg shadow-xl max-w-lg w-full mx-4 overflow-hidden`;
+
+    modal.innerHTML = `
+        <div class="p-4">
+            <div class="flex items-start">
+                <div class="flex-shrink-0">
+                    ${colorScheme.icon}
+                </div>
+                <div class="ml-3 flex-1">
+                    <h3 class="text-lg font-medium ${colorScheme.title}">${escapeHtml(title)}</h3>
+                    <div class="mt-2">
+                        <pre id="copyable-modal-content" class="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap font-mono bg-white dark:bg-gray-800 p-3 rounded border border-gray-200 dark:border-gray-600 max-h-64 overflow-auto select-all cursor-text">${escapeHtml(message)}</pre>
+                    </div>
+                    <div class="mt-4 flex justify-end space-x-3">
+                        <button id="copyable-modal-copy" class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            <svg class="h-4 w-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                            </svg>
+                            Copy
+                        </button>
+                        <button id="copyable-modal-close" class="inline-flex items-center px-3 py-1.5 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            Close
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    // Add event listeners
+    document.getElementById("copyable-modal-close").onclick = () =>
+        overlay.remove();
+
+    document.getElementById("copyable-modal-copy").onclick = async () => {
+        const content = document.getElementById("copyable-modal-content");
+        try {
+            await navigator.clipboard.writeText(content.textContent);
+            const copyBtn = document.getElementById("copyable-modal-copy");
+            const originalText = copyBtn.innerHTML;
+            copyBtn.innerHTML = `<svg class="h-4 w-4 mr-1.5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg> Copied!`;
+            setTimeout(() => {
+                copyBtn.innerHTML = originalText;
+            }, 2000);
+        } catch (err) {
+            console.error("Failed to copy:", err);
+            // Fallback: select the text
+            const range = document.createRange();
+            range.selectNodeContents(content);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+    };
+
+    // Close on Escape key
+    const handleEscape = (e) => {
+        if (e.key === "Escape") {
+            overlay.remove();
+            document.removeEventListener("keydown", handleEscape);
+        }
+    };
+    document.addEventListener("keydown", handleEscape);
+}
+
+window.showCopyableModal = showCopyableModal;
+
+/**
  * Utility function to get cookie value
  */
 function getCookie(name) {
@@ -15356,9 +19376,27 @@ async function getAuthToken() {
     if (!token) {
         token = localStorage.getItem("auth_token");
     }
-    console.log("MY TOKEN GENERATED:", token);
-
     return token || "";
+}
+
+/**
+ * Fetch helper that always includes auth context.
+ * Ensures HTTP-only cookies are sent even when JS cannot read them.
+ */
+async function fetchWithAuth(url, options = {}) {
+    const opts = { ...options };
+    // Always send same-origin cookies unless caller overrides explicitly
+    opts.credentials = options.credentials || "same-origin";
+
+    // Clone headers to avoid mutating caller-provided object
+    const headers = new Headers(options.headers || {});
+    const token = await getAuthToken();
+    if (token) {
+        headers.set("Authorization", `Bearer ${token}`);
+    }
+    opts.headers = headers;
+
+    return fetch(url, opts);
 }
 
 // Expose token management functions to global scope
@@ -16392,8 +20430,8 @@ function resetImportSelection() {
                     // Many panels use specific ids — attempt to call generic initializers if they exist
                     initResourceSelect(
                         "associatedResources",
-                        "resource-pills",
-                        "resource-warn",
+                        "selectedResourcePills",
+                        "selectedResourceWarning",
                         10,
                         null,
                         null,
@@ -16402,8 +20440,8 @@ function resetImportSelection() {
                 if (typeof initToolSelect === "function") {
                     initToolSelect(
                         "associatedTools",
-                        "tool-pills",
-                        "tool-warn",
+                        "selectedToolsPills",
+                        "selectedToolsWarning",
                         10,
                         null,
                         null,
@@ -17271,6 +21309,25 @@ function initializeLLMChat() {
     // Generate or retrieve user ID
     llmChatState.userId = generateUserId();
 
+    // Restore previously selected server (if any) from sessionStorage
+    try {
+        const persistedServerId = sessionStorage.getItem(
+            "llm_chat_selected_server_id",
+        );
+        const persistedServerName = sessionStorage.getItem(
+            "llm_chat_selected_server_name",
+        );
+        if (persistedServerId) {
+            llmChatState.selectedServerId = persistedServerId;
+            if (persistedServerName) {
+                llmChatState.selectedServerName = persistedServerName;
+            }
+        }
+    } catch (e) {
+        // sessionStorage may be unavailable in some environments
+        console.warn("Could not restore persisted LLM server selection:", e);
+    }
+
     // Load servers if not already loaded
     const serversList = document.getElementById("llm-chat-servers-list");
     if (serversList && serversList.children.length <= 1) {
@@ -17456,6 +21513,15 @@ async function selectServerForChat(
     // Update state
     llmChatState.selectedServerId = serverId;
     llmChatState.selectedServerName = serverName;
+
+    // Persist selection so it survives tab reloads within the session
+    try {
+        sessionStorage.setItem("llm_chat_selected_server_id", serverId);
+        sessionStorage.setItem("llm_chat_selected_server_name", serverName);
+    } catch (e) {
+        // sessionStorage may be unavailable (e.g. privacy mode); ignore silently
+        console.warn("Could not persist selected LLM server:", e);
+    }
 
     // Update UI to show selected server
     const serverItems = document.querySelectorAll(".server-item");
@@ -19084,6 +23150,109 @@ async function serverSideToolSearch(searchTerm) {
         return;
     }
 
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Tool Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // --- DOM instrumentation for debugging replacement during searches ---
+    // Assign a stable debug id to the container (persists through innerHTML swaps
+    // but will change if the element is replaced). Observe the parent node for
+    // childList mutations and log if the container is removed or replaced.
+    let _domInstrObserver = null;
+    let _domInstrId = null;
+    try {
+        if (!container.dataset.debugNodeId) {
+            container.dataset.debugNodeId = `dbg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+        }
+        _domInstrId = container.dataset.debugNodeId;
+        console.info(
+            `[DOM-INSTRUMENT] serverSideToolSearch start for #associatedTools debugId=${_domInstrId} searchTerm='${searchTerm}'`,
+        );
+
+        const parentNode = container.parentNode;
+        if (parentNode) {
+            _domInstrObserver = new MutationObserver((mutationsList) => {
+                for (const mut of mutationsList) {
+                    if (mut.type === "childList") {
+                        const current =
+                            document.getElementById("associatedTools");
+                        if (!current) {
+                            console.warn(
+                                `[DOM-INSTRUMENT] associatedTools element REMOVED during search (original debugId=${_domInstrId})`,
+                                mut,
+                            );
+                        } else {
+                            const curId = current.dataset.debugNodeId || null;
+                            if (curId !== _domInstrId) {
+                                console.warn(
+                                    `[DOM-INSTRUMENT] associatedTools element REPLACED during search. original=${_domInstrId} current=${curId}`,
+                                    mut,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+            try {
+                _domInstrObserver.observe(parentNode, { childList: true });
+            } catch (e) {
+                console.error(
+                    "[DOM-INSTRUMENT] Failed to observe parent node for associatedTools:",
+                    e,
+                );
+            }
+        }
+    } catch (e) {
+        console.error("[DOM-INSTRUMENT] setup error:", e);
+    }
+
+    // Persist current selections to window fallback AND data attribute before we replace/clear the container
+    let persistedToolIds = [];
+    try {
+        // First get from data attribute if it exists
+        const dataAttr = container.getAttribute("data-selected-tools");
+        if (dataAttr) {
+            try {
+                const parsed = JSON.parse(dataAttr);
+                if (Array.isArray(parsed)) {
+                    persistedToolIds = parsed.slice();
+                }
+            } catch (e) {
+                console.error("Error parsing data-selected-tools:", e);
+            }
+        }
+
+        // Then merge with currently checked items (important for search results)
+        const currentChecked = Array.from(
+            container.querySelectorAll('input[type="checkbox"]:checked'),
+        ).map((cb) => cb.value);
+        const merged = new Set([...persistedToolIds, ...currentChecked]);
+        persistedToolIds = Array.from(merged);
+
+        // Update both the window fallback and the container attribute
+        window._selectedAssociatedTools = persistedToolIds.slice();
+        if (persistedToolIds.length > 0) {
+            container.setAttribute(
+                "data-selected-tools",
+                JSON.stringify(persistedToolIds),
+            );
+        }
+
+        console.log(
+            `[Tool Search] Persisted ${persistedToolIds.length} tool selections before search:`,
+            persistedToolIds,
+        );
+    } catch (e) {
+        console.error("Error capturing current selections before search:", e);
+    }
+
     // Show loading state
     container.innerHTML = `
         <div class="text-center py-4">
@@ -19096,22 +23265,141 @@ async function serverSideToolSearch(searchTerm) {
     `;
 
     if (searchTerm.trim() === "") {
-        // If search term is empty, reload the default tool list
+        // If search term is empty, reload the default tool list with gateway filter
         try {
-            const response = await fetch(
-                `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector`,
+            const toolsUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Tool Search] Loading default tools with URL: ${toolsUrl}`,
             );
+
+            const response = await fetch(toolsUrl);
             if (response.ok) {
                 const html = await response.text();
-                container.innerHTML = html;
 
-                // Hide no results message
-                if (noResultsMessage) {
-                    noResultsMessage.style.display = "none";
+                // Preserve the data-selected-tools attribute before replacing innerHTML
+                let persistedToolIds = [];
+                try {
+                    const dataAttr = container.getAttribute(
+                        "data-selected-tools",
+                    );
+                    if (dataAttr) {
+                        try {
+                            const parsed = JSON.parse(dataAttr);
+                            if (Array.isArray(parsed)) {
+                                persistedToolIds = parsed.slice();
+                            }
+                        } catch (e) {
+                            console.error(
+                                "Error parsing data-selected-tools before clearing search:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // Merge with currently checked items
+                    const currentChecked = Array.from(
+                        container.querySelectorAll(
+                            'input[type="checkbox"]:checked',
+                        ),
+                    ).map((cb) => cb.value);
+                    const merged = new Set([
+                        ...persistedToolIds,
+                        ...currentChecked,
+                    ]);
+                    persistedToolIds = Array.from(merged);
+
+                    // Update window fallback
+                    window._selectedAssociatedTools = persistedToolIds.slice();
+                } catch (e) {
+                    console.error(
+                        "Error capturing current tool selections before clearing search:",
+                        e,
+                    );
                 }
 
-                // Update tool mapping if needed
-                updateToolMapping(container);
+                container.innerHTML = html;
+
+                // Immediately restore the data-selected-tools attribute after innerHTML replacement
+                if (persistedToolIds.length > 0) {
+                    container.setAttribute(
+                        "data-selected-tools",
+                        JSON.stringify(persistedToolIds),
+                    );
+                }
+
+                // If the container has been re-rendered server-side and our
+                // `data-selected-tools` attribute was lost, restore from the
+                // global fallback `window._selectedAssociatedTools`.
+                try {
+                    updateToolMapping(container);
+
+                    // Re-initialize selector so handlers are attached
+                    initToolSelect(
+                        "associatedTools",
+                        "selectedToolsPills",
+                        "selectedToolsWarning",
+                        6,
+                        "selectAllToolsBtn",
+                        "clearAllToolsBtn",
+                    );
+
+                    const dataAttr = container.getAttribute(
+                        "data-selected-tools",
+                    );
+                    let selectedIds = null;
+                    if (dataAttr) {
+                        try {
+                            selectedIds = JSON.parse(dataAttr);
+                        } catch (e) {
+                            console.error(
+                                "Error parsing server data-selected-tools:",
+                                e,
+                            );
+                        }
+                    }
+
+                    if (
+                        (!selectedIds ||
+                            !Array.isArray(selectedIds) ||
+                            selectedIds.length === 0) &&
+                        Array.isArray(window._selectedAssociatedTools)
+                    ) {
+                        selectedIds = window._selectedAssociatedTools.slice();
+                    }
+
+                    if (Array.isArray(selectedIds) && selectedIds.length > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedTools"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            if (selectedIds.includes(cb.value)) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+
+                    // Hide no results message
+                    if (noResultsMessage) {
+                        noResultsMessage.style.display = "none";
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring selections after loading default tools:",
+                        e,
+                    );
+                }
             } else {
                 container.innerHTML =
                     '<div class="text-center py-4 text-red-600">Failed to load tools</div>';
@@ -19125,10 +23413,14 @@ async function serverSideToolSearch(searchTerm) {
     }
 
     try {
-        // Call the new search API
-        const response = await fetch(
-            `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100`,
-        );
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(`[Tool Search] Searching tools with URL: ${searchUrl}`);
+
+        const response = await fetch(searchUrl);
 
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -19166,9 +23458,134 @@ async function serverSideToolSearch(searchTerm) {
             });
 
             container.innerHTML = searchResultsHtml;
+            // If server-side didn't provide `data-selected-tools` (or provided
+            // an empty array), restore/merge from the in-memory fallback so
+            // the attribute isn't left empty and selectors can pick it up.
+            try {
+                const existingAttr = container.getAttribute(
+                    "data-selected-tools",
+                );
+                let existingIds = null;
+                if (existingAttr) {
+                    try {
+                        existingIds = JSON.parse(existingAttr);
+                    } catch (e) {
+                        console.error(
+                            "Error parsing existing data-selected-tools after search insert:",
+                            e,
+                        );
+                    }
+                }
+
+                if (
+                    (!existingIds ||
+                        !Array.isArray(existingIds) ||
+                        existingIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedTools) &&
+                    window._selectedAssociatedTools.length > 0
+                ) {
+                    // Write a merged view back to the container attribute so
+                    // subsequent init/observers see the selection
+                    container.setAttribute(
+                        "data-selected-tools",
+                        JSON.stringify(window._selectedAssociatedTools.slice()),
+                    );
+                } else if (
+                    Array.isArray(existingIds) &&
+                    Array.isArray(window._selectedAssociatedTools) &&
+                    window._selectedAssociatedTools.length > 0
+                ) {
+                    // Merge the two sets to avoid losing either
+                    const merged = new Set([
+                        ...(existingIds || []),
+                        ...window._selectedAssociatedTools,
+                    ]);
+                    container.setAttribute(
+                        "data-selected-tools",
+                        JSON.stringify(Array.from(merged)),
+                    );
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring data-selected-tools attribute after inserting search results:",
+                    e,
+                );
+            }
 
             // Update tool mapping with search results
             updateToolMapping(container);
+
+            // Re-initialize selector behavior for the add-server container
+            try {
+                initToolSelect(
+                    "associatedTools",
+                    "selectedToolsPills",
+                    "selectedToolsWarning",
+                    6,
+                    "selectAllToolsBtn",
+                    "clearAllToolsBtn",
+                );
+
+                // Restore any previously selected tool IDs stored on the container
+                try {
+                    const dataAttr = container.getAttribute(
+                        "data-selected-tools",
+                    );
+                    let selectedIds = null;
+                    if (dataAttr) {
+                        try {
+                            selectedIds = JSON.parse(dataAttr);
+                        } catch (e) {
+                            console.error(
+                                "Error parsing data-selected-tools:",
+                                e,
+                            );
+                        }
+                    }
+
+                    // If parsed attribute is missing or an empty array, fall back
+                    // to the in-memory `window._selectedAssociatedTools` saved earlier.
+                    if (
+                        (!selectedIds ||
+                            !Array.isArray(selectedIds) ||
+                            selectedIds.length === 0) &&
+                        Array.isArray(window._selectedAssociatedTools)
+                    ) {
+                        selectedIds = window._selectedAssociatedTools.slice();
+                    }
+
+                    if (Array.isArray(selectedIds) && selectedIds.length > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedTools"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            if (selectedIds.includes(cb.value)) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring data-selected-tools after search:",
+                        e,
+                    );
+                }
+            } catch (e) {
+                console.error(
+                    "Error initializing associatedTools selector:",
+                    e,
+                );
+            }
 
             // Hide no results message
             if (noResultsMessage) {
@@ -19217,6 +23634,52 @@ function updateToolMapping(container) {
 }
 
 /**
+ * Update the prompt mapping with prompts in the given container
+ */
+function updatePromptMapping(container) {
+    if (!window.promptMapping) {
+        window.promptMapping = {};
+    }
+
+    const checkboxes = container.querySelectorAll(
+        'input[name="associatedPrompts"]',
+    );
+    checkboxes.forEach((checkbox) => {
+        const promptId = checkbox.value;
+        const promptName =
+            checkbox.getAttribute("data-prompt-name") ||
+            checkbox.nextElementSibling?.textContent?.trim() ||
+            promptId;
+        if (promptId && promptName) {
+            window.promptMapping[promptId] = promptName;
+        }
+    });
+}
+
+/**
+ * Update the resource mapping with resources in the given container
+ */
+function updateResourceMapping(container) {
+    if (!window.resourceMapping) {
+        window.resourceMapping = {};
+    }
+
+    const checkboxes = container.querySelectorAll(
+        'input[name="associatedResources"]',
+    );
+    checkboxes.forEach((checkbox) => {
+        const resourceId = checkbox.value;
+        const resourceName =
+            checkbox.getAttribute("data-resource-name") ||
+            checkbox.nextElementSibling?.textContent?.trim() ||
+            resourceId;
+        if (resourceId && resourceName) {
+            window.resourceMapping[resourceId] = resourceName;
+        }
+    });
+}
+
+/**
  * Perform server-side search for prompts and update the prompt list
  */
 async function serverSidePromptSearch(searchTerm) {
@@ -19227,6 +23690,41 @@ async function serverSidePromptSearch(searchTerm) {
     if (!container) {
         console.error("associatedPrompts container not found");
         return;
+    }
+
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Prompt Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // Persist current selections to window fallback before we replace/clear the container
+    try {
+        const currentChecked = Array.from(
+            container.querySelectorAll('input[type="checkbox"]:checked'),
+        ).map((cb) => cb.value);
+        if (
+            !Array.isArray(window._selectedAssociatedPrompts) ||
+            window._selectedAssociatedPrompts.length === 0
+        ) {
+            window._selectedAssociatedPrompts = currentChecked.slice();
+        } else {
+            const merged = new Set([
+                ...(window._selectedAssociatedPrompts || []),
+                ...currentChecked,
+            ]);
+            window._selectedAssociatedPrompts = Array.from(merged);
+        }
+    } catch (e) {
+        console.error(
+            "Error capturing current prompt selections before search:",
+            e,
+        );
     }
 
     // Show loading state
@@ -19241,11 +23739,17 @@ async function serverSidePromptSearch(searchTerm) {
     `;
 
     if (searchTerm.trim() === "") {
-        // If search term is empty, reload the default prompt selector
+        // If search term is empty, reload the default prompt selector with gateway filter
         try {
-            const response = await fetch(
-                `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector`,
+            const promptsUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Prompt Search] Loading default prompts with URL: ${promptsUrl}`,
             );
+
+            const response = await fetch(promptsUrl);
             if (response.ok) {
                 const html = await response.text();
                 container.innerHTML = html;
@@ -19255,15 +23759,67 @@ async function serverSidePromptSearch(searchTerm) {
                     noResultsMessage.style.display = "none";
                 }
 
-                // Initialize prompt mapping if needed
-                initPromptSelect(
-                    "associatedPrompts",
-                    "selectedPromptsPills",
-                    "selectedPromptsWarning",
-                    6,
-                    "selectAllPromptsBtn",
-                    "clearAllPromptsBtn",
-                );
+                try {
+                    // Update mapping and ensure persisted selections are applied
+                    // Initialize prompt mapping if needed
+                    // If the server did not supply `data-selected-prompts`, restore from fallback
+                    const dataAttr = container.getAttribute(
+                        "data-selected-prompts",
+                    );
+                    let selectedIds = null;
+                    if (dataAttr) {
+                        try {
+                            selectedIds = JSON.parse(dataAttr);
+                        } catch (e) {
+                            console.error(
+                                "Error parsing server data-selected-prompts:",
+                                e,
+                            );
+                        }
+                    }
+
+                    if (
+                        (!selectedIds ||
+                            !Array.isArray(selectedIds) ||
+                            selectedIds.length === 0) &&
+                        Array.isArray(window._selectedAssociatedPrompts)
+                    ) {
+                        selectedIds = window._selectedAssociatedPrompts.slice();
+                    }
+
+                    initPromptSelect(
+                        "associatedPrompts",
+                        "selectedPromptsPills",
+                        "selectedPromptsWarning",
+                        6,
+                        "selectAllPromptsBtn",
+                        "clearAllPromptsBtn",
+                    );
+
+                    if (Array.isArray(selectedIds) && selectedIds.length > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedPrompts"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            if (selectedIds.includes(cb.value)) {
+                                cb.checked = true;
+                            }
+                        });
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring selections after loading default prompts:",
+                        e,
+                    );
+                }
             } else {
                 container.innerHTML =
                     '<div class="text-center py-4 text-red-600">Failed to load prompts</div>';
@@ -19277,9 +23833,14 @@ async function serverSidePromptSearch(searchTerm) {
     }
 
     try {
-        const response = await fetch(
-            `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100`,
-        );
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(`[Prompt Search] Searching prompts with URL: ${searchUrl}`);
+
+        const response = await fetch(searchUrl);
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -19306,6 +23867,57 @@ async function serverSidePromptSearch(searchTerm) {
                     </label>
                 `;
             });
+
+            // Before initializing, ensure any persisted selections are merged into the container
+            try {
+                const existingAttr = container.getAttribute(
+                    "data-selected-prompts",
+                );
+                let existingIds = null;
+                if (existingAttr) {
+                    try {
+                        existingIds = JSON.parse(existingAttr);
+                    } catch (e) {
+                        console.error(
+                            "Error parsing existing data-selected-prompts after search insert:",
+                            e,
+                        );
+                    }
+                }
+
+                if (
+                    (!existingIds ||
+                        !Array.isArray(existingIds) ||
+                        existingIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedPrompts) &&
+                    window._selectedAssociatedPrompts.length > 0
+                ) {
+                    container.setAttribute(
+                        "data-selected-prompts",
+                        JSON.stringify(
+                            window._selectedAssociatedPrompts.slice(),
+                        ),
+                    );
+                } else if (
+                    Array.isArray(existingIds) &&
+                    Array.isArray(window._selectedAssociatedPrompts) &&
+                    window._selectedAssociatedPrompts.length > 0
+                ) {
+                    const merged = new Set([
+                        ...(existingIds || []),
+                        ...window._selectedAssociatedPrompts,
+                    ]);
+                    container.setAttribute(
+                        "data-selected-prompts",
+                        JSON.stringify(Array.from(merged)),
+                    );
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring data-selected-prompts attribute after inserting search results:",
+                    e,
+                );
+            }
 
             container.innerHTML = searchResultsHtml;
 
@@ -19335,6 +23947,1179 @@ async function serverSidePromptSearch(searchTerm) {
         console.error("Error searching prompts:", error);
         container.innerHTML =
             '<div class="text-center py-4 text-red-600">Error searching prompts</div>';
+        if (noResultsMessage) {
+            noResultsMessage.style.display = "none";
+        }
+    }
+}
+
+/**
+ * Perform server-side search for resources and update the resouces list
+ */
+async function serverSideResourceSearch(searchTerm) {
+    const container = document.getElementById("associatedResources");
+    const noResultsMessage = safeGetElement("noResourcesMessage", true);
+    const searchQuerySpan = safeGetElement("searchResourcesQuery", true);
+
+    if (!container) {
+        console.error("associatedResources container not found");
+        return;
+    }
+
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Resource Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // Persist current selections to window fallback before we replace/clear the container
+    try {
+        const currentChecked = Array.from(
+            container.querySelectorAll('input[type="checkbox"]:checked'),
+        ).map((cb) => cb.value);
+        if (
+            !Array.isArray(window._selectedAssociatedResources) ||
+            window._selectedAssociatedResources.length === 0
+        ) {
+            window._selectedAssociatedResources = currentChecked.slice();
+        } else {
+            const merged = new Set([
+                ...(window._selectedAssociatedResources || []),
+                ...currentChecked,
+            ]);
+            window._selectedAssociatedResources = Array.from(merged);
+        }
+    } catch (e) {
+        console.error(
+            "Error capturing current resource selections before search:",
+            e,
+        );
+    }
+
+    // Show loading state
+    container.innerHTML = `
+        <div class="text-center py-4">
+            <svg class="animate-spin h-5 w-5 text-purple-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Searching resources...</p>
+        </div>
+    `;
+
+    if (searchTerm.trim() === "") {
+        // If search term is empty, reload the default resource selector with gateway filter
+        try {
+            const resourcesUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/resources/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/resources/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Resource Search] Loading default resources with URL: ${resourcesUrl}`,
+            );
+
+            const response = await fetch(resourcesUrl);
+            if (response.ok) {
+                const html = await response.text();
+
+                // Persist current selections to window fallback before we replace/clear the container
+                try {
+                    const currentChecked = Array.from(
+                        container.querySelectorAll(
+                            'input[type="checkbox"]:checked',
+                        ),
+                    ).map((cb) => cb.value);
+                    if (
+                        !Array.isArray(window._selectedAssociatedResources) ||
+                        window._selectedAssociatedResources.length === 0
+                    ) {
+                        window._selectedAssociatedResources =
+                            currentChecked.slice();
+                    } else {
+                        const merged = new Set([
+                            ...(window._selectedAssociatedResources || []),
+                            ...currentChecked,
+                        ]);
+                        window._selectedAssociatedResources =
+                            Array.from(merged);
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error capturing current resource selections before search:",
+                        e,
+                    );
+                }
+
+                container.innerHTML = html;
+
+                // If the container has been re-rendered server-side and our
+                // `data-selected-resources` attribute was lost, restore from the
+                // global fallback `window._selectedAssociatedResources`.
+                try {
+                    // Initialize resource mapping if needed
+                    initResourceSelect(
+                        "associatedResources",
+                        "selectedResourcesPills",
+                        "selectedResourcesWarning",
+                        6,
+                        "selectAllResourcesBtn",
+                        "clearAllResourcesBtn",
+                    );
+
+                    const dataAttr = container.getAttribute(
+                        "data-selected-resources",
+                    );
+                    let selectedIds = null;
+                    if (dataAttr) {
+                        try {
+                            selectedIds = JSON.parse(dataAttr);
+                        } catch (e) {
+                            console.error(
+                                "Error parsing server data-selected-resources:",
+                                e,
+                            );
+                        }
+                    }
+
+                    if (
+                        (!selectedIds ||
+                            !Array.isArray(selectedIds) ||
+                            selectedIds.length === 0) &&
+                        Array.isArray(window._selectedAssociatedResources)
+                    ) {
+                        selectedIds =
+                            window._selectedAssociatedResources.slice();
+                    }
+
+                    if (Array.isArray(selectedIds) && selectedIds.length > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedResources"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            if (selectedIds.includes(cb.value)) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring selections after loading default resources:",
+                        e,
+                    );
+                }
+            } else {
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load resources</div>';
+            }
+        } catch (error) {
+            console.error("Error loading resources:", error);
+            container.innerHTML =
+                '<div class="text-center py-4 text-red-600">Error loading resources</div>';
+        }
+        return;
+    }
+
+    try {
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(
+            `[Resource Search] Searching resources with URL: ${searchUrl}`,
+        );
+
+        const response = await fetch(searchUrl);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.resources && data.resources.length > 0) {
+            let searchResultsHtml = "";
+            data.resources.forEach((resource) => {
+                const displayName = resource.name || resource.id;
+                searchResultsHtml += `
+                    <label
+                        class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 cursor-pointer hover:bg-purple-50 dark:hover:bg-purple-900 rounded-md p-1 resource-item"
+                        data-resource-id="${escapeHtml(resource.id)}"
+                    >
+                        <input
+                            type="checkbox"
+                            name="associatedResources"
+                            value="${escapeHtml(resource.id)}"
+                            data-resource-name="${escapeHtml(displayName)}"
+                            class="resource-checkbox form-checkbox h-5 w-5 text-purple-600 dark:bg-gray-800 dark:border-gray-600"
+                        />
+                        <span class="select-none">${escapeHtml(displayName)}</span>
+                    </label>
+                `;
+            });
+
+            container.innerHTML = searchResultsHtml;
+
+            // Before initializing, ensure any persisted selections are merged into the container
+            try {
+                const existingAttr = container.getAttribute(
+                    "data-selected-resources",
+                );
+                let existingIds = null;
+                if (existingAttr) {
+                    try {
+                        existingIds = JSON.parse(existingAttr);
+                    } catch (e) {
+                        console.error(
+                            "Error parsing existing data-selected-resources after search insert:",
+                            e,
+                        );
+                    }
+                }
+
+                if (
+                    (!existingIds ||
+                        !Array.isArray(existingIds) ||
+                        existingIds.length === 0) &&
+                    Array.isArray(window._selectedAssociatedResources) &&
+                    window._selectedAssociatedResources.length > 0
+                ) {
+                    container.setAttribute(
+                        "data-selected-resources",
+                        JSON.stringify(
+                            window._selectedAssociatedResources.slice(),
+                        ),
+                    );
+                } else if (
+                    Array.isArray(existingIds) &&
+                    Array.isArray(window._selectedAssociatedResources) &&
+                    window._selectedAssociatedResources.length > 0
+                ) {
+                    const merged = new Set([
+                        ...(existingIds || []),
+                        ...window._selectedAssociatedResources,
+                    ]);
+                    container.setAttribute(
+                        "data-selected-resources",
+                        JSON.stringify(Array.from(merged)),
+                    );
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring data-selected-resources attribute after inserting search results:",
+                    e,
+                );
+            }
+
+            container.innerHTML = searchResultsHtml;
+
+            // Initialize Resource select mapping
+            initResourceSelect(
+                "associatedResources",
+                "selectedResourcesPills",
+                "selectedResourcesWarning",
+                6,
+                "selectAllResourcesBtn",
+                "clearAllResourcesBtn",
+            );
+
+            if (noResultsMessage) {
+                noResultsMessage.style.display = "none";
+            }
+        } else {
+            container.innerHTML = "";
+            if (noResultsMessage) {
+                if (searchQuerySpan) {
+                    searchQuerySpan.textContent = searchTerm;
+                }
+                noResultsMessage.style.display = "block";
+            }
+        }
+    } catch (error) {
+        console.error("Error searching resources:", error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching resources</div>';
+        if (noResultsMessage) {
+            noResultsMessage.style.display = "none";
+        }
+    }
+}
+
+/**
+ * Perform server-side search for tools in the edit-server selector and update the list
+ */
+async function serverSideEditToolSearch(searchTerm) {
+    const container = document.getElementById("edit-server-tools");
+    const noResultsMessage = safeGetElement("noEditToolsMessage", true);
+    const searchQuerySpan = safeGetElement("searchQueryEditTools", true);
+
+    if (!container) {
+        console.error("edit-server-tools container not found");
+        return;
+    }
+
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Edit Tool Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // Persist current selections before we replace/clear the container
+    let serverToolsData = null;
+    let currentCheckedTools = [];
+    try {
+        // Preserve the data-server-tools attribute
+        const dataAttr = container.getAttribute("data-server-tools");
+        if (dataAttr) {
+            serverToolsData = dataAttr;
+        }
+
+        // Also capture currently checked items (important for search results)
+        currentCheckedTools = Array.from(
+            container.querySelectorAll('input[type="checkbox"]:checked'),
+        ).map((cb) => cb.value);
+
+        console.log(
+            `[Edit Tool Search] Persisted ${currentCheckedTools.length} checked tools before search:`,
+            currentCheckedTools,
+        );
+    } catch (e) {
+        console.error(
+            "Error preserving selections before edit tool search:",
+            e,
+        );
+    }
+
+    // Show loading state
+    container.innerHTML = `
+        <div class="text-center py-4">
+            <svg class="animate-spin h-5 w-5 text-indigo-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Searching tools...</p>
+        </div>
+    `;
+
+    if (searchTerm.trim() === "") {
+        // If search term is empty, reload the default tool selector partial with gateway filter
+        try {
+            const toolsUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/tools/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Edit Tool Search] Loading default tools with URL: ${toolsUrl}`,
+            );
+
+            const response = await fetch(toolsUrl);
+            if (response.ok) {
+                const html = await response.text();
+
+                container.innerHTML = html;
+
+                // Restore the data-server-tools attribute after innerHTML replacement
+                if (serverToolsData) {
+                    container.setAttribute(
+                        "data-server-tools",
+                        serverToolsData,
+                    );
+                }
+
+                // Hide no results message
+                if (noResultsMessage) {
+                    noResultsMessage.style.display = "none";
+                }
+
+                // Update tool mapping
+                updateToolMapping(container);
+
+                // Restore checked state for any tools already associated with the server
+                // PLUS any tools that were checked during the search
+                try {
+                    const dataAttr =
+                        container.getAttribute("data-server-tools");
+                    const toolsToCheck = new Set();
+
+                    // Add server-associated tools
+                    if (dataAttr) {
+                        const serverTools = JSON.parse(dataAttr);
+                        if (
+                            Array.isArray(serverTools) &&
+                            serverTools.length > 0
+                        ) {
+                            serverTools.forEach((t) =>
+                                toolsToCheck.add(String(t)),
+                            );
+                        }
+                    }
+
+                    // Add tools that were checked during search
+                    if (
+                        Array.isArray(currentCheckedTools) &&
+                        currentCheckedTools.length > 0
+                    ) {
+                        currentCheckedTools.forEach((t) =>
+                            toolsToCheck.add(String(t)),
+                        );
+                        console.log(
+                            `[Edit Tool Search] Restoring ${currentCheckedTools.length} tools checked during search`,
+                        );
+                    }
+
+                    if (toolsToCheck.size > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedTools"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const toolId = cb.value;
+                            const toolName =
+                                cb.getAttribute("data-tool-name") ||
+                                (window.toolMapping &&
+                                    window.toolMapping[cb.value]);
+                            if (
+                                toolsToCheck.has(toolId) ||
+                                (toolName && toolsToCheck.has(String(toolName)))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring edit-server tools checked state:",
+                        e,
+                    );
+                }
+
+                // Re-initialize the selector logic for the edit container
+                initToolSelect(
+                    "edit-server-tools",
+                    "selectedEditToolsPills",
+                    "selectedEditToolsWarning",
+                    6,
+                    "selectAllEditToolsBtn",
+                    "clearAllEditToolsBtn",
+                );
+            } else {
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load tools</div>';
+            }
+        } catch (error) {
+            console.error("Error loading tools:", error);
+            container.innerHTML =
+                '<div class="text-center py-4 text-red-600">Error loading tools</div>';
+        }
+        return;
+    }
+
+    try {
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(
+            `[Edit Tool Search] Searching tools with URL: ${searchUrl}`,
+        );
+
+        const response = await fetch(searchUrl);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.tools && data.tools.length > 0) {
+            // Create HTML for search results
+            let searchResultsHtml = "";
+            data.tools.forEach((tool) => {
+                const displayName =
+                    tool.display_name ||
+                    tool.custom_name ||
+                    tool.name ||
+                    tool.id;
+
+                searchResultsHtml += `
+                    <label
+                        class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md p-1 tool-item"
+                        data-tool-id="${escapeHtml(tool.id)}"
+                    >
+                        <input
+                            type="checkbox"
+                            name="associatedTools"
+                            value="${escapeHtml(tool.id)}"
+                            data-tool-name="${escapeHtml(displayName)}"
+                            class="tool-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                        />
+                        <span class="select-none">${escapeHtml(displayName)}</span>
+                    </label>
+                `;
+            });
+
+            container.innerHTML = searchResultsHtml;
+
+            // Update mapping
+            updateToolMapping(container);
+
+            // Restore checked state for any tools already associated with the server
+            try {
+                const dataAttr = container.getAttribute("data-server-tools");
+                if (dataAttr) {
+                    const serverTools = JSON.parse(dataAttr);
+                    if (Array.isArray(serverTools) && serverTools.length > 0) {
+                        // Normalize serverTools to a set of strings for robust comparison
+                        const serverToolSet = new Set(
+                            serverTools.map((s) => String(s)),
+                        );
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedTools"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const toolId = cb.value;
+                            const toolName =
+                                cb.getAttribute("data-tool-name") ||
+                                (window.toolMapping &&
+                                    window.toolMapping[cb.value]);
+                            if (
+                                serverToolSet.has(toolId) ||
+                                (toolName &&
+                                    serverToolSet.has(String(toolName)))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring edit-server tools checked state:",
+                    e,
+                );
+            }
+
+            // Initialize selector behavior
+            initToolSelect(
+                "edit-server-tools",
+                "selectedEditToolsPills",
+                "selectedEditToolsWarning",
+                6,
+                "selectAllEditToolsBtn",
+                "clearAllEditToolsBtn",
+            );
+
+            // Hide no results message
+            if (noResultsMessage) {
+                noResultsMessage.style.display = "none";
+            }
+        } else {
+            // Show no results message
+            container.innerHTML = "";
+            if (noResultsMessage) {
+                if (searchQuerySpan) {
+                    searchQuerySpan.textContent = searchTerm;
+                }
+                noResultsMessage.style.display = "block";
+            }
+        }
+    } catch (error) {
+        console.error("Error searching tools:", error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching tools</div>';
+
+        if (noResultsMessage) {
+            noResultsMessage.style.display = "none";
+        }
+    }
+}
+
+/**
+ * Perform server-side search for prompts in the edit-server selector and update the list
+ */
+async function serverSideEditPromptsSearch(searchTerm) {
+    const container = document.getElementById("edit-server-prompts");
+    const noResultsMessage = safeGetElement("noEditPromptsMessage", true);
+    const searchQuerySpan = safeGetElement("searchQueryEditPrompts", true);
+
+    if (!container) {
+        console.error("edit-server-prompts container not found");
+        return;
+    }
+
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Edit Prompt Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // Capture currently checked prompts BEFORE clearing the container
+    const currentlyCheckedPrompts = new Set();
+    const existingCheckboxes = container.querySelectorAll(
+        'input[name="associatedPrompts"]:checked',
+    );
+    existingCheckboxes.forEach((cb) => {
+        currentlyCheckedPrompts.add(cb.value);
+    });
+
+    // Show loading state
+    container.innerHTML = `
+        <div class="text-center py-4">
+            <svg class="animate-spin h-5 w-5 text-indigo-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Searching prompts...</p>
+        </div>
+    `;
+
+    if (searchTerm.trim() === "") {
+        // If search term is empty, reload the default prompts selector partial with gateway filter
+        try {
+            const promptsUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/prompts/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Edit Prompt Search] Loading default prompts with URL: ${promptsUrl}`,
+            );
+
+            const response = await fetch(promptsUrl);
+            if (response.ok) {
+                const html = await response.text();
+                container.innerHTML = html;
+
+                // Hide no results message
+                if (noResultsMessage) {
+                    noResultsMessage.style.display = "none";
+                }
+
+                // Update prompt mapping
+                updatePromptMapping(container);
+
+                // Restore checked state for prompts (both original server associations AND newly selected ones)
+                try {
+                    // Combine original server prompts with currently checked prompts
+                    const allSelectedPrompts = new Set(currentlyCheckedPrompts);
+
+                    const dataAttr = container.getAttribute(
+                        "data-server-prompts",
+                    );
+                    if (dataAttr) {
+                        const serverPrompts = JSON.parse(dataAttr);
+                        if (Array.isArray(serverPrompts)) {
+                            serverPrompts.forEach((p) =>
+                                allSelectedPrompts.add(String(p)),
+                            );
+                        }
+                    }
+
+                    if (allSelectedPrompts.size > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedPrompts"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const promptId = cb.value;
+                            const promptName =
+                                cb.getAttribute("data-prompt-name") ||
+                                (window.promptMapping &&
+                                    window.promptMapping[cb.value]);
+
+                            // Check by id first (string), then by name as a fallback
+                            if (
+                                allSelectedPrompts.has(promptId) ||
+                                (promptName &&
+                                    allSelectedPrompts.has(String(promptName)))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring edit-server prompts checked state:",
+                        e,
+                    );
+                }
+
+                // Re-initialize the selector logic for the edit container (prompt-specific)
+                initPromptSelect(
+                    "edit-server-prompts",
+                    "selectedEditPromptsPills",
+                    "selectedEditPromptsWarning",
+                    6,
+                    "selectAllEditPromptsBtn",
+                    "clearAllEditPromptsBtn",
+                );
+            } else {
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load prompts</div>';
+            }
+        } catch (error) {
+            console.error("Error loading prompts:", error);
+            container.innerHTML =
+                '<div class="text-center py-4 text-red-600">Error loading prompts</div>';
+        }
+        return;
+    }
+
+    try {
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(
+            `[Edit Prompt Search] Searching prompts with URL: ${searchUrl}`,
+        );
+
+        const response = await fetch(searchUrl);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.prompts && data.prompts.length > 0) {
+            // Create HTML for search results
+            let searchResultsHtml = "";
+            data.prompts.forEach((prompt) => {
+                const name = prompt.name || prompt.id;
+
+                searchResultsHtml += `
+                    <label
+                        class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md p-1 prompt-item"
+                        data-prompt-id="${escapeHtml(prompt.id)}"
+                    >
+                        <input
+                            type="checkbox"
+                            name="associatedPrompts"
+                            value="${escapeHtml(prompt.id)}"
+                            data-prompt-name="${escapeHtml(name)}"
+                            class="prompt-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                        />
+                        <span class="select-none">${escapeHtml(name)}</span>
+                    </label>
+                `;
+            });
+
+            container.innerHTML = searchResultsHtml;
+
+            // Update mapping
+            updatePromptMapping(container);
+
+            // Restore checked state for any prompts already associated with the server
+            try {
+                const dataAttr = container.getAttribute("data-server-prompts");
+                if (dataAttr) {
+                    const serverPrompts = JSON.parse(dataAttr);
+                    if (
+                        Array.isArray(serverPrompts) &&
+                        serverPrompts.length > 0
+                    ) {
+                        // Normalize serverPrompts to a set of strings for robust comparison
+                        const serverPromptSet = new Set(
+                            serverPrompts.map((s) => String(s)),
+                        );
+
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedPrompts"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const promptId = cb.value;
+                            const promptName =
+                                cb.getAttribute("data-prompt-name") ||
+                                (window.promptMapping &&
+                                    window.promptMapping[cb.value]);
+
+                            if (
+                                serverPromptSet.has(promptId) ||
+                                (promptName &&
+                                    serverPromptSet.has(String(promptName)))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring edit-server prompts checked state:",
+                    e,
+                );
+            }
+
+            // Initialize selector behavior
+            initPromptSelect(
+                "edit-server-prompts",
+                "selectedEditPromptsPills",
+                "selectedEditPromptsWarning",
+                6,
+                "selectAllEditPromptsBtn",
+                "clearAllEditPromptsBtn",
+            );
+
+            // Hide no results message
+            if (noResultsMessage) {
+                noResultsMessage.style.display = "none";
+            }
+        } else {
+            // Show no results message
+            container.innerHTML = "";
+            if (noResultsMessage) {
+                if (searchQuerySpan) {
+                    searchQuerySpan.textContent = searchTerm;
+                }
+                noResultsMessage.style.display = "block";
+            }
+        }
+    } catch (error) {
+        console.error("Error searching prompts:", error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching prompts</div>';
+        if (noResultsMessage) {
+            noResultsMessage.style.display = "none";
+        }
+    }
+}
+
+/**
+ * Perform server-side search for resources in the edit-server selector and update the list
+ */
+async function serverSideEditResourcesSearch(searchTerm) {
+    const container = document.getElementById("edit-server-resources");
+    const noResultsMessage = safeGetElement("noEditResourcesMessage", true);
+    const searchQuerySpan = safeGetElement("searchQueryEditResources", true);
+
+    if (!container) {
+        console.error("edit-server-resources container not found");
+        return;
+    }
+
+    // Get selected gateway IDs to maintain filtering
+    const selectedGatewayIds = getSelectedGatewayIds
+        ? getSelectedGatewayIds()
+        : [];
+    const gatewayIdParam =
+        selectedGatewayIds.length > 0 ? selectedGatewayIds.join(",") : "";
+
+    console.log(
+        `[Edit Resource Search] Searching with gateway filter: ${gatewayIdParam || "none (showing all)"}`,
+    );
+
+    // Capture currently checked resources BEFORE clearing the container
+    const currentlyCheckedResources = new Set();
+    const existingCheckboxes = container.querySelectorAll(
+        'input[name="associatedResources"]:checked',
+    );
+    existingCheckboxes.forEach((cb) => {
+        currentlyCheckedResources.add(cb.value);
+    });
+
+    // Show loading state
+    container.innerHTML = `
+        <div class="text-center py-4">
+            <svg class="animate-spin h-5 w-5 text-indigo-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Searching Resources...</p>
+        </div>
+    `;
+
+    if (searchTerm.trim() === "") {
+        // If search term is empty, reload the default resources selector partial with gateway filter
+        try {
+            const resourcesUrl = gatewayIdParam
+                ? `${window.ROOT_PATH}/admin/resources/partial?page=1&per_page=50&render=selector&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+                : `${window.ROOT_PATH}/admin/resources/partial?page=1&per_page=50&render=selector`;
+
+            console.log(
+                `[Edit Resource Search] Loading default resources with URL: ${resourcesUrl}`,
+            );
+
+            const response = await fetch(resourcesUrl);
+            if (response.ok) {
+                const html = await response.text();
+                container.innerHTML = html;
+
+                // Hide no results message
+                if (noResultsMessage) {
+                    noResultsMessage.style.display = "none";
+                }
+
+                // Update resource mapping
+                updateResourceMapping(container);
+
+                // Restore checked state for resources (both original server associations AND newly selected ones)
+                try {
+                    // Combine original server resources with currently checked resources
+                    const allSelectedResources = new Set(
+                        currentlyCheckedResources,
+                    );
+
+                    const dataAttr = container.getAttribute(
+                        "data-server-resources",
+                    );
+                    if (dataAttr) {
+                        const serverResources = JSON.parse(dataAttr);
+                        if (Array.isArray(serverResources)) {
+                            serverResources.forEach((r) =>
+                                allSelectedResources.add(String(r)),
+                            );
+                        }
+                    }
+
+                    if (allSelectedResources.size > 0) {
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedResources"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const resourceId = cb.value;
+                            const resourceName =
+                                cb.getAttribute("data-resource-name") ||
+                                (window.resourceMapping &&
+                                    window.resourceMapping[cb.value]);
+                            if (
+                                allSelectedResources.has(resourceId) ||
+                                (resourceName &&
+                                    allSelectedResources.has(
+                                        String(resourceName),
+                                    ))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error(
+                        "Error restoring edit-server resources checked state:",
+                        e,
+                    );
+                }
+
+                // Re-initialize the selector logic for the edit container (resource-specific)
+                initResourceSelect(
+                    "edit-server-resources",
+                    "selectedEditResourcesPills",
+                    "selectedEditResourcesWarning",
+                    6,
+                    "selectAllEditResourcesBtn",
+                    "clearAllEditResourcesBtn",
+                );
+            } else {
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load resources</div>';
+            }
+        } catch (error) {
+            console.error("Error loading resources:", error);
+            container.innerHTML =
+                '<div class="text-center py-4 text-red-600">Error loading resources</div>';
+        }
+        return;
+    }
+
+    try {
+        // Call the search API with gateway filter
+        const searchUrl = gatewayIdParam
+            ? `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
+            : `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+
+        console.log(
+            `[Edit Resource Search] Searching resources with URL: ${searchUrl}`,
+        );
+
+        const response = await fetch(searchUrl);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.resources && data.resources.length > 0) {
+            // Create HTML for search results
+            let searchResultsHtml = "";
+            data.resources.forEach((resource) => {
+                const name = resource.name || resource.id;
+
+                searchResultsHtml += `
+                    <label
+                        class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 cursor-pointer hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md p-1 resource-item"
+                        data-resource-id="${escapeHtml(resource.id)}"
+                    >
+                        <input
+                            type="checkbox"
+                            name="associatedResources"
+                            value="${escapeHtml(resource.id)}"
+                            data-resource-name="${escapeHtml(name)}"
+                            class="resource-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600"
+                        />
+                        <span class="select-none">${escapeHtml(name)}</span>
+                    </label>
+                `;
+            });
+
+            container.innerHTML = searchResultsHtml;
+
+            // Update mapping
+            updateResourceMapping(container);
+
+            // Restore checked state for any resources already associated with the server
+            try {
+                const dataAttr = container.getAttribute(
+                    "data-server-resources",
+                );
+                if (dataAttr) {
+                    const serverResources = JSON.parse(dataAttr);
+                    if (
+                        Array.isArray(serverResources) &&
+                        serverResources.length > 0
+                    ) {
+                        // Normalize serverResources to a set of strings for robust comparison
+                        const serverResourceSet = new Set(
+                            serverResources.map((s) => String(s)),
+                        );
+
+                        const checkboxes = container.querySelectorAll(
+                            'input[name="associatedResources"]',
+                        );
+                        checkboxes.forEach((cb) => {
+                            const resourceId = cb.value;
+                            const resourceName =
+                                cb.getAttribute("data-resource-name") ||
+                                (window.resourceMapping &&
+                                    window.resourceMapping[cb.value]);
+                            // Check by id first (string), then by name as a fallback
+                            if (
+                                serverResourceSet.has(resourceId) ||
+                                (resourceName &&
+                                    serverResourceSet.has(String(resourceName)))
+                            ) {
+                                cb.checked = true;
+                            }
+                        });
+
+                        // Trigger update so pills/counts refresh
+                        const firstCb = container.querySelector(
+                            'input[type="checkbox"]',
+                        );
+                        if (firstCb) {
+                            firstCb.dispatchEvent(
+                                new Event("change", { bubbles: true }),
+                            );
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(
+                    "Error restoring edit-server resources checked state:",
+                    e,
+                );
+            }
+
+            // Initialize selector behavior
+            initResourceSelect(
+                "edit-server-resources",
+                "selectedEditResourcesPills",
+                "selectedEditResourcesWarning",
+                6,
+                "selectAllEditResourcesBtn",
+                "clearAllEditResourcesBtn",
+            );
+
+            // Hide no results message
+            if (noResultsMessage) {
+                noResultsMessage.style.display = "none";
+            }
+        } else {
+            // Show no results message
+            container.innerHTML = "";
+            if (noResultsMessage) {
+                if (searchQuerySpan) {
+                    searchQuerySpan.textContent = searchTerm;
+                }
+                noResultsMessage.style.display = "block";
+            }
+        }
+    } catch (error) {
+        console.error("Error searching resources:", error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching resources</div>';
         if (noResultsMessage) {
             noResultsMessage.style.display = "none";
         }
@@ -19762,3 +25547,2441 @@ function updateBodyLabel() {
 
 // Make it available globally for HTML onclick handlers
 window.updateBodyLabel = updateBodyLabel;
+
+/**
+ * ====================================================================
+ * REAL-TIME GATEWAY & TOOL MONITORING (SSE)
+ * Handles live status updates for Gateways and Tools
+ * ====================================================================
+ */
+
+document.addEventListener("DOMContentLoaded", function () {
+    initializeRealTimeMonitoring();
+});
+
+function initializeRealTimeMonitoring() {
+    if (!window.EventSource) {
+        return;
+    }
+
+    // Connect to the admin events endpoint
+    const eventSource = new EventSource(`${window.ROOT_PATH}/admin/events`);
+
+    // --- Gateway Events ---
+    // Handlers for specific states
+
+    // eventSource.addEventListener("gateway_deactivated", (e) => handleEntityEvent("gateway", e));
+    eventSource.addEventListener("gateway_activated", (e) =>
+        handleEntityEvent("gateway", e),
+    );
+    eventSource.addEventListener("gateway_offline", (e) =>
+        handleEntityEvent("gateway", e),
+    );
+
+    // --- Tool Events ---
+    // Handlers for specific states
+
+    // eventSource.addEventListener("tool_deactivated", (e) => handleEntityEvent("tool", e));
+    eventSource.addEventListener("tool_activated", (e) =>
+        handleEntityEvent("tool", e),
+    );
+    eventSource.addEventListener("tool_offline", (e) =>
+        handleEntityEvent("tool", e),
+    );
+
+    eventSource.onopen = () =>
+        console.log("✅ SSE Connected for Real-time Monitoring");
+    eventSource.onerror = (err) =>
+        console.warn("⚠️ SSE Connection issue, retrying...", err);
+}
+
+/**
+ * Generic handler for entity events
+ */
+function handleEntityEvent(type, event) {
+    try {
+        const data = JSON.parse(event.data);
+        // Log the specific event type for debugging
+        // console.log(`Received ${type} event [${event.type}]:`, data);
+        updateEntityStatus(type, data);
+    } catch (err) {
+        console.error(`Error processing ${type} event:`, err);
+    }
+}
+
+/**
+ * Updates the status badge and action buttons for a row
+ */
+
+function updateEntityStatus(type, data) {
+    let row = null;
+
+    if (type === "gateway") {
+        // Gateways usually have explicit IDs
+        row = document.getElementById(`gateway-row-${data.id}`);
+    } else if (type === "tool") {
+        // 1. Try explicit ID (fastest)
+        row = document.getElementById(`tool-row-${data.id}`);
+
+        // 2. Fallback: Search rows by looking for the ID in Action buttons
+        if (!row) {
+            const panel = document.getElementById("tools-panel");
+            if (panel) {
+                const rows = panel.querySelectorAll("table tbody tr");
+                for (const tr of rows) {
+                    // Check data attribute if present
+                    if (tr.dataset.toolId === data.id) {
+                        row = tr;
+                        break;
+                    }
+
+                    // Check innerHTML for the UUID in action attributes
+                    const html = tr.innerHTML;
+                    if (html.includes(data.id)) {
+                        // Verify it's likely an ID usage (in quotes or url path)
+                        if (
+                            html.includes(`'${data.id}'`) ||
+                            html.includes(`"${data.id}"`) ||
+                            html.includes(`/${data.id}/`)
+                        ) {
+                            row = tr;
+                            // Optimization: Set ID on row for next time
+                            tr.id = `tool-row-${data.id}`;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!row) {
+        console.warn(`Could not find row for ${type} id: ${data.id}`);
+        return;
+    }
+
+    // Dynamically find Status and Action columns
+    const table = row.closest("table");
+    let statusIndex = -1;
+    let actionIndex = -1;
+
+    if (table) {
+        const headers = table.querySelectorAll("thead th");
+        headers.forEach((th, index) => {
+            const text = th.textContent.trim().toLowerCase();
+            if (text === "status") {
+                statusIndex = index;
+            }
+            if (text === "actions") {
+                actionIndex = index;
+            }
+        });
+    }
+
+    // Fallback indices if headers aren't found
+    if (statusIndex === -1) {
+        statusIndex = type === "gateway" ? 4 : 5;
+    }
+    if (actionIndex === -1) {
+        actionIndex = type === "gateway" ? 9 : 6;
+    }
+
+    const statusCell = row.children[statusIndex];
+    const actionCell = row.children[actionIndex];
+
+    // --- 1. Update Status Badge ---
+    if (statusCell) {
+        const isEnabled =
+            data.enabled !== undefined ? data.enabled : data.isActive;
+        const isReachable =
+            data.reachable !== undefined ? data.reachable : true;
+
+        statusCell.innerHTML = generateStatusBadgeHtml(
+            isEnabled,
+            isReachable,
+            type,
+        );
+
+        // Flash effect
+        statusCell.classList.add(
+            "bg-blue-50",
+            "dark:bg-blue-900",
+            "transition-colors",
+            "duration-500",
+        );
+        setTimeout(() => {
+            statusCell.classList.remove("bg-blue-50", "dark:bg-blue-900");
+        }, 1000);
+    }
+
+    // --- 2. Update Action Buttons ---
+    if (actionCell) {
+        const isEnabled =
+            data.enabled !== undefined ? data.enabled : data.isActive;
+        updateEntityActionButtons(actionCell, type, data.id, isEnabled);
+    }
+}
+// ============================================================================
+// Structured Logging UI Functions
+// ============================================================================
+
+// Current log search state
+let currentLogPage = 0;
+const currentLogLimit = 50;
+// eslint-disable-next-line no-unused-vars
+let currentLogFilters = {};
+const PERFORMANCE_HISTORY_HOURS = 24;
+const PERFORMANCE_AGGREGATION_OPTIONS = {
+    "5m": { label: "5-minute aggregation", query: "5m" },
+    "24h": { label: "24-hour aggregation", query: "24h" },
+};
+let currentPerformanceAggregationKey = "5m";
+
+function getPerformanceAggregationConfig(
+    rangeKey = currentPerformanceAggregationKey,
+) {
+    return (
+        PERFORMANCE_AGGREGATION_OPTIONS[rangeKey] ||
+        PERFORMANCE_AGGREGATION_OPTIONS["5m"]
+    );
+}
+
+function getPerformanceAggregationLabel(
+    rangeKey = currentPerformanceAggregationKey,
+) {
+    return getPerformanceAggregationConfig(rangeKey).label;
+}
+
+function getPerformanceAggregationQuery(
+    rangeKey = currentPerformanceAggregationKey,
+) {
+    return getPerformanceAggregationConfig(rangeKey).query;
+}
+
+function syncPerformanceAggregationSelect() {
+    const select = document.getElementById("performance-aggregation-select");
+    if (select && select.value !== currentPerformanceAggregationKey) {
+        select.value = currentPerformanceAggregationKey;
+    }
+}
+
+function setPerformanceAggregationVisibility(shouldShow) {
+    const controls = document.getElementById(
+        "performance-aggregation-controls",
+    );
+    if (!controls) {
+        return;
+    }
+    if (shouldShow) {
+        controls.classList.remove("hidden");
+    } else {
+        controls.classList.add("hidden");
+    }
+}
+
+function setLogFiltersVisibility(shouldShow) {
+    const filters = document.getElementById("log-filters");
+    if (!filters) {
+        return;
+    }
+    if (shouldShow) {
+        filters.classList.remove("hidden");
+    } else {
+        filters.classList.add("hidden");
+    }
+}
+
+function handlePerformanceAggregationChange(event) {
+    const selectedKey = event?.target?.value;
+    if (selectedKey && PERFORMANCE_AGGREGATION_OPTIONS[selectedKey]) {
+        showPerformanceMetrics(selectedKey);
+    }
+}
+
+/**
+ * Search structured logs with filters
+ */
+async function searchStructuredLogs() {
+    setPerformanceAggregationVisibility(false);
+    setLogFiltersVisibility(true);
+    const levelFilter = document.getElementById("log-level-filter")?.value;
+    const componentFilter = document.getElementById(
+        "log-component-filter",
+    )?.value;
+    const searchQuery = document.getElementById("log-search")?.value;
+
+    // Restore default log table headers (in case we're coming from performance metrics view)
+    restoreLogTableHeaders();
+
+    // Build search request
+    const searchRequest = {
+        limit: currentLogLimit,
+        offset: currentLogPage * currentLogLimit,
+        sort_by: "timestamp",
+        sort_order: "desc",
+    };
+
+    // Only add filters if they have actual values (not empty strings)
+    if (searchQuery && searchQuery.trim() !== "") {
+        const trimmedSearch = searchQuery.trim();
+        // Check if search is a correlation ID (32 hex chars or UUID format) or text search
+        const correlationIdPattern =
+            /^([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+        if (correlationIdPattern.test(trimmedSearch)) {
+            searchRequest.correlation_id = trimmedSearch;
+        } else {
+            searchRequest.search_text = trimmedSearch;
+        }
+    }
+    if (levelFilter && levelFilter !== "") {
+        searchRequest.level = [levelFilter];
+    }
+    if (componentFilter && componentFilter !== "") {
+        searchRequest.component = [componentFilter];
+    }
+
+    // Store filters for pagination
+    currentLogFilters = searchRequest;
+
+    try {
+        const response = await fetchWithAuth(
+            `${getRootPath()}/api/logs/search`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(searchRequest),
+            },
+        );
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error("API Error Response:", errorText);
+            throw new Error(
+                `Failed to search logs: ${response.statusText} - ${errorText}`,
+            );
+        }
+
+        const data = await response.json();
+        displayLogResults(data);
+    } catch (error) {
+        console.error("Error searching logs:", error);
+        showToast("Failed to search logs: " + error.message, "error");
+        document.getElementById("logs-tbody").innerHTML = `
+            <tr><td colspan="7" class="px-4 py-4 text-center text-red-600 dark:text-red-400">
+                ❌ Error: ${escapeHtml(error.message)}
+            </td></tr>
+        `;
+    }
+}
+
+/**
+ * Display log search results
+ */
+function displayLogResults(data) {
+    const tbody = document.getElementById("logs-tbody");
+    const logCount = document.getElementById("log-count");
+    const logStats = document.getElementById("log-stats");
+    const prevButton = document.getElementById("prev-page");
+    const nextButton = document.getElementById("next-page");
+
+    // Ensure default headers are shown for log view
+    restoreLogTableHeaders();
+
+    if (!data.results || data.results.length === 0) {
+        tbody.innerHTML = `
+            <tr><td colspan="7" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                📭 No logs found matching your criteria
+            </td></tr>
+        `;
+        logCount.textContent = "0 logs";
+        logStats.innerHTML = '<span class="text-sm">No results</span>';
+        return;
+    }
+
+    // Update stats
+    logCount.textContent = `${data.total.toLocaleString()} logs`;
+    const start = currentLogPage * currentLogLimit + 1;
+    const end = Math.min(start + data.results.length - 1, data.total);
+    logStats.innerHTML = `
+        <span class="text-sm">
+            Showing ${start}-${end} of ${data.total.toLocaleString()} logs
+        </span>
+    `;
+
+    // Update pagination buttons
+    prevButton.disabled = currentLogPage === 0;
+    nextButton.disabled = end >= data.total;
+
+    // Render log entries
+    tbody.innerHTML = data.results
+        .map((log) => {
+            const levelClass = getLogLevelClass(log.level);
+            const durationDisplay = log.duration_ms
+                ? `${log.duration_ms.toFixed(2)}ms`
+                : "-";
+            const correlationId = log.correlation_id || "-";
+            const userDisplay = log.user_email || log.user_id || "-";
+
+            return `
+            <tr class="hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                onclick="showLogDetails('${log.id}', '${escapeHtml(log.correlation_id || "")}')">
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${formatTimestamp(log.timestamp)}
+                </td>
+                <td class="px-4 py-3">
+                    <span class="px-2 py-1 text-xs font-semibold rounded ${levelClass}">
+                        ${log.level}
+                    </span>
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(log.component || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${escapeHtml(truncateText(log.message, 80))}
+                    ${log.error_details ? '<span class="text-red-600">⚠️</span>' : ""}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(userDisplay)}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${durationDisplay}
+                </td>
+                <td class="px-4 py-3 text-sm">
+                    ${
+                        correlationId !== "-"
+                            ? `
+                        <button onclick="event.stopPropagation(); showCorrelationTrace('${escapeHtml(correlationId)}')"
+                                class="text-blue-600 dark:text-blue-400 hover:underline">
+                            ${escapeHtml(truncateText(correlationId, 12))}
+                        </button>
+                    `
+                            : "-"
+                    }
+                </td>
+            </tr>
+        `;
+        })
+        .join("");
+}
+
+/**
+ * Get CSS class for log level badge
+ */
+function getLogLevelClass(level) {
+    const classes = {
+        DEBUG: "bg-gray-200 text-gray-800 dark:bg-gray-600 dark:text-gray-200",
+        INFO: "bg-blue-200 text-blue-800 dark:bg-blue-800 dark:text-blue-200",
+        WARNING:
+            "bg-yellow-200 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200",
+        ERROR: "bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200",
+        CRITICAL:
+            "bg-purple-200 text-purple-800 dark:bg-purple-800 dark:text-purple-200",
+    };
+    return classes[level] || classes.INFO;
+}
+
+/**
+ * Format timestamp for display
+ */
+function formatTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    return date.toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+    });
+}
+
+/**
+ * Truncate text with ellipsis
+ */
+function truncateText(text, maxLength) {
+    if (!text) {
+        return "";
+    }
+    return text.length > maxLength
+        ? text.substring(0, maxLength) + "..."
+        : text;
+}
+
+/**
+ * Show detailed log entry (future enhancement - modal)
+ */
+function showLogDetails(logId, correlationId) {
+    if (correlationId) {
+        showCorrelationTrace(correlationId);
+    } else {
+        console.log("Log details:", logId);
+        showToast("Full log details view coming soon", "info");
+    }
+}
+
+/**
+ * Restore default log table headers
+ */
+function restoreLogTableHeaders() {
+    const thead = document.getElementById("logs-thead");
+    if (thead) {
+        thead.innerHTML = `
+            <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Level
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Component
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Message
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    User
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Duration
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Correlation ID
+                </th>
+            </tr>
+        `;
+    }
+}
+
+/**
+ * Trace all logs for a correlation ID
+ */
+async function showCorrelationTrace(correlationId) {
+    setPerformanceAggregationVisibility(false);
+    setLogFiltersVisibility(true);
+    if (!correlationId) {
+        const searchInput = document.getElementById("log-search");
+        correlationId = prompt(
+            "Enter Correlation ID to trace:",
+            searchInput?.value || "",
+        );
+        if (!correlationId) {
+            return;
+        }
+    }
+
+    try {
+        const response = await fetchWithAuth(
+            `${getRootPath()}/api/logs/trace/${encodeURIComponent(correlationId)}`,
+            {
+                method: "GET",
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch trace: ${response.statusText}`);
+        }
+
+        const trace = await response.json();
+        displayCorrelationTrace(trace);
+    } catch (error) {
+        console.error("Error fetching correlation trace:", error);
+        showToast(
+            "Failed to fetch correlation trace: " + error.message,
+            "error",
+        );
+    }
+}
+
+/**
+ * Generates the HTML for the status badge (Active/Inactive/Offline)
+ */
+function generateStatusBadgeHtml(enabled, reachable, typeLabel) {
+    const label = typeLabel
+        ? typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1)
+        : "Item";
+
+    if (!enabled) {
+        // CASE 1: Inactive (Manually disabled) -> RED
+        return `
+        <div class="relative group inline-block">
+            <span class="px-2 inline-flex items-center text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
+                Inactive
+                <svg class="ml-1 h-4 w-4 text-red-600 dark:text-red-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M6.293 6.293a1 1 0 011.414 0L10 8.586l2.293-2.293a1 1 0 111.414 1.414L11.414 10l2.293 2.293a1 1 0 11-1.414 1.414L10 11.414l-2.293 2.293a1 1 0 11-1.414-1.414L8.586 10 6.293 7.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+            </span>
+            <div class="absolute left-full top-1/2 -translate-y-1/2 ml-2 hidden group-hover:block bg-gray-800 text-white text-xs rounded py-1 px-2 z-10 whitespace-nowrap shadow">💡${label} is Manually Deactivated</div>
+        </div>`;
+    } else if (!reachable) {
+        // CASE 2: Offline (Enabled but Unreachable/Health Check Failed) -> YELLOW
+        return `
+        <div class="relative group inline-block">
+            <span class="px-2 inline-flex items-center text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                Offline
+                <svg class="ml-1 h-4 w-4 text-yellow-600 dark:text-yellow-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-10h2v4h-2V8zm0 6h2v2h-2v-2z" clip-rule="evenodd"/></svg>
+            </span>
+            <div class="absolute left-full top-1/2 -translate-y-1/2 ml-2 hidden group-hover:block bg-gray-800 text-white text-xs rounded py-1 px-2 z-10 whitespace-nowrap shadow">💡${label} is Not Reachable (Health Check Failed)</div>
+        </div>`;
+    } else {
+        // CASE 3: Active (Enabled and Reachable) -> GREEN
+        return `
+        <div class="relative group inline-block">
+            <span class="px-2 inline-flex items-center text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                Active
+                <svg class="ml-1 h-4 w-4 text-green-600 dark:text-green-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-4.586l5.293-5.293-1.414-1.414L9 11.586 7.121 9.707 5.707 11.121 9 14.414z" clip-rule="evenodd"/></svg>
+            </span>
+            <div class="absolute left-full top-1/2 -translate-y-1/2 ml-2 hidden group-hover:block bg-gray-800 text-white text-xs rounded py-1 px-2 z-10 whitespace-nowrap shadow">💡${label} is Active</div>
+        </div>`;
+    }
+}
+
+/**
+ * Dynamically updates the action buttons (Activate/Deactivate) inside the table cell
+ */
+function updateEntityActionButtons(cell, type, id, isEnabled) {
+    // We look for the form that toggles activation inside the cell
+    const form = cell.querySelector('form[action*="/toggle"]');
+    if (!form) {
+        return;
+    }
+
+    // The HTML structure for the button
+    // Ensure we are flipping the button state correctly based on isEnabled
+
+    if (isEnabled) {
+        // If Enabled -> Show Deactivate Button
+        form.innerHTML = `
+            <input type="hidden" name="activate" value="false" />
+            <button type="submit" class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-yellow-600 hover:text-yellow-900 hover:bg-yellow-50 dark:text-yellow-400 dark:hover:bg-yellow-900/20 transition-colors" x-tooltip="'💡Temporarily disable this item'">
+                Deactivate
+            </button>
+        `;
+    } else {
+        // If Disabled -> Show Activate Button
+        form.innerHTML = `
+            <input type="hidden" name="activate" value="true" />
+            <button type="submit" class="flex items-center justify-center px-2 py-1 text-xs font-medium rounded-md text-blue-600 hover:text-blue-900 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/20 transition-colors" x-tooltip="'💡Re-enable this item'">
+                Activate
+            </button>
+        `;
+    }
+}
+
+// CRITICAL DEBUG AND FIX FOR MCP SERVERS SEARCH
+console.log("🔧 LOADING MCP SERVERS SEARCH DEBUG FUNCTIONS...");
+
+// Emergency fix function for MCP Servers search
+window.emergencyFixMCPSearch = function () {
+    console.log("🚨 EMERGENCY FIX: Attempting to fix MCP Servers search...");
+
+    // Find the search input
+    const searchInput = document.getElementById("gateways-search-input");
+    if (!searchInput) {
+        console.error("❌ Cannot find gateways-search-input element");
+        return false;
+    }
+
+    console.log("✅ Found search input:", searchInput);
+
+    // Remove all existing event listeners by cloning
+    const newSearchInput = searchInput.cloneNode(true);
+    searchInput.parentNode.replaceChild(newSearchInput, searchInput);
+
+    // Add fresh event listener
+    const finalSearchInput = document.getElementById("gateways-search-input");
+    finalSearchInput.addEventListener("input", function (e) {
+        console.log("🔍 EMERGENCY SEARCH EVENT:", e.target.value);
+        filterGatewaysTable(e.target.value);
+    });
+
+    console.log(
+        "✅ Emergency fix applied - test by typing in MCP Servers search box",
+    );
+    return true;
+};
+
+// Manual test function
+window.testMCPSearchManually = function (searchTerm = "github") {
+    console.log("🧪 MANUAL TEST: Testing MCP search with:", searchTerm);
+    filterGatewaysTable(searchTerm);
+};
+
+// Debug current state function
+window.debugMCPSearchState = function () {
+    console.log("🔍 DEBUGGING MCP SEARCH STATE:");
+
+    const searchInput = document.getElementById("gateways-search-input");
+    console.log("Search input:", searchInput);
+    console.log(
+        "Search input value:",
+        searchInput ? searchInput.value : "NOT FOUND",
+    );
+
+    const panel = document.getElementById("gateways-panel");
+    console.log("Gateways panel:", panel);
+
+    const table = panel ? panel.querySelector("table") : null;
+    console.log("Table in panel:", table);
+
+    const rows = table ? table.querySelectorAll("tbody tr") : [];
+    console.log("Rows found:", rows.length);
+
+    if (rows.length > 0) {
+        console.log("First row content:", rows[0].textContent);
+    }
+
+    return {
+        searchInput: !!searchInput,
+        panel: !!panel,
+        table: !!table,
+        rowCount: rows.length,
+    };
+};
+
+// Auto-fix on page load
+setTimeout(function () {
+    console.log("🔄 AUTO-FIX: Attempting to fix MCP search after page load...");
+    if (window.emergencyFixMCPSearch) {
+        window.emergencyFixMCPSearch();
+    }
+}, 1000);
+
+console.log("🔧 MCP SERVERS SEARCH DEBUG FUNCTIONS LOADED!");
+console.log("💡 Use: window.emergencyFixMCPSearch() to fix search");
+console.log("💡 Use: window.testMCPSearchManually('github') to test search");
+console.log("💡 Use: window.debugMCPSearchState() to check current state");
+
+/**
+ * Display correlation trace results
+ */
+function displayCorrelationTrace(trace) {
+    const tbody = document.getElementById("logs-tbody");
+    const thead = document.getElementById("logs-thead");
+    const logCount = document.getElementById("log-count");
+    const logStats = document.getElementById("log-stats");
+
+    // Calculate total events
+    const totalEvents =
+        (trace.logs?.length || 0) +
+        (trace.security_events?.length || 0) +
+        (trace.audit_trails?.length || 0);
+
+    // Update table headers for trace view
+    if (thead) {
+        thead.innerHTML = `
+            <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Event Type
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Component
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Message/Description
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    User
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Duration
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Status/Severity
+                </th>
+            </tr>
+        `;
+    }
+
+    // Update stats
+    logCount.textContent = `${totalEvents} events`;
+    logStats.innerHTML = `
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+            <div>
+                <strong>Correlation ID:</strong><br>
+                <code class="text-xs bg-gray-200 dark:bg-gray-700 px-2 py-1 rounded">${escapeHtml(trace.correlation_id)}</code>
+            </div>
+            <div>
+                <strong>Logs:</strong> <span class="text-blue-600">${trace.log_count || 0}</span>
+            </div>
+            <div>
+                <strong>Security:</strong> <span class="text-red-600">${trace.security_events?.length || 0}</span>
+            </div>
+            <div>
+                <strong>Audit:</strong> <span class="text-yellow-600">${trace.audit_trails?.length || 0}</span>
+            </div>
+            <div>
+                <strong>Duration:</strong> ${trace.total_duration_ms ? trace.total_duration_ms.toFixed(2) + "ms" : "N/A"}
+            </div>
+        </div>
+    `;
+
+    if (totalEvents === 0) {
+        tbody.innerHTML = `
+            <tr><td colspan="7" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                📭 No events found for this correlation ID
+            </td></tr>
+        `;
+        return;
+    }
+
+    // Combine all events into a unified timeline
+    const allEvents = [];
+
+    // Add logs
+    (trace.logs || []).forEach((log) => {
+        const levelClass = getLogLevelClass(log.level);
+        allEvents.push({
+            timestamp: new Date(log.timestamp),
+            html: `
+                <tr class="hover:bg-gray-50 dark:hover:bg-gray-700 border-l-4 border-blue-500">
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        ${formatTimestamp(log.timestamp)}
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-semibold rounded bg-blue-200 text-blue-800 dark:bg-blue-800 dark:text-blue-200">
+                            📝 Log
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(log.component || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        ${escapeHtml(log.message)}
+                        ${log.error_details ? `<br><small class="text-red-600">⚠️ ${escapeHtml(log.error_details.error_message || JSON.stringify(log.error_details))}</small>` : ""}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(log.user_email || log.user_id || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${log.duration_ms ? log.duration_ms.toFixed(2) + "ms" : "-"}
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-semibold rounded ${levelClass}">
+                            ${log.level}
+                        </span>
+                    </td>
+                </tr>
+            `,
+        });
+    });
+
+    // Add security events
+    (trace.security_events || []).forEach((event) => {
+        const severityClass = getSeverityClass(event.severity);
+        const threatScore = event.threat_score
+            ? (event.threat_score * 100).toFixed(0)
+            : 0;
+        allEvents.push({
+            timestamp: new Date(event.timestamp),
+            html: `
+                <tr class="hover:bg-gray-50 dark:hover:bg-gray-700 border-l-4 border-red-500 bg-red-50 dark:bg-red-900/10">
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        ${formatTimestamp(event.timestamp)}
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-semibold rounded bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200">
+                            🛡️ Security
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(event.event_type || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        ${escapeHtml(event.description || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(event.user_email || event.user_id || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+                        -
+                    </td>
+                    <td class="px-4 py-3">
+                        <div class="flex flex-col gap-1">
+                            <span class="px-2 py-1 text-xs font-semibold rounded ${severityClass} w-fit">
+                                ${event.severity}
+                            </span>
+                            <div class="flex items-center gap-1">
+                                <span class="text-xs text-gray-600 dark:text-gray-400">Threat:</span>
+                                <div class="w-16 bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+                                    <div class="bg-red-600 h-2 rounded-full" style="width: ${threatScore}%"></div>
+                                </div>
+                                <span class="text-xs font-medium text-gray-700 dark:text-gray-300">${threatScore}%</span>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+            `,
+        });
+    });
+
+    // Add audit trails
+    (trace.audit_trails || []).forEach((audit) => {
+        const actionBadgeColors = {
+            create: "bg-green-200 text-green-800",
+            update: "bg-blue-200 text-blue-800",
+            delete: "bg-red-200 text-red-800",
+            read: "bg-gray-200 text-gray-800",
+        };
+        const actionBadge =
+            actionBadgeColors[audit.action?.toLowerCase()] ||
+            "bg-purple-200 text-purple-800";
+        const statusIcon = audit.success ? "✓" : "✗";
+        const statusClass = audit.success ? "text-green-600" : "text-red-600";
+        const statusBg = audit.success
+            ? "bg-green-100 dark:bg-green-900"
+            : "bg-red-100 dark:bg-red-900";
+
+        allEvents.push({
+            timestamp: new Date(audit.timestamp),
+            html: `
+                <tr class="hover:bg-gray-50 dark:hover:bg-gray-700 border-l-4 border-yellow-500 bg-yellow-50 dark:bg-yellow-900/10">
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        ${formatTimestamp(audit.timestamp)}
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-semibold rounded ${actionBadge}">
+                            📋 ${audit.action?.toUpperCase()}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(audit.resource_type || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                        <strong>${audit.action}:</strong> ${audit.resource_type}
+                        <code class="text-xs bg-gray-200 px-1 rounded">${escapeHtml(audit.resource_id || "-")}</code>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                        ${escapeHtml(audit.user_email || audit.user_id || "-")}
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+                        -
+                    </td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-semibold rounded ${statusBg} ${statusClass}">
+                            ${statusIcon} ${audit.success ? "Success" : "Failed"}
+                        </span>
+                    </td>
+                </tr>
+            `,
+        });
+    });
+
+    // Sort all events chronologically
+    allEvents.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Render sorted events
+    tbody.innerHTML = allEvents.map((event) => event.html).join("");
+}
+
+/**
+ * Show security events
+ */
+async function showSecurityEvents() {
+    setPerformanceAggregationVisibility(false);
+    setLogFiltersVisibility(false);
+    try {
+        const response = await fetchWithAuth(
+            `${getRootPath()}/api/logs/security-events?limit=50&resolved=false`,
+            {
+                method: "GET",
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `Failed to fetch security events: ${response.statusText}`,
+            );
+        }
+
+        const events = await response.json();
+        displaySecurityEvents(events);
+    } catch (error) {
+        console.error("Error fetching security events:", error);
+        showToast("Failed to fetch security events: " + error.message, "error");
+    }
+}
+
+/**
+ * Display security events
+ */
+function displaySecurityEvents(events) {
+    const tbody = document.getElementById("logs-tbody");
+    const thead = document.getElementById("logs-thead");
+    const logCount = document.getElementById("log-count");
+    const logStats = document.getElementById("log-stats");
+
+    // Update table headers for security events
+    if (thead) {
+        thead.innerHTML = `
+            <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Severity
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Event Type
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Description
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    User/Source
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Threat Score
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Correlation ID
+                </th>
+            </tr>
+        `;
+    }
+
+    logCount.textContent = `${events.length} security events`;
+    logStats.innerHTML = `
+        <span class="text-sm text-red-600 dark:text-red-400">
+            🛡️ Unresolved Security Events
+        </span>
+    `;
+
+    if (events.length === 0) {
+        tbody.innerHTML = `
+            <tr><td colspan="7" class="px-4 py-8 text-center text-green-600 dark:text-green-400">
+                ✅ No unresolved security events
+            </td></tr>
+        `;
+        return;
+    }
+
+    tbody.innerHTML = events
+        .map((event) => {
+            const severityClass = getSeverityClass(event.severity);
+            const threatScore = (event.threat_score * 100).toFixed(0);
+
+            return `
+            <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${formatTimestamp(event.timestamp)}
+                </td>
+                <td class="px-4 py-3">
+                    <span class="px-2 py-1 text-xs font-semibold rounded ${severityClass}">
+                        ${event.severity}
+                    </span>
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(event.event_type)}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${escapeHtml(event.description)}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(event.user_email || event.user_id || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm">
+                    <div class="flex items-center">
+                        <div class="w-16 bg-gray-200 dark:bg-gray-600 rounded-full h-2 mr-2">
+                            <div class="bg-red-600 h-2 rounded-full" style="width: ${threatScore}%"></div>
+                        </div>
+                        <span class="text-xs">${threatScore}%</span>
+                    </div>
+                </td>
+                <td class="px-4 py-3 text-sm">
+                    ${
+                        event.correlation_id
+                            ? `
+                        <button onclick="event.stopPropagation(); showCorrelationTrace('${escapeHtml(event.correlation_id)}')"
+                                class="text-blue-600 dark:text-blue-400 hover:underline">
+                            ${escapeHtml(truncateText(event.correlation_id, 12))}
+                        </button>
+                    `
+                            : "-"
+                    }
+                </td>
+            </tr>
+        `;
+        })
+        .join("");
+}
+
+/**
+ * Get CSS class for severity badge
+ */
+function getSeverityClass(severity) {
+    const classes = {
+        LOW: "bg-blue-200 text-blue-800 dark:bg-blue-800 dark:text-blue-200",
+        MEDIUM: "bg-yellow-200 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200",
+        HIGH: "bg-orange-200 text-orange-800 dark:bg-orange-800 dark:text-orange-200",
+        CRITICAL: "bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200",
+    };
+    return classes[severity] || classes.MEDIUM;
+}
+
+/**
+ * Show audit trail
+ */
+async function showAuditTrail() {
+    setPerformanceAggregationVisibility(false);
+    setLogFiltersVisibility(false);
+    try {
+        const response = await fetchWithAuth(
+            `${getRootPath()}/api/logs/audit-trails?limit=50&requires_review=true`,
+            {
+                method: "GET",
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `Failed to fetch audit trails: ${response.statusText}`,
+            );
+        }
+
+        const trails = await response.json();
+        displayAuditTrail(trails);
+    } catch (error) {
+        console.error("Error fetching audit trails:", error);
+        showToast("Failed to fetch audit trails: " + error.message, "error");
+    }
+}
+
+/**
+ * Display audit trail entries
+ */
+function displayAuditTrail(trails) {
+    const tbody = document.getElementById("logs-tbody");
+    const thead = document.getElementById("logs-thead");
+    const logCount = document.getElementById("log-count");
+    const logStats = document.getElementById("log-stats");
+
+    // Update table headers for audit trail
+    if (thead) {
+        thead.innerHTML = `
+            <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Action
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Resource Type
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Resource
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    User
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Status
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Correlation ID
+                </th>
+            </tr>
+        `;
+    }
+
+    logCount.textContent = `${trails.length} audit entries`;
+    logStats.innerHTML = `
+        <span class="text-sm text-yellow-600 dark:text-yellow-400">
+            📝 Audit Trail Entries Requiring Review
+        </span>
+    `;
+
+    if (trails.length === 0) {
+        tbody.innerHTML = `
+            <tr><td colspan="7" class="px-4 py-8 text-center text-green-600 dark:text-green-400">
+                ✅ No audit entries require review
+            </td></tr>
+        `;
+        return;
+    }
+
+    tbody.innerHTML = trails
+        .map((trail) => {
+            const actionClass = trail.success
+                ? "text-green-600"
+                : "text-red-600";
+            const actionIcon = trail.success ? "✓" : "✗";
+
+            // Determine action badge color
+            const actionBadgeColors = {
+                create: "bg-green-200 text-green-800 dark:bg-green-800 dark:text-green-200",
+                update: "bg-blue-200 text-blue-800 dark:bg-blue-800 dark:text-blue-200",
+                delete: "bg-red-200 text-red-800 dark:bg-red-800 dark:text-red-200",
+                read: "bg-gray-200 text-gray-800 dark:bg-gray-600 dark:text-gray-200",
+                activate:
+                    "bg-teal-200 text-teal-800 dark:bg-teal-800 dark:text-teal-200",
+                deactivate:
+                    "bg-orange-200 text-orange-800 dark:bg-orange-800 dark:text-orange-200",
+            };
+            const actionBadge =
+                actionBadgeColors[trail.action.toLowerCase()] ||
+                "bg-purple-200 text-purple-800 dark:bg-purple-800 dark:text-purple-200";
+
+            // Format resource name with ID
+            const resourceName =
+                trail.resource_name || trail.resource_id || "-";
+            const resourceDisplay = `
+            <div class="font-medium">${escapeHtml(resourceName)}</div>
+            ${trail.resource_id && trail.resource_name ? `<div class="text-xs text-gray-500">UUID: ${escapeHtml(trail.resource_id)}</div>` : ""}
+            ${trail.data_classification ? `<div class="text-xs text-orange-600 mt-1">🔒 ${escapeHtml(trail.data_classification)}</div>` : ""}
+        `;
+
+            return `
+            <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${formatTimestamp(trail.timestamp)}
+                </td>
+                <td class="px-4 py-3">
+                    <span class="px-2 py-1 text-xs font-semibold rounded ${actionBadge}">
+                        ${trail.action.toUpperCase()}
+                    </span>
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(trail.resource_type || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${resourceDisplay}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(trail.user_email || trail.user_id || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm ${actionClass}">
+                    ${actionIcon} ${trail.success ? "Success" : "Failed"}
+                </td>
+                <td class="px-4 py-3 text-sm">
+                    ${
+                        trail.correlation_id
+                            ? `
+                        <button onclick="event.stopPropagation(); showCorrelationTrace('${escapeHtml(trail.correlation_id)}')"
+                                class="text-blue-600 dark:text-blue-400 hover:underline">
+                            ${escapeHtml(truncateText(trail.correlation_id, 12))}
+                        </button>
+                    `
+                            : "-"
+                    }
+                </td>
+            </tr>
+        `;
+        })
+        .join("");
+}
+
+/**
+ * Show performance metrics
+ */
+async function showPerformanceMetrics(rangeKey) {
+    if (rangeKey && PERFORMANCE_AGGREGATION_OPTIONS[rangeKey]) {
+        currentPerformanceAggregationKey = rangeKey;
+    } else {
+        const select = document.getElementById(
+            "performance-aggregation-select",
+        );
+        if (select?.value && PERFORMANCE_AGGREGATION_OPTIONS[select.value]) {
+            currentPerformanceAggregationKey = select.value;
+        }
+    }
+
+    syncPerformanceAggregationSelect();
+    setPerformanceAggregationVisibility(true);
+    setLogFiltersVisibility(false);
+    const hoursParam = encodeURIComponent(PERFORMANCE_HISTORY_HOURS.toString());
+    const aggregationParam = encodeURIComponent(
+        getPerformanceAggregationQuery(),
+    );
+
+    try {
+        const response = await fetchWithAuth(
+            `${getRootPath()}/api/logs/performance-metrics?hours=${hoursParam}&aggregation=${aggregationParam}`,
+            {
+                method: "GET",
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `Failed to fetch performance metrics: ${response.statusText}`,
+            );
+        }
+
+        const metrics = await response.json();
+        displayPerformanceMetrics(metrics);
+    } catch (error) {
+        console.error("Error fetching performance metrics:", error);
+        showToast(
+            "Failed to fetch performance metrics: " + error.message,
+            "error",
+        );
+    }
+}
+
+/**
+ * Display performance metrics
+ */
+function displayPerformanceMetrics(metrics) {
+    const tbody = document.getElementById("logs-tbody");
+    const thead = document.getElementById("logs-thead");
+    const logCount = document.getElementById("log-count");
+    const logStats = document.getElementById("log-stats");
+    const aggregationLabel = getPerformanceAggregationLabel();
+
+    // Update table headers for performance metrics
+    if (thead) {
+        thead.innerHTML = `
+            <tr>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Component
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Operation
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Avg Duration
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Requests
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    Error Rate
+                </th>
+                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                    P99 Duration
+                </th>
+            </tr>
+        `;
+    }
+
+    logCount.textContent = `${metrics.length} metrics`;
+    logStats.innerHTML = `
+        <span class="text-sm text-green-600 dark:text-green-400">
+            ⚡ Performance Metrics (${aggregationLabel})
+        </span>
+    `;
+
+    if (metrics.length === 0) {
+        tbody.innerHTML = `
+            <tr><td colspan="7" class="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                📊 No performance metrics available for ${aggregationLabel.toLowerCase()}
+            </td></tr>
+        `;
+        return;
+    }
+
+    tbody.innerHTML = metrics
+        .map((metric) => {
+            const errorRatePercent = (metric.error_rate * 100).toFixed(2);
+            const errorClass =
+                metric.error_rate > 0.1 ? "text-red-600" : "text-green-600";
+
+            return `
+            <tr class="hover:bg-gray-50 dark:hover:bg-gray-700">
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    ${formatTimestamp(metric.window_start)}
+                </td>
+                <td class="px-4 py-3 text-sm font-semibold text-gray-900 dark:text-gray-300">
+                    ${escapeHtml(metric.component || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${escapeHtml(metric.operation_type || "-")}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-900 dark:text-gray-300">
+                    <div class="text-xs">
+                        <div>Avg: <strong>${metric.avg_duration_ms.toFixed(2)}ms</strong></div>
+                        <div class="text-gray-500">P95: ${metric.p95_duration_ms.toFixed(2)}ms</div>
+                    </div>
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-700 dark:text-gray-300">
+                    ${metric.request_count.toLocaleString()} requests
+                </td>
+                <td class="px-4 py-3 text-sm ${errorClass}">
+                    ${errorRatePercent}%
+                    ${metric.error_rate > 0.1 ? "⚠️" : ""}
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+                    <div class="text-xs">
+                        P99: ${metric.p99_duration_ms.toFixed(2)}ms
+                    </div>
+                </td>
+            </tr>
+        `;
+        })
+        .join("");
+}
+
+/**
+ * Navigate to previous log page
+ */
+function previousLogPage() {
+    if (currentLogPage > 0) {
+        currentLogPage--;
+        searchStructuredLogs();
+    }
+}
+
+/**
+ * Navigate to next log page
+ */
+function nextLogPage() {
+    currentLogPage++;
+    searchStructuredLogs();
+}
+
+/**
+ * Get root path for API calls
+ */
+function getRootPath() {
+    return window.ROOT_PATH || "";
+}
+
+/**
+ * Show toast notification
+ */
+function showToast(message, type = "info") {
+    // Check if showMessage function exists (from existing admin.js)
+    if (typeof showMessage === "function") {
+        // eslint-disable-next-line no-undef
+        showMessage(message, type === "error" ? "danger" : type);
+    } else {
+        console.log(`[${type.toUpperCase()}] ${message}`);
+    }
+}
+
+// Make functions globally available for HTML onclick handlers
+window.searchStructuredLogs = searchStructuredLogs;
+window.showCorrelationTrace = showCorrelationTrace;
+window.showSecurityEvents = showSecurityEvents;
+window.showAuditTrail = showAuditTrail;
+window.showPerformanceMetrics = showPerformanceMetrics;
+window.handlePerformanceAggregationChange = handlePerformanceAggregationChange;
+window.previousLogPage = previousLogPage;
+window.nextLogPage = nextLogPage;
+window.showLogDetails = showLogDetails;
+
+// ===================================================================
+// LLM SETTINGS FUNCTIONS
+// ===================================================================
+
+/**
+ * Switch between LLM Settings tabs (providers/models)
+ */
+function switchLLMSettingsTab(tabName) {
+    // Hide all content panels
+    const panels = document.querySelectorAll(".llm-settings-content");
+    panels.forEach((panel) => panel.classList.add("hidden"));
+
+    // Remove active state from all tabs
+    const tabs = document.querySelectorAll(".llm-settings-tab");
+    tabs.forEach((tab) => {
+        tab.classList.remove(
+            "border-indigo-500",
+            "text-indigo-600",
+            "dark:text-indigo-400",
+        );
+        tab.classList.add(
+            "border-transparent",
+            "text-gray-500",
+            "hover:text-gray-700",
+            "hover:border-gray-300",
+            "dark:text-gray-400",
+            "dark:hover:text-gray-300",
+        );
+    });
+
+    // Show selected panel
+    const selectedPanel = document.getElementById(
+        `llm-settings-content-${tabName}`,
+    );
+    if (selectedPanel) {
+        selectedPanel.classList.remove("hidden");
+        // Trigger HTMX load if not yet loaded
+        htmx.trigger(selectedPanel, "revealed");
+    }
+
+    // Activate selected tab
+    const selectedTab = document.getElementById(`llm-settings-tab-${tabName}`);
+    if (selectedTab) {
+        selectedTab.classList.remove(
+            "border-transparent",
+            "text-gray-500",
+            "hover:text-gray-700",
+            "hover:border-gray-300",
+            "dark:text-gray-400",
+            "dark:hover:text-gray-300",
+        );
+        selectedTab.classList.add(
+            "border-indigo-500",
+            "text-indigo-600",
+            "dark:text-indigo-400",
+        );
+    }
+}
+
+// Cache for provider defaults
+let llmProviderDefaults = null;
+
+/**
+ * Load provider defaults from the server
+ */
+async function loadLLMProviderDefaults() {
+    if (llmProviderDefaults) {
+        return llmProviderDefaults;
+    }
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/admin/llm/provider-defaults`,
+            {
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+        if (response.ok) {
+            llmProviderDefaults = await response.json();
+        }
+    } catch (error) {
+        console.error("Failed to load provider defaults:", error);
+    }
+    return llmProviderDefaults || {};
+}
+
+// Track previous provider type for smart auto-fill
+let previousProviderType = null;
+
+/**
+ * Handle provider type change - auto-fill defaults
+ */
+async function onLLMProviderTypeChange() {
+    const providerType = document.getElementById("llm-provider-type").value;
+    if (!providerType) {
+        return;
+    }
+
+    const defaults = await loadLLMProviderDefaults();
+    const config = defaults[providerType];
+
+    if (!config) {
+        return;
+    }
+
+    // Only auto-fill if creating new provider (not editing)
+    const providerId = document.getElementById("llm-provider-id").value;
+    if (providerId) {
+        return;
+    }
+
+    const apiBaseField = document.getElementById("llm-provider-api-base");
+    const defaultModelField = document.getElementById(
+        "llm-provider-default-model",
+    );
+
+    // Check if current values match previous provider's defaults
+    const previousConfig = previousProviderType
+        ? defaults[previousProviderType]
+        : null;
+    const apiBaseMatchesPrevious =
+        previousConfig &&
+        (apiBaseField.value === previousConfig.api_base ||
+            apiBaseField.value === "");
+    const modelMatchesPrevious =
+        previousConfig &&
+        (defaultModelField.value === previousConfig.default_model ||
+            defaultModelField.value === "");
+
+    // Auto-fill API base if empty or matches previous provider's default
+    if ((apiBaseMatchesPrevious || !apiBaseField.value) && config.api_base) {
+        apiBaseField.value = config.api_base;
+    }
+
+    // Auto-fill default model if empty or matches previous provider's default
+    if (
+        (modelMatchesPrevious || !defaultModelField.value) &&
+        config.default_model
+    ) {
+        defaultModelField.value = config.default_model;
+    }
+
+    // Remember this provider type for next change
+    previousProviderType = providerType;
+
+    // Update description/help text
+    const descEl = document.getElementById("llm-provider-type-description");
+    if (descEl && config.description) {
+        descEl.textContent = config.description;
+        descEl.classList.remove("hidden");
+    }
+
+    // Show/hide API key requirement indicator
+    const apiKeyRequired = document.getElementById(
+        "llm-provider-api-key-required",
+    );
+    if (apiKeyRequired) {
+        if (config.requires_api_key) {
+            apiKeyRequired.classList.remove("hidden");
+        } else {
+            apiKeyRequired.classList.add("hidden");
+        }
+    }
+}
+
+/**
+ * Show Add Provider Modal
+ */
+async function showAddProviderModal() {
+    document.getElementById("llm-provider-id").value = "";
+    document.getElementById("llm-provider-form").reset();
+    document.getElementById("llm-provider-modal-title").textContent =
+        "Add LLM Provider";
+
+    // Reset helper elements
+    const descEl = document.getElementById("llm-provider-type-description");
+    if (descEl) {
+        descEl.classList.add("hidden");
+    }
+
+    // Reset provider type tracker for smart auto-fill
+    previousProviderType = null;
+
+    // Load defaults for quick access
+    await loadLLMProviderDefaults();
+
+    document.getElementById("llm-provider-modal").classList.remove("hidden");
+}
+
+/**
+ * Close Provider Modal
+ */
+function closeLLMProviderModal() {
+    document.getElementById("llm-provider-modal").classList.add("hidden");
+}
+
+/**
+ * Fetch models from a provider's API
+ */
+async function fetchLLMProviderModels(providerId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/admin/llm/providers/${providerId}/fetch-models`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        const result = await response.json();
+
+        if (result.success) {
+            const modelList = result.models
+                .map((m) => `- ${m.id} (${m.owned_by || "unknown"})`)
+                .join("\n");
+            showCopyableModal(
+                `Found ${result.count} Models`,
+                modelList || "No models found",
+                "success",
+            );
+        } else {
+            showCopyableModal("Failed to Fetch Models", result.error, "error");
+        }
+
+        return result;
+    } catch (error) {
+        console.error("Error fetching models:", error);
+        showCopyableModal(
+            "Failed to Fetch Models",
+            `Error: ${error.message}`,
+            "error",
+        );
+        return { success: false, error: error.message, models: [] };
+    }
+}
+
+/**
+ * Sync models from provider API to database
+ */
+async function syncLLMProviderModels(providerId) {
+    try {
+        showToast("Syncing models...", "info");
+
+        const response = await fetch(
+            `${window.ROOT_PATH}/admin/llm/providers/${providerId}/sync-models`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        const result = await response.json();
+
+        if (result.success) {
+            showCopyableModal(
+                "Models Synced Successfully",
+                `${result.message}\n\nTotal available: ${result.total || 0}`,
+                "success",
+            );
+            // Refresh the models list
+            refreshLLMModels();
+        } else {
+            showCopyableModal("Failed to Sync Models", result.error, "error");
+        }
+
+        return result;
+    } catch (error) {
+        console.error("Error syncing models:", error);
+        showCopyableModal(
+            "Failed to Sync Models",
+            `Error: ${error.message}`,
+            "error",
+        );
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Edit LLM Provider
+ */
+async function editLLMProvider(providerId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/providers/${providerId}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+        if (!response.ok) {
+            throw new Error("Failed to fetch provider details");
+        }
+        const provider = await response.json();
+
+        document.getElementById("llm-provider-id").value = provider.id;
+        document.getElementById("llm-provider-name").value = provider.name;
+        document.getElementById("llm-provider-type").value =
+            provider.provider_type;
+        document.getElementById("llm-provider-description").value =
+            provider.description || "";
+        document.getElementById("llm-provider-api-key").value = "";
+        document.getElementById("llm-provider-api-base").value =
+            provider.api_base || "";
+        document.getElementById("llm-provider-default-model").value =
+            provider.default_model || "";
+        document.getElementById("llm-provider-temperature").value =
+            provider.default_temperature || 0.7;
+        document.getElementById("llm-provider-max-tokens").value =
+            provider.default_max_tokens || "";
+        document.getElementById("llm-provider-enabled").checked =
+            provider.enabled;
+
+        document.getElementById("llm-provider-modal-title").textContent =
+            "Edit LLM Provider";
+        document
+            .getElementById("llm-provider-modal")
+            .classList.remove("hidden");
+    } catch (error) {
+        console.error("Error fetching provider:", error);
+        showToast("Failed to load provider details", "error");
+    }
+}
+
+/**
+ * Save LLM Provider (create or update)
+ */
+async function saveLLMProvider(event) {
+    event.preventDefault();
+
+    const providerId = document.getElementById("llm-provider-id").value;
+    const isUpdate = providerId !== "";
+
+    const formData = {
+        name: document.getElementById("llm-provider-name").value,
+        provider_type: document.getElementById("llm-provider-type").value,
+        description:
+            document.getElementById("llm-provider-description").value || null,
+        api_base:
+            document.getElementById("llm-provider-api-base").value || null,
+        default_model:
+            document.getElementById("llm-provider-default-model").value || null,
+        default_temperature: parseFloat(
+            document.getElementById("llm-provider-temperature").value,
+        ),
+        enabled: document.getElementById("llm-provider-enabled").checked,
+    };
+
+    const apiKey = document.getElementById("llm-provider-api-key").value;
+    if (apiKey) {
+        formData.api_key = apiKey;
+    }
+
+    const maxTokens = document.getElementById("llm-provider-max-tokens").value;
+    if (maxTokens) {
+        formData.default_max_tokens = parseInt(maxTokens, 10);
+    }
+
+    try {
+        const url = isUpdate
+            ? `${window.ROOT_PATH}/llm/providers/${providerId}`
+            : `${window.ROOT_PATH}/llm/providers`;
+        const method = isUpdate ? "PATCH" : "POST";
+
+        const response = await fetch(url, {
+            method,
+            headers: {
+                Authorization: `Bearer ${await getAuthToken()}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(formData),
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Failed to save provider");
+        }
+
+        closeLLMProviderModal();
+        showToast(
+            isUpdate
+                ? "Provider updated successfully"
+                : "Provider created successfully",
+            "success",
+        );
+        refreshLLMProviders();
+    } catch (error) {
+        console.error("Error saving provider:", error);
+        showToast(error.message || "Failed to save provider", "error");
+    }
+}
+
+/**
+ * Delete LLM Provider
+ */
+async function deleteLLMProvider(providerId, providerName) {
+    if (
+        !confirm(
+            `Are you sure you want to delete the provider "${providerName}"? This will also delete all associated models.`,
+        )
+    ) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/providers/${providerId}`,
+            {
+                method: "DELETE",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Failed to delete provider");
+        }
+
+        showToast("Provider deleted successfully", "success");
+        refreshLLMProviders();
+    } catch (error) {
+        console.error("Error deleting provider:", error);
+        showToast(error.message || "Failed to delete provider", "error");
+    }
+}
+
+/**
+ * Toggle LLM Provider enabled state
+ */
+async function toggleLLMProvider(providerId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/providers/${providerId}/toggle`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error("Failed to toggle provider");
+        }
+
+        refreshLLMProviders();
+    } catch (error) {
+        console.error("Error toggling provider:", error);
+        showToast("Failed to toggle provider", "error");
+    }
+}
+
+/**
+ * Check LLM Provider health
+ */
+async function checkLLMProviderHealth(providerId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/admin/llm/providers/${providerId}/health`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        const result = await response.json();
+
+        // Show result message with details using copyable modal
+        if (result.status === "healthy") {
+            const message = `Status: ${result.status}\nLatency: ${result.latency_ms}ms`;
+            showCopyableModal("Health Check Passed", message, "success");
+        } else {
+            // Show error details for unhealthy status
+            let message = `Status: ${result.status}`;
+            if (result.latency_ms) {
+                message += `\nLatency: ${result.latency_ms}ms`;
+            }
+            if (result.error) {
+                message += `\n\nError:\n${result.error}`;
+            }
+            showCopyableModal("Health Check Failed", message, "error");
+        }
+
+        // Refresh providers to update status
+        refreshLLMProviders();
+    } catch (error) {
+        console.error("Error checking provider health:", error);
+        showCopyableModal(
+            "Health Check Request Failed",
+            `Error: ${error.message}`,
+            "error",
+        );
+    }
+}
+
+/**
+ * Refresh LLM Providers list
+ */
+function refreshLLMProviders() {
+    const container = document.getElementById("llm-providers-container");
+    if (container) {
+        htmx.ajax("GET", `${window.ROOT_PATH}/admin/llm/providers/html`, {
+            target: "#llm-providers-container",
+            swap: "innerHTML",
+        });
+    }
+}
+
+/**
+ * Show Add Model Modal
+ */
+async function showAddModelModal() {
+    document.getElementById("llm-model-id").value = "";
+    document.getElementById("llm-model-form").reset();
+    document.getElementById("llm-model-modal-title").textContent =
+        "Add LLM Model";
+
+    // Populate providers dropdown
+    await populateProviderDropdown();
+
+    document.getElementById("llm-model-modal").classList.remove("hidden");
+}
+
+/**
+ * Populate provider dropdown in model modal
+ */
+async function populateProviderDropdown() {
+    try {
+        const response = await fetch(`${window.ROOT_PATH}/llm/providers`, {
+            headers: {
+                Authorization: `Bearer ${await getAuthToken()}`,
+            },
+        });
+        if (!response.ok) {
+            throw new Error("Failed to fetch providers");
+        }
+        const data = await response.json();
+
+        const select = document.getElementById("llm-model-provider");
+        select.innerHTML = '<option value="">Select provider</option>';
+
+        data.providers.forEach((provider) => {
+            const option = document.createElement("option");
+            option.value = provider.id;
+            option.textContent = `${provider.name} (${provider.provider_type})`;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error("Error fetching providers:", error);
+    }
+}
+
+/**
+ * Close Model Modal
+ */
+function closeLLMModelModal() {
+    document.getElementById("llm-model-modal").classList.add("hidden");
+}
+
+/**
+ * Handle provider change in model modal - auto-fetch models
+ */
+async function onModelProviderChange() {
+    const providerId = document.getElementById("llm-model-provider").value;
+    const modelInput = document.getElementById("llm-model-model-id");
+    const datalist = document.getElementById("llm-model-suggestions");
+    const statusEl = document.getElementById("llm-model-fetch-status");
+
+    // Clear existing suggestions
+    datalist.innerHTML = "";
+
+    if (!providerId) {
+        modelInput.placeholder = "Select provider first...";
+        statusEl.classList.add("hidden");
+        return;
+    }
+
+    modelInput.placeholder = "Type or select a model...";
+
+    // Auto-fetch models when provider is selected
+    await fetchModelsForModelModal();
+}
+
+/**
+ * Fetch available models for the model modal
+ */
+async function fetchModelsForModelModal() {
+    const providerId = document.getElementById("llm-model-provider").value;
+    const datalist = document.getElementById("llm-model-suggestions");
+    const statusEl = document.getElementById("llm-model-fetch-status");
+
+    if (!providerId) {
+        showToast("Please select a provider first", "warning");
+        return;
+    }
+
+    statusEl.textContent = "Fetching models...";
+    statusEl.classList.remove("hidden");
+
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/admin/llm/providers/${providerId}/fetch-models`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        const result = await response.json();
+
+        if (result.success && result.models && result.models.length > 0) {
+            // Populate datalist with model suggestions
+            datalist.innerHTML = "";
+            result.models.forEach((model) => {
+                const option = document.createElement("option");
+                option.value = model.id;
+                option.textContent = model.name || model.id;
+                datalist.appendChild(option);
+            });
+
+            statusEl.textContent = `Found ${result.models.length} models. Type to filter or enter custom.`;
+            statusEl.classList.remove("hidden");
+        } else {
+            statusEl.textContent =
+                result.error || "No models found. Enter model ID manually.";
+            statusEl.classList.remove("hidden");
+        }
+    } catch (error) {
+        console.error("Error fetching models:", error);
+        statusEl.textContent =
+            "Failed to fetch models. Enter model ID manually.";
+        statusEl.classList.remove("hidden");
+    }
+}
+
+window.onModelProviderChange = onModelProviderChange;
+window.fetchModelsForModelModal = fetchModelsForModelModal;
+
+/**
+ * Edit LLM Model
+ */
+async function editLLMModel(modelId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/models/${modelId}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+        if (!response.ok) {
+            throw new Error("Failed to fetch model details");
+        }
+        const model = await response.json();
+
+        await populateProviderDropdown();
+
+        document.getElementById("llm-model-id").value = model.id;
+        document.getElementById("llm-model-provider").value = model.provider_id;
+        document.getElementById("llm-model-model-id").value = model.model_id;
+        document.getElementById("llm-model-name").value = model.model_name;
+        document.getElementById("llm-model-alias").value =
+            model.model_alias || "";
+        document.getElementById("llm-model-description").value =
+            model.description || "";
+        document.getElementById("llm-model-context-window").value =
+            model.context_window || "";
+        document.getElementById("llm-model-max-output").value =
+            model.max_output_tokens || "";
+        document.getElementById("llm-model-supports-chat").checked =
+            model.supports_chat;
+        document.getElementById("llm-model-supports-streaming").checked =
+            model.supports_streaming;
+        document.getElementById("llm-model-supports-functions").checked =
+            model.supports_function_calling;
+        document.getElementById("llm-model-supports-vision").checked =
+            model.supports_vision;
+        document.getElementById("llm-model-enabled").checked = model.enabled;
+        document.getElementById("llm-model-deprecated").checked =
+            model.deprecated;
+
+        document.getElementById("llm-model-modal-title").textContent =
+            "Edit LLM Model";
+        document.getElementById("llm-model-modal").classList.remove("hidden");
+    } catch (error) {
+        console.error("Error fetching model:", error);
+        showToast("Failed to load model details", "error");
+    }
+}
+
+/**
+ * Save LLM Model (create or update)
+ */
+async function saveLLMModel(event) {
+    event.preventDefault();
+
+    const modelId = document.getElementById("llm-model-id").value;
+    const isUpdate = modelId !== "";
+
+    const formData = {
+        provider_id: document.getElementById("llm-model-provider").value,
+        model_id: document.getElementById("llm-model-model-id").value,
+        model_name: document.getElementById("llm-model-name").value,
+        model_alias: document.getElementById("llm-model-alias").value || null,
+        description:
+            document.getElementById("llm-model-description").value || null,
+        supports_chat: document.getElementById("llm-model-supports-chat")
+            .checked,
+        supports_streaming: document.getElementById(
+            "llm-model-supports-streaming",
+        ).checked,
+        supports_function_calling: document.getElementById(
+            "llm-model-supports-functions",
+        ).checked,
+        supports_vision: document.getElementById("llm-model-supports-vision")
+            .checked,
+        enabled: document.getElementById("llm-model-enabled").checked,
+        deprecated: document.getElementById("llm-model-deprecated").checked,
+    };
+
+    const contextWindow = document.getElementById(
+        "llm-model-context-window",
+    ).value;
+    if (contextWindow) {
+        formData.context_window = parseInt(contextWindow, 10);
+    }
+
+    const maxOutput = document.getElementById("llm-model-max-output").value;
+    if (maxOutput) {
+        formData.max_output_tokens = parseInt(maxOutput, 10);
+    }
+
+    try {
+        const url = isUpdate
+            ? `${window.ROOT_PATH}/llm/models/${modelId}`
+            : `${window.ROOT_PATH}/llm/models`;
+        const method = isUpdate ? "PATCH" : "POST";
+
+        const response = await fetch(url, {
+            method,
+            headers: {
+                Authorization: `Bearer ${await getAuthToken()}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(formData),
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Failed to save model");
+        }
+
+        closeLLMModelModal();
+        showToast(
+            isUpdate
+                ? "Model updated successfully"
+                : "Model created successfully",
+            "success",
+        );
+        refreshLLMModels();
+    } catch (error) {
+        console.error("Error saving model:", error);
+        showToast(error.message || "Failed to save model", "error");
+    }
+}
+
+/**
+ * Delete LLM Model
+ */
+async function deleteLLMModel(modelId, modelName) {
+    if (!confirm(`Are you sure you want to delete the model "${modelName}"?`)) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/models/${modelId}`,
+            {
+                method: "DELETE",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Failed to delete model");
+        }
+
+        showToast("Model deleted successfully", "success");
+        refreshLLMModels();
+    } catch (error) {
+        console.error("Error deleting model:", error);
+        showToast(error.message || "Failed to delete model", "error");
+    }
+}
+
+/**
+ * Toggle LLM Model enabled state
+ */
+async function toggleLLMModel(modelId) {
+    try {
+        const response = await fetch(
+            `${window.ROOT_PATH}/llm/models/${modelId}/toggle`,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${await getAuthToken()}`,
+                },
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error("Failed to toggle model");
+        }
+
+        refreshLLMModels();
+    } catch (error) {
+        console.error("Error toggling model:", error);
+        showToast("Failed to toggle model", "error");
+    }
+}
+
+/**
+ * Refresh LLM Models list
+ */
+function refreshLLMModels() {
+    const container = document.getElementById("llm-models-container");
+    if (container) {
+        htmx.ajax("GET", `${window.ROOT_PATH}/admin/llm/models/html`, {
+            target: "#llm-models-container",
+            swap: "innerHTML",
+        });
+    }
+}
+
+/**
+ * Filter models by provider
+ */
+function filterModelsByProvider(providerId) {
+    const url = providerId
+        ? `${window.ROOT_PATH}/admin/llm/models/html?provider_id=${providerId}`
+        : `${window.ROOT_PATH}/admin/llm/models/html`;
+
+    htmx.ajax("GET", url, {
+        target: "#llm-models-container",
+        swap: "innerHTML",
+    });
+}
+
+/**
+ * Alpine.js component for LLM API Info & Test
+ */
+function llmApiInfoApp() {
+    return {
+        testType: "models",
+        testModel: "",
+        testMessage: "Hello! Please respond with a short greeting.",
+        testing: false,
+        testResult: null,
+        testSuccess: false,
+        testMetrics: null,
+        assistantMessage: null,
+        modelList: null,
+
+        formatDuration(ms) {
+            if (ms < 1000) {
+                return `${ms}ms`;
+            }
+            return `${(ms / 1000).toFixed(2)}s`;
+        },
+
+        formatBytes(bytes) {
+            if (bytes === 0) {
+                return "0 B";
+            }
+            if (bytes < 1024) {
+                return `${bytes} B`;
+            } else if (bytes < 1024 * 1024) {
+                return `${(bytes / 1024).toFixed(2)} KB`;
+            } else {
+                return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+            }
+        },
+
+        async runTest() {
+            // Use admin test endpoint directly
+            this.testing = true;
+            this.testResult = null;
+            this.testSuccess = false;
+            this.testMetrics = null;
+            this.assistantMessage = null;
+            this.modelList = null;
+
+            try {
+                const requestBody = {
+                    test_type: this.testType,
+                };
+
+                if (this.testType === "chat") {
+                    if (!this.testModel) {
+                        this.testResult = JSON.stringify(
+                            { error: "Please select a model" },
+                            null,
+                            2,
+                        );
+                        this.testSuccess = false;
+                        this.testMetrics = {
+                            httpStatus: 400,
+                            httpStatusText: "Bad Request",
+                        };
+                        return;
+                    }
+                    requestBody.model_id = this.testModel;
+                    requestBody.message = this.testMessage;
+                    requestBody.max_tokens = 100;
+                }
+
+                const requestBodyStr = JSON.stringify(requestBody);
+                const startTime = performance.now();
+
+                const response = await fetch(
+                    `${window.ROOT_PATH}/admin/llm/test`,
+                    {
+                        method: "POST",
+                        headers: {
+                            Authorization: `Bearer ${await getAuthToken()}`,
+                            "Content-Type": "application/json",
+                        },
+                        body: requestBodyStr,
+                    },
+                );
+
+                const endTime = performance.now();
+                const data = await response.json();
+
+                this.testSuccess = data.success === true;
+                this.testResult = JSON.stringify(data, null, 2);
+
+                // Build metrics
+                this.testMetrics = {
+                    duration:
+                        data.metrics?.duration ||
+                        Math.round(endTime - startTime),
+                    httpStatus: response.status,
+                    httpStatusText: response.statusText,
+                    requestSize: requestBodyStr.length,
+                    responseSize: JSON.stringify(data).length,
+                };
+
+                if (this.testType === "chat" && data.metrics) {
+                    this.testMetrics.promptTokens =
+                        data.metrics.promptTokens || 0;
+                    this.testMetrics.completionTokens =
+                        data.metrics.completionTokens || 0;
+                    this.testMetrics.totalTokens =
+                        data.metrics.totalTokens || 0;
+                    this.testMetrics.responseModel = data.metrics.responseModel;
+                    this.assistantMessage = data.assistant_message;
+                }
+
+                if (this.testType === "models" && data.metrics) {
+                    this.testMetrics.modelCount = data.metrics.modelCount;
+                    this.modelList = data.data?.data || [];
+                }
+            } catch (error) {
+                this.testResult = JSON.stringify(
+                    { error: error.message },
+                    null,
+                    2,
+                );
+                this.testSuccess = false;
+                this.testMetrics = {
+                    httpStatus: 0,
+                    httpStatusText: "Network Error",
+                };
+            } finally {
+                this.testing = false;
+            }
+        },
+    };
+}
+
+// Make LLM functions globally available
+window.switchLLMSettingsTab = switchLLMSettingsTab;
+window.showAddProviderModal = showAddProviderModal;
+window.closeLLMProviderModal = closeLLMProviderModal;
+window.editLLMProvider = editLLMProvider;
+window.saveLLMProvider = saveLLMProvider;
+window.deleteLLMProvider = deleteLLMProvider;
+window.toggleLLMProvider = toggleLLMProvider;
+window.checkLLMProviderHealth = checkLLMProviderHealth;
+window.refreshLLMProviders = refreshLLMProviders;
+window.onLLMProviderTypeChange = onLLMProviderTypeChange;
+window.fetchLLMProviderModels = fetchLLMProviderModels;
+window.syncLLMProviderModels = syncLLMProviderModels;
+window.showAddModelModal = showAddModelModal;
+window.closeLLMModelModal = closeLLMModelModal;
+window.editLLMModel = editLLMModel;
+window.saveLLMModel = saveLLMModel;
+window.deleteLLMModel = deleteLLMModel;
+window.toggleLLMModel = toggleLLMModel;
+window.refreshLLMModels = refreshLLMModels;
+window.filterModelsByProvider = filterModelsByProvider;
+window.llmApiInfoApp = llmApiInfoApp;

@@ -27,7 +27,7 @@ Structure:
 
 # Standard
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 import json
 import os as _os  # local alias to avoid collisions
@@ -70,12 +70,14 @@ from mcpgateway.config import settings
 from mcpgateway.db import refresh_slugs_on_startup, SessionLocal
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.handlers.sampling import SamplingHandler
+from mcpgateway.middleware.correlation_id import CorrelationIDMiddleware
 from mcpgateway.middleware.http_auth_middleware import HttpAuthMiddleware
 from mcpgateway.middleware.protocol_version import MCPProtocolVersionMiddleware
 from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.middleware.request_logging_middleware import RequestLoggingMiddleware
 from mcpgateway.middleware.security_headers import SecurityHeadersMiddleware
 from mcpgateway.middleware.token_scoping import token_scoping_middleware
+from mcpgateway.middleware.validation_middleware import ValidationMiddleware
 from mcpgateway.observability import init_telemetry
 from mcpgateway.plugins.framework import PluginError, PluginManager, PluginViolationError
 from mcpgateway.routers.well_known import router as well_known_router
@@ -112,6 +114,7 @@ from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayD
 from mcpgateway.services.import_service import ConflictStrategy, ImportConflictError
 from mcpgateway.services.import_service import ImportError as ImportServiceError
 from mcpgateway.services.import_service import ImportService, ImportValidationError
+from mcpgateway.services.log_aggregator import get_log_aggregator
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.metrics import setup_metrics
 from mcpgateway.services.prompt_service import PromptError, PromptNameConflictError, PromptNotFoundError, PromptService
@@ -165,6 +168,7 @@ else:
     _PLUGINS_ENABLED = settings.plugins_enabled
 _config_file = _os.getenv("PLUGIN_CONFIG_FILE", settings.plugin_config_file)
 plugin_manager: PluginManager | None = PluginManager(_config_file) if _PLUGINS_ENABLED else None
+
 
 # Initialize services
 tool_service = ToolService()
@@ -315,30 +319,71 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
     results = [match.value for match in main_matches]
 
     if mappings:
-        mapped_results = []
-        for item in results:
-            mapped_item = {}
-            for new_key, mapping_expr_str in mappings.items():
-                try:
-                    mapping_expr = parse(mapping_expr_str)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
-                try:
-                    mapping_matches = mapping_expr.find(item)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Error executing mapping JSONPath for key '{new_key}': {e}")
-                if not mapping_matches:
-                    mapped_item[new_key] = None
-                elif len(mapping_matches) == 1:
-                    mapped_item[new_key] = mapping_matches[0].value
-                else:
-                    mapped_item[new_key] = [m.value for m in mapping_matches]
-            mapped_results.append(mapped_item)
-        results = mapped_results
+        results = transform_data_with_mappings(results, mappings)
 
     if len(results) == 1 and isinstance(results[0], dict):
         return results[0]
+
     return results
+
+
+def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> list[Any]:
+    """
+    Applies the given JSONPath expression and mappings to the data.
+    Only return data that is required by the user dynamically.
+
+    Args:
+        data: The set of data to apply mappings to.
+        mappings: dictionary of mappings where keys are new field names
+
+    Returns:
+        list[Any]: A list (or mapped list) of re-mapped data
+
+    Raises:
+        HTTPException: If there's an error parsing or executing the JSONPath expressions.
+
+    Examples:
+        >>> transform_data_with_mappings([{'first_name': "Bruce", 'second_name': "Wayne"},{'first_name': "Diana", 'second_name': "Prince"}], {"n": "$.first_name"})
+        [{'n': 'Bruce'}, {'n': 'Diana'}]
+    """
+
+    mapped_results = []
+    for item in data:
+        mapped_item = {}
+        for new_key, mapping_expr_str in mappings.items():
+            try:
+                mapping_expr = parse(mapping_expr_str)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
+
+            try:
+                mapping_matches = mapping_expr.find(item)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error executing mapping JSONPath for key '{new_key}': {e}")
+
+            if not mapping_matches:
+                mapped_item[new_key] = None
+            elif len(mapping_matches) == 1:
+                mapped_item[new_key] = mapping_matches[0].value
+            else:
+                mapped_item[new_key] = [m.value for m in mapping_matches]
+        mapped_results.append(mapped_item)
+
+    return mapped_results
+
+
+def attempt_to_bootstrap_sso_providers():
+    """
+    Try to bootstrap SSO provider services based on settings.
+    """
+    try:
+        # First-Party
+        from mcpgateway.utils.sso_bootstrap import bootstrap_sso_providers  # pylint: disable=import-outside-toplevel
+
+        bootstrap_sso_providers()
+        logger.info("SSO providers bootstrapped successfully")
+    except Exception as e:
+        logger.warning(f"Failed to bootstrap SSO providers: {e}")
 
 
 ####################
@@ -364,6 +409,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Exception: Any unhandled error that occurs during service
             initialisation or shutdown is re-raised to the caller.
     """
+    aggregation_stop_event: Optional[asyncio.Event] = None
+    aggregation_loop_task: Optional[asyncio.Task] = None
+    aggregation_backfill_task: Optional[asyncio.Task] = None
+
     # Initialize logging service FIRST to ensure all logging goes to dual output
     await logging_service.initialize()
     logger.info("Starting MCP Gateway services")
@@ -374,24 +423,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     try:
         # Validate security configuration
-        await validate_security_configuration()
+        validate_security_configuration()
 
         if plugin_manager:
             await plugin_manager.initialize()
             logger.info(f"Plugin manager initialized with {plugin_manager.plugin_count} plugins")
 
         if settings.enable_header_passthrough:
-            logger.info(f"🔄 Header Passthrough: ENABLED (default headers: {settings.default_passthrough_headers})")
-            if settings.enable_overwrite_base_headers:
-                logger.warning("⚠️  Base Header Override: ENABLED - Client headers can override gateway headers")
-            else:
-                logger.info("🔒 Base Header Override: DISABLED - Gateway headers take precedence")
-            db_gen = get_db()
-            db = next(db_gen)  # pylint: disable=stop-iteration-return
-            try:
-                await set_global_passthrough_headers(db)
-            finally:
-                db.close()
+            await setup_passthrough_headers()
         else:
             logger.info("🔒 Header Passthrough: DISABLED")
 
@@ -422,19 +461,60 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         # Bootstrap SSO providers from environment configuration
         if settings.sso_enabled:
-            try:
-                # First-Party
-                from mcpgateway.utils.sso_bootstrap import bootstrap_sso_providers  # pylint: disable=import-outside-toplevel
-
-                bootstrap_sso_providers()
-                logger.info("SSO providers bootstrapped successfully")
-            except Exception as e:
-                logger.warning(f"Failed to bootstrap SSO providers: {e}")
+            attempt_to_bootstrap_sso_providers()
 
         logger.info("All services initialized successfully")
 
         # Reconfigure uvicorn loggers after startup to capture access logs in dual output
         logging_service.configure_uvicorn_after_startup()
+
+        if settings.metrics_aggregation_enabled and settings.metrics_aggregation_auto_start:
+            aggregation_stop_event = asyncio.Event()
+            log_aggregator = get_log_aggregator()
+
+            async def run_log_backfill() -> None:
+                """Backfill log aggregation metrics for configured hours."""
+                hours = getattr(settings, "metrics_aggregation_backfill_hours", 0)
+                if hours <= 0:
+                    return
+                try:
+                    await asyncio.to_thread(log_aggregator.backfill, hours)
+                    logger.info("Log aggregation backfill completed for last %s hour(s)", hours)
+                except Exception as backfill_error:  # pragma: no cover - defensive logging
+                    logger.warning("Log aggregation backfill failed: %s", backfill_error)
+
+            async def run_log_aggregation_loop() -> None:
+                """Run continuous log aggregation at configured intervals.
+
+                Raises:
+                    asyncio.CancelledError: When aggregation is stopped
+                """
+                interval_seconds = max(1, int(settings.metrics_aggregation_window_minutes)) * 60
+                logger.info(
+                    "Starting log aggregation loop (window=%s min)",
+                    log_aggregator.aggregation_window_minutes,
+                )
+                try:
+                    while not aggregation_stop_event.is_set():
+                        try:
+                            await asyncio.to_thread(log_aggregator.aggregate_all_components)
+                        except Exception as agg_error:  # pragma: no cover - defensive logging
+                            logger.warning("Log aggregation loop iteration failed: %s", agg_error)
+
+                        try:
+                            await asyncio.wait_for(aggregation_stop_event.wait(), timeout=interval_seconds)
+                        except asyncio.TimeoutError:
+                            continue
+                except asyncio.CancelledError:
+                    logger.debug("Log aggregation loop cancelled")
+                    raise
+                finally:
+                    logger.info("Log aggregation loop stopped")
+
+            aggregation_backfill_task = asyncio.create_task(run_log_backfill())
+            aggregation_loop_task = asyncio.create_task(run_log_aggregation_loop())
+        elif settings.metrics_aggregation_enabled:
+            logger.info("Metrics aggregation auto-start disabled; performance metrics will be generated on-demand when requested.")
 
         yield
     except Exception as e:
@@ -449,6 +529,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             raise SystemExit(1)
         raise
     finally:
+        if aggregation_stop_event is not None:
+            aggregation_stop_event.set()
+        for task in (aggregation_backfill_task, aggregation_loop_task):
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
         # Shutdown plugin manager
         if plugin_manager:
             try:
@@ -485,12 +573,40 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             elicitation_service = get_elicitation_service()
             services_to_shutdown.insert(5, elicitation_service)
 
-        for service in services_to_shutdown:
-            try:
-                await service.shutdown()
-            except Exception as e:
-                logger.error(f"Error shutting down {service.__class__.__name__}: {str(e)}")
+        await shutdown_services(services_to_shutdown)
+
         logger.info("Shutdown complete")
+
+
+async def shutdown_services(services_to_shutdown: list[Any]):
+    """
+    Awaits shutdown of services provided in a list
+
+    Args:
+        services_to_shutdown (list[Any]): list of services to shutdown
+    """
+    for service in services_to_shutdown:
+        try:
+            await service.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down {service.__class__.__name__}: {str(e)}")
+
+
+async def setup_passthrough_headers():
+    """
+    Enables configuration and logs active settings as needed for when passthrough headers are enabled.
+    """
+    logger.info(f"🔄 Header Passthrough: ENABLED (default headers: {settings.default_passthrough_headers})")
+    if settings.enable_overwrite_base_headers:
+        logger.warning("⚠️  Base Header Override: ENABLED - Client headers can override gateway headers")
+    else:
+        logger.info("🔒 Base Header Override: DISABLED - Gateway headers take precedence")
+    db_gen = get_db()
+    db = next(db_gen)  # pylint: disable=stop-iteration-return
+    try:
+        await set_global_passthrough_headers(db)
+    finally:
+        db.close()
 
 
 # Initialize FastAPI app with orjson for 2-3x faster JSON serialization
@@ -507,22 +623,25 @@ app = FastAPI(
 setup_metrics(app)
 
 
-async def validate_security_configuration():
-    """Validate security configuration on startup."""
+def validate_security_configuration():
+    """
+    Validate security configuration on startup.
+    This function encapsulates:
+     - verifying the configuration,
+     - logging the output for warnings,
+     - critical issues
+     - security recommendations
+
+     Args: None
+     Raises: Passthrough Errors/Exceptions but doesn't raise any of its own.
+    """
     logger.info("🔒 Validating security configuration...")
 
     # Get security status
-    security_status = settings.get_security_status()
+    security_status: settings.SecurityStatus = settings.get_security_status()
     warnings = security_status["warnings"]
 
-    # Log warnings
-    if warnings:
-        logger.warning("=" * 60)
-        logger.warning("🚨 SECURITY WARNINGS DETECTED:")
-        logger.warning("=" * 60)
-        for warning in warnings:
-            logger.warning(f"  {warning}")
-        logger.warning("=" * 60)
+    log_warnings(warnings)
 
     # Critical security checks (fail startup only if REQUIRE_STRONG_SECRETS=true)
     critical_issues = []
@@ -536,6 +655,37 @@ async def validate_security_configuration():
     if not settings.auth_required and settings.federation_enabled and not settings.dev_mode:
         critical_issues.append("Federation enabled without authentication in non-dev mode. This is a critical security risk!")
 
+    log_critical_issues(critical_issues)
+
+    log_security_recommendations(security_status)
+
+
+def log_warnings(warnings: list[str]):
+    """
+    Log warnings from list of warnings provided
+
+    Args:
+        warnings: List
+    """
+    if warnings:
+        logger.warning("=" * 60)
+        logger.warning("🚨 SECURITY WARNINGS DETECTED:")
+        logger.warning("=" * 60)
+        for warning in warnings:
+            logger.warning(f"  {warning}")
+        logger.warning("=" * 60)
+
+
+def log_critical_issues(critical_issues: list[Any]):
+    """
+    Log critical based on configuration settings
+    If REQUIRE_STRONG_SECRETS set, this will output critical errors and exit the mcpgateway server.
+
+    Args:
+        critical_issues: List
+
+    Returns: None
+    """
     # Handle critical issues based on REQUIRE_STRONG_SECRETS setting
     if critical_issues:
         if settings.require_strong_secrets:
@@ -557,7 +707,16 @@ async def validate_security_configuration():
                 logger.warning(f"  • {issue}")
             logger.warning("=" * 60)
 
-    # Log security recommendations
+
+def log_security_recommendations(security_status: settings.SecurityStatus):
+    """
+    Log security recommendations based on configuration settings
+
+    Args:
+        security_status (settings.SecurityStatus): The SecurityStatus object for checking and logging current security settings from MCPGateway.
+
+    Returns: None
+    """
     if not security_status["secure_secrets"] or not security_status["auth_enabled"]:
         logger.info("=" * 60)
         logger.info("📋 SECURITY RECOMMENDATIONS:")
@@ -816,6 +975,10 @@ class DocsAuthMiddleware(BaseHTTPMiddleware):
     the request is rejected with a 401 or 403 error.
 
     Note:
+        OPTIONS requests are exempt from authentication to support CORS preflight
+        as per RFC 7231 Section 4.3.7 (OPTIONS must not require authentication).
+
+    Note:
         When DOCS_ALLOW_BASIC_AUTH is enabled, Basic Authentication
         is also accepted using BASIC_AUTH_USER and BASIC_AUTH_PASSWORD credentials.
     """
@@ -855,6 +1018,10 @@ class DocsAuthMiddleware(BaseHTTPMiddleware):
             True
         """
         protected_paths = ["/docs", "/redoc", "/openapi.json"]
+
+        # Allow OPTIONS requests to pass through for CORS preflight (RFC 7231)
+        if request.method == "OPTIONS":
+            return await call_next(request)
 
         if any(request.url.path.startswith(p) for p in protected_paths):
             try:
@@ -1024,6 +1191,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Length", "X-Request-ID"],
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
 
 # Add response compression middleware (Brotli, Zstd, GZip)
@@ -1050,6 +1218,13 @@ else:
 # Add security headers middleware
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Add validation middleware if explicitly enabled
+if settings.validation_middleware_enabled:
+    app.add_middleware(ValidationMiddleware)
+    logger.info("🔒 Input validation and output sanitization middleware enabled")
+else:
+    logger.info("🔒 Input validation and output sanitization middleware disabled")
+
 # Add MCP Protocol Version validation middleware (validates MCP-Protocol-Version header)
 app.add_middleware(MCPProtocolVersionMiddleware)
 
@@ -1065,6 +1240,15 @@ else:
 # Add HTTP authentication hook middleware for plugins (before auth dependencies)
 if plugin_manager:
     app.add_middleware(HttpAuthMiddleware, plugin_manager=plugin_manager)
+    logger.info("🔌 HTTP authentication hooks enabled for plugins")
+
+# Add request logging middleware FIRST (always enabled for gateway boundary logging)
+# IMPORTANT: Must be registered BEFORE CorrelationIDMiddleware so it executes AFTER correlation ID is set
+# Gateway boundary logging (request_started/completed) runs regardless of log_requests setting
+# Detailed payload logging only runs if log_detailed_requests=True
+app.add_middleware(
+    RequestLoggingMiddleware, enable_gateway_logging=True, log_detailed_requests=settings.log_requests, log_level=settings.log_level, max_body_size=settings.log_max_size_mb * 1024 * 1024
+)  # Convert MB to bytes
 
 # Add custom DocsAuthMiddleware
 app.add_middleware(DocsAuthMiddleware)
@@ -1072,13 +1256,27 @@ app.add_middleware(DocsAuthMiddleware)
 # Trust all proxies (or lock down with a list of host patterns)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-# Add request logging middleware if enabled
-if settings.log_requests:
-    app.add_middleware(RequestLoggingMiddleware, log_requests=settings.log_requests, log_level=settings.log_level, max_body_size=settings.log_max_size_mb * 1024 * 1024)  # Convert MB to bytes
+# Add correlation ID middleware if enabled
+# Note: Registered AFTER RequestLoggingMiddleware so correlation ID is available when RequestLoggingMiddleware executes
+if settings.correlation_id_enabled:
+    app.add_middleware(CorrelationIDMiddleware)
+    logger.info(f"✅ Correlation ID tracking enabled (header: {settings.correlation_id_header})")
+
+# Add authentication context middleware if security logging is enabled
+# This middleware extracts user context and logs security events (authentication attempts)
+# Note: This is independent of observability - security logging is always important
+if settings.security_logging_enabled:
+    # First-Party
+    from mcpgateway.middleware.auth_middleware import AuthContextMiddleware
+
+    app.add_middleware(AuthContextMiddleware)
+    logger.info("🔐 Authentication context middleware enabled - logging security events")
+else:
+    logger.info("🔐 Security event logging disabled")
 
 # Add observability middleware if enabled
 # Note: Middleware runs in REVERSE order (last added runs first)
-# We add ObservabilityMiddleware first so it wraps AuthContextMiddleware
+# If AuthContextMiddleware is already registered, ObservabilityMiddleware wraps it
 # Execution order will be: AuthContext -> Observability -> Request Handler
 if settings.observability_enabled:
     # First-Party
@@ -1086,15 +1284,19 @@ if settings.observability_enabled:
 
     app.add_middleware(ObservabilityMiddleware, enabled=True)
     logger.info("🔍 Observability middleware enabled - tracing all HTTP requests")
-
-    # Add authentication context middleware (runs BEFORE observability in execution)
-    # First-Party
-    from mcpgateway.middleware.auth_middleware import AuthContextMiddleware
-
-    app.add_middleware(AuthContextMiddleware)
-    logger.info("🔐 Authentication context middleware enabled - extracting user info for observability")
 else:
     logger.info("🔍 Observability middleware disabled")
+
+# Database query logging middleware (for N+1 detection)
+if settings.db_query_log_enabled:
+    # First-Party
+    from mcpgateway.db import engine
+    from mcpgateway.middleware.db_query_logging import setup_query_logging
+
+    setup_query_logging(app, engine)
+    logger.info(f"📊 Database query logging enabled - logs: {settings.db_query_log_file}")
+else:
+    logger.debug("📊 Database query logging disabled (enable with DB_QUERY_LOG_ENABLED=true)")
 
 # Set up Jinja2 templates and store in app state for later use
 templates = Jinja2Templates(directory=str(settings.templates_dir))
@@ -1775,6 +1977,7 @@ async def delete_server(server_id: str, db: Session = Depends(get_db), user=Depe
     try:
         logger.debug(f"User {user} is deleting server with ID {server_id}")
         user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await server_service.get_server(db, server_id)
         await server_service.delete_server(db, server_id, user_email=user_email)
         return {
             "status": "success",
@@ -1898,6 +2101,7 @@ async def message_endpoint(request: Request, server_id: str, user=Depends(get_cu
 async def server_get_tools(
     server_id: str,
     include_inactive: bool = False,
+    include_metrics: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> List[Dict[str, Any]]:
@@ -1911,6 +2115,7 @@ async def server_get_tools(
     Args:
         server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive tools in the results.
+        include_metrics (bool): Whether to include metrics in the tools results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
 
@@ -1918,7 +2123,7 @@ async def server_get_tools(
         List[ToolRead]: A list of tool records formatted with by_alias=True.
     """
     logger.debug(f"User: {user} has listed tools for the server_id: {server_id}")
-    tools = await tool_service.list_server_tools(db, server_id=server_id, include_inactive=include_inactive)
+    tools = await tool_service.list_server_tools(db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics)
     return [tool.model_dump(by_alias=True) for tool in tools]
 
 
@@ -2296,7 +2501,20 @@ async def invoke_a2a_agent(
         logger.debug(f"User {user} is invoking A2A agent '{agent_name}' with type '{interaction_type}'")
         if a2a_service is None:
             raise HTTPException(status_code=503, detail="A2A service not available")
-        return await a2a_service.invoke_agent(db, agent_name, parameters, interaction_type)
+        user_email = get_user_email(user)
+        user_id = None
+        if isinstance(user, dict):
+            user_id = str(user.get("id") or user.get("sub") or user_email)
+        else:
+            user_id = str(user)
+        return await a2a_service.invoke_agent(
+            db,
+            agent_name,
+            parameters,
+            interaction_type,
+            user_id=user_id,
+            user_email=user_email,
+        )
     except A2AAgentNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except A2AAgentError as e:
@@ -2390,7 +2608,6 @@ async def create_tool(
     tool: ToolCreate,
     request: Request,
     team_id: Optional[str] = Body(None, description="Team ID to assign tool to"),
-    visibility: Optional[str] = Body("public", description="Tool visibility: private, team, public"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> ToolRead:
@@ -2401,7 +2618,6 @@ async def create_tool(
         tool (ToolCreate): The data needed to create the tool.
         request (Request): The FastAPI request object for metadata extraction.
         team_id (Optional[str]): Team ID to assign the tool to.
-        visibility (str): Tool visibility (private, team, public).
         db (Session): The database session dependency.
         user: The authenticated user making the request.
 
@@ -2442,7 +2658,7 @@ async def create_tool(
             federation_source=metadata["federation_source"],
             team_id=team_id,
             owner_email=user_email,
-            visibility=visibility,
+            visibility=tool.visibility,
         )
     except Exception as ex:
         logger.error(f"Error while creating tool: {ex}")
@@ -2652,7 +2868,7 @@ async def list_resource_templates(
     Returns:
         ListResourceTemplatesResult: A paginated list of resource templates.
     """
-    logger.debug(f"User {user} requested resource templates")
+    logger.info(f"User {user} requested resource templates")
     resource_templates = await resource_service.list_resource_templates(db)
     # For simplicity, we're not implementing real pagination here
     return ListResourceTemplatesResult(_meta={}, resource_templates=resource_templates, next_cursor=None)  # No pagination for now
@@ -2661,7 +2877,7 @@ async def list_resource_templates(
 @resource_router.post("/{resource_id}/toggle")
 @require_permission("resources.update")
 async def toggle_resource_status(
-    resource_id: int,
+    resource_id: str,
     activate: bool = True,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -2670,7 +2886,7 @@ async def toggle_resource_status(
     Activate or deactivate a resource by its ID.
 
     Args:
-        resource_id (int): The ID of the resource.
+        resource_id (str): The ID of the resource.
         activate (bool): True to activate, False to deactivate.
         db (Session): Database session.
         user (str): Authenticated user.
@@ -2863,9 +3079,21 @@ async def read_resource(resource_id: str, request: Request, db: Session = Depend
     if cached := resource_cache.get(resource_id):
         return cached
 
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
     try:
         # Call service with context for plugin support
-        content = await resource_service.read_resource(db, resource_id, request_id=request_id, user=user, server_id=server_id)
+        content = await resource_service.read_resource(
+            db,
+            resource_id=resource_id,
+            request_id=request_id,
+            user=user,
+            server_id=server_id,
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
     except (ResourceNotFoundError, ResourceError) as exc:
         # Translate to FastAPI HTTP error
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -2986,21 +3214,20 @@ async def delete_resource(resource_id: str, db: Session = Depends(get_db), user=
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@resource_router.post("/subscribe/{resource_id}")
+@resource_router.post("/subscribe")
 @require_permission("resources.read")
-async def subscribe_resource(resource_id: str, user=Depends(get_current_user_with_permissions)) -> StreamingResponse:
+async def subscribe_resource(user=Depends(get_current_user_with_permissions)) -> StreamingResponse:
     """
     Subscribe to server-sent events (SSE) for a specific resource.
 
     Args:
-        resource_id (str): ID of the resource to subscribe to.
         user (str): Authenticated user.
 
     Returns:
         StreamingResponse: A streaming response with event updates.
     """
-    logger.debug(f"User {user} is subscribing to resource with resource_id {resource_id}")
-    return StreamingResponse(resource_service.subscribe_events(resource_id), media_type="text/event-stream")
+    logger.debug(f"User {user} is subscribing to resource")
+    return StreamingResponse(resource_service.subscribe_events(), media_type="text/event-stream")
 
 
 ###############
@@ -3009,7 +3236,7 @@ async def subscribe_resource(resource_id: str, user=Depends(get_current_user_wit
 @prompt_router.post("/{prompt_id}/toggle")
 @require_permission("prompts.update")
 async def toggle_prompt_status(
-    prompt_id: int,
+    prompt_id: str,
     activate: bool = True,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -3192,6 +3419,7 @@ async def create_prompt(
 @prompt_router.post("/{prompt_id}")
 @require_permission("prompts.read")
 async def get_prompt(
+    request: Request,
     prompt_id: str,
     args: Dict[str, str] = Body({}),
     db: Session = Depends(get_db),
@@ -3204,6 +3432,7 @@ async def get_prompt(
 
 
     Args:
+        request: FastAPI request object.
         prompt_id: ID of the prompt.
         args: Template arguments.
         db: Database session.
@@ -3217,9 +3446,19 @@ async def get_prompt(
     """
     logger.debug(f"User: {user} requested prompt: {prompt_id} with args={args}")
 
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
     try:
         PromptExecuteArgs(args=args)
-        result = await prompt_service.get_prompt(db, prompt_id, args)
+        result = await prompt_service.get_prompt(
+            db,
+            prompt_id,
+            args,
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
         logger.debug(f"Prompt execution successful for '{prompt_id}'")
     except Exception as ex:
         logger.error(f"Could not retrieve prompt {prompt_id}: {ex}")
@@ -3237,6 +3476,7 @@ async def get_prompt(
 @prompt_router.get("/{prompt_id}")
 @require_permission("prompts.read")
 async def get_prompt_no_args(
+    request: Request,
     prompt_id: str,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -3246,6 +3486,7 @@ async def get_prompt_no_args(
     This endpoint is for convenience when no arguments are needed.
 
     Args:
+        request: FastAPI request object.
         prompt_id: The ID of the prompt to retrieve
         db: Database session
         user: Authenticated user
@@ -3257,7 +3498,18 @@ async def get_prompt_no_args(
         Exception: Re-raised from prompt service.
     """
     logger.debug(f"User: {user} requested prompt: {prompt_id} with no arguments")
-    return await prompt_service.get_prompt(db, prompt_id, {})
+
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+    return await prompt_service.get_prompt(
+        db,
+        prompt_id,
+        {},
+        plugin_context_table=plugin_context_table,
+        plugin_global_context=plugin_global_context,
+    )
 
 
 @prompt_router.put("/{prompt_id}", response_model=PromptRead)
@@ -3824,8 +4076,18 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depen
                 raise JSONRPCError(-32602, "Missing resource URI in parameters", params)
             # Get user email for OAuth token selection
             user_email = get_user_email(user)
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
             try:
-                result = await resource_service.read_resource(db, uri, request_id=request_id, user=user_email)
+                result = await resource_service.read_resource(
+                    db,
+                    resource_uri=uri,
+                    request_id=request_id,
+                    user=user_email,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                )
                 if hasattr(result, "model_dump"):
                     result = {"contents": [result.model_dump(by_alias=True, exclude_none=True)]}
                 else:
@@ -3869,7 +4131,16 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depen
             arguments = params.get("arguments", {})
             if not name:
                 raise JSONRPCError(-32602, "Missing prompt name in parameters", params)
-            result = await prompt_service.get_prompt(db, name, arguments)
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
+            result = await prompt_service.get_prompt(
+                db,
+                name,
+                arguments,
+                plugin_context_table=plugin_context_table,
+                plugin_global_context=plugin_global_context,
+            )
             if hasattr(result, "model_dump"):
                 result = result.model_dump(by_alias=True, exclude_none=True)
         elif method == "ping":
@@ -3884,8 +4155,19 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depen
                 raise JSONRPCError(-32602, "Missing tool name in parameters", params)
             # Get user email for OAuth token selection
             user_email = get_user_email(user)
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
             try:
-                result = await tool_service.invoke_tool(db=db, name=name, arguments=arguments, request_headers=headers, app_user_email=user_email)
+                result = await tool_service.invoke_tool(
+                    db=db,
+                    name=name,
+                    arguments=arguments,
+                    request_headers=headers,
+                    app_user_email=user_email,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                )
                 if hasattr(result, "model_dump"):
                     result = result.model_dump(by_alias=True, exclude_none=True)
             except ValueError:
@@ -4808,6 +5090,19 @@ app.include_router(metrics_router)
 app.include_router(tag_router)
 app.include_router(export_import_router)
 
+# Include log search router if structured logging is enabled
+if getattr(settings, "structured_logging_enabled", True):
+    try:
+        # First-Party
+        from mcpgateway.routers.log_search import router as log_search_router
+
+        app.include_router(log_search_router)
+        logger.info("Log search router included - structured logging enabled")
+    except ImportError as e:
+        logger.warning(f"Failed to import log search router: {e}")
+else:
+    logger.info("Log search router not included - structured logging disabled")
+
 # Conditionally include observability router if enabled
 if settings.observability_enabled:
     # First-Party
@@ -4925,6 +5220,31 @@ if settings.llmchat_enabled:
     except ImportError:
         logger.debug("LLM Chat router not available")
 
+    # Include LLM configuration and proxy routers (internal API)
+    try:
+        # First-Party
+        from mcpgateway.routers.llm_admin_router import llm_admin_router
+        from mcpgateway.routers.llm_config_router import llm_config_router
+        from mcpgateway.routers.llm_proxy_router import llm_proxy_router
+
+        app.include_router(llm_config_router, prefix="/llm", tags=["LLM Configuration"])
+        app.include_router(llm_proxy_router, prefix=settings.llm_api_prefix, tags=["LLM Proxy"])
+        app.include_router(llm_admin_router, prefix="/admin/llm", tags=["LLM Admin"])
+        logger.info("LLM configuration, proxy, and admin routers included")
+    except ImportError as e:
+        logger.debug(f"LLM routers not available: {e}")
+
+# Include Toolops router
+if settings.toolops_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.toolops_router import toolops_router
+
+        app.include_router(toolops_router)
+        logger.info("Toolops router included")
+    except ImportError:
+        logger.debug("Toolops router not available")
+
 # Feature flags for admin UI and API
 UI_ENABLED = settings.mcpgateway_ui_enabled
 ADMIN_API_ENABLED = settings.mcpgateway_admin_api_enabled
@@ -4965,25 +5285,21 @@ if UI_ENABLED:
 
     # Redirect root path to admin UI
     @app.get("/")
-    async def root_redirect(request: Request):
+    async def root_redirect():
         """
-        Redirects the root path ("/") to "/admin".
+        Redirects the root path ("/") to "/admin/".
 
         Logs a debug message before redirecting.
 
-        Args:
-            request (Request): The incoming HTTP request (used only to build the
-                target URL via :pymeth:`starlette.requests.Request.url_for`).
-
         Returns:
-            RedirectResponse: Redirects to /admin.
+            RedirectResponse: Redirects to /admin/.
 
         Raises:
             HTTPException: If there is an error during redirection.
         """
-        logger.debug("Redirecting root path to /admin")
-        root_path = request.scope.get("root_path", "")
-        return RedirectResponse(f"{root_path}/admin", status_code=303)
+        logger.debug("Redirecting root path to /admin/")
+        root_path = settings.app_root_path
+        return RedirectResponse(f"{root_path}/admin/", status_code=303)
         # return RedirectResponse(request.url_for("admin_home"))
 
 else:

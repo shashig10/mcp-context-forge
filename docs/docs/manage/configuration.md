@@ -14,16 +14,15 @@ MCP Gateway supports multiple database backends with full feature parity across 
 |-------------|---------------|--------------------------------------------------------------|--------------------------------|
 | SQLite      | ✅ Full       | `sqlite:///./mcp.db`                                        | Default, file-based            |
 | PostgreSQL  | ✅ Full       | `postgresql://postgres:changeme@localhost:5432/mcp`         | Recommended for production     |
-| MariaDB     | ✅ Full       | `mysql+pymysql://mysql:changeme@localhost:3306/mcp`         | **36+ tables**, MariaDB 12.0+ |
+| MariaDB     | ✅ Full       | `mysql+pymysql://mysql:changeme@localhost:3306/mcp`         | **36+ tables**, MariaDB 10.6+ |
 | MySQL       | ✅ Full       | `mysql+pymysql://admin:changeme@localhost:3306/mcp`         | Alternative MySQL variant      |
-| MongoDB     | ✅ Full       | `mongodb://admin:changeme@localhost:27017/mcp`              | NoSQL document store           |
 
 ### MariaDB/MySQL Setup Details
 
 !!! success "MariaDB & MySQL Full Support"
     MariaDB and MySQL are **fully supported** alongside SQLite and PostgreSQL:
 
-    - **36+ database tables** work perfectly with MariaDB 12.0+ and MySQL 8.4+
+    - **36+ database tables** work perfectly with MariaDB 10.6+ and MySQL 8.0+
     - All **VARCHAR length issues** have been resolved for MariaDB/MySQL compatibility
     - Complete feature parity with SQLite and PostgreSQL
     - Supports all MCP Gateway features including federation, caching, and A2A agents
@@ -154,9 +153,8 @@ DATABASE_URL=mysql+pymysql://mysql:changeme@localhost:3306/mcp
 ```bash
 # Database connection (choose one)
 DATABASE_URL=sqlite:///./mcp.db                                        # SQLite (default)
-DATABASE_URL=mysql+pymysql://mysql:changeme@localhost:3306/mcp          # MySQL
+DATABASE_URL=mysql+pymysql://mysql:changeme@localhost:3306/mcp          # MariaDB/MySQL
 DATABASE_URL=postgresql://postgres:changeme@localhost:5432/mcp          # PostgreSQL
-DATABASE_URL=mongodb://admin:changeme@localhost:27017/mcp               # MongoDB
 
 # Connection pool settings (optional)
 DB_POOL_SIZE=200
@@ -312,6 +310,46 @@ OTEL_ENABLE_OBSERVABILITY=true
 OTEL_TRACES_EXPORTER=otlp
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
+
+### LLM Settings (Internal API)
+
+MCP Gateway can act as a unified LLM provider with an OpenAI-compatible API. Configure multiple external LLM providers through the Admin UI and expose them through a single proxy endpoint.
+
+```bash
+# LLM API Configuration
+LLM_API_PREFIX=/v1                  # API prefix for internal LLM endpoints
+LLM_REQUEST_TIMEOUT=120             # Request timeout for LLM API calls (seconds)
+LLM_STREAMING_ENABLED=true          # Enable streaming responses
+LLM_HEALTH_CHECK_INTERVAL=300       # Provider health check interval (seconds)
+
+# Gateway Provider Settings (for LLM Chat with provider=gateway)
+GATEWAY_MODEL=gpt-4o                # Default model to use
+GATEWAY_BASE_URL=                   # Base URL (defaults to internal API)
+GATEWAY_TEMPERATURE=0.7             # Sampling temperature
+```
+
+!!! info "Provider Configuration"
+    LLM providers (OpenAI, Azure OpenAI, Anthropic, Ollama, Google, Mistral, Cohere, AWS Bedrock, Groq, etc.) are configured through the Admin UI under **LLM Settings > Providers**. The settings above control the gateway's internal LLM proxy behavior.
+
+**OpenAI-Compatible API Endpoints:**
+
+```bash
+# List available models
+curl -H "Authorization: Bearer $TOKEN" http://localhost:4444/v1/models
+
+# Chat completion
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]}' \
+  http://localhost:4444/v1/chat/completions
+```
+
+**Admin UI Features:**
+
+- **Providers**: Add, edit, enable/disable, and delete LLM providers
+- **Models**: View, test, and manage models from configured providers
+- **Health Checks**: Monitor provider health with automatic status checks
+- **Model Discovery**: Fetch available models from providers and sync to database
 
 ---
 

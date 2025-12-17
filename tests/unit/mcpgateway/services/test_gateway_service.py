@@ -68,6 +68,16 @@ def _make_execute_result(*, scalar: _R | None = None, scalars_list: list[_R] | N
 
 
 @pytest.fixture(autouse=True)
+def mock_logging_services():
+    """Mock audit_trail and structured_logger to prevent database writes during tests."""
+    with patch("mcpgateway.services.gateway_service.audit_trail") as mock_audit, \
+         patch("mcpgateway.services.gateway_service.structured_logger") as mock_logger:
+        mock_audit.log_action = MagicMock(return_value=None)
+        mock_logger.log = MagicMock(return_value=None)
+        yield {"audit_trail": mock_audit, "structured_logger": mock_logger}
+
+
+@pytest.fixture(autouse=True)
 def _bypass_gatewayread_validation(monkeypatch):
     """
     The real GatewayService returns ``GatewayRead.model_validate(db_obj)``.
@@ -1513,7 +1523,7 @@ class TestGatewayService:
             mock_session_instance.list_tools.return_value = mock_tools_response
 
             # Make list_resources fail
-            mock_session_instance.list_resources.side_effect = Exception("Resource fetch failed") 
+            mock_session_instance.list_resources.side_effect = Exception("Resource fetch failed")
 
             # Execute
             capabilities, tools, resources, prompts = await gateway_service._initialize_gateway("http://test.example.com", {"Authorization": "Bearer token"}, "SSE")

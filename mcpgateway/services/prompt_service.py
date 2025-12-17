@@ -15,7 +15,6 @@ It handles:
 """
 
 # Standard
-import asyncio
 from datetime import datetime, timezone
 import os
 from string import Formatter
@@ -36,10 +35,13 @@ from mcpgateway.db import EmailTeam
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import PromptMetric, server_prompt_association
 from mcpgateway.observability import create_span
-from mcpgateway.plugins.framework import GlobalContext, PluginManager, PromptHookType, PromptPosthookPayload, PromptPrehookPayload
+from mcpgateway.plugins.framework import GlobalContext, PluginContextTable, PluginManager, PromptHookType, PromptPosthookPayload, PromptPrehookPayload
 from mcpgateway.schemas import PromptCreate, PromptRead, PromptUpdate, TopPerformer
+from mcpgateway.services.audit_trail_service import get_audit_trail_service
+from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService
+from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.pagination import decode_cursor, encode_cursor
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
@@ -47,6 +49,10 @@ from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 # Initialize logging service first
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
+
+# Initialize structured logger and audit trail for prompt operations
+structured_logger = get_structured_logger("prompt_service")
+audit_trail = get_audit_trail_service()
 
 
 class PromptError(Exception):
@@ -60,12 +66,12 @@ class PromptNotFoundError(PromptError):
 class PromptNameConflictError(PromptError):
     """Raised when a prompt name conflicts with existing (active or inactive) prompt."""
 
-    def __init__(self, name: str, is_active: bool = True, prompt_id: Optional[int] = None, visibility: str = "public") -> None:
+    def __init__(self, name: str, enabled: bool = True, prompt_id: Optional[int] = None, visibility: str = "public") -> None:
         """Initialize the error with prompt information.
 
         Args:
             name: The conflicting prompt name
-            is_active: Whether the existing prompt is active
+            enabled: Whether the existing prompt is enabled
             prompt_id: ID of the existing prompt if available
             visibility: Prompt visibility level (private, team, public).
 
@@ -74,21 +80,21 @@ class PromptNameConflictError(PromptError):
             >>> error = PromptNameConflictError("test_prompt")
             >>> error.name
             'test_prompt'
-            >>> error.is_active
+            >>> error.enabled
             True
             >>> error.prompt_id is None
             True
             >>> error = PromptNameConflictError("inactive_prompt", False, 123)
-            >>> error.is_active
+            >>> error.enabled
             False
             >>> error.prompt_id
             123
         """
         self.name = name
-        self.is_active = is_active
+        self.enabled = enabled
         self.prompt_id = prompt_id
         message = f"{visibility.capitalize()} Prompt already exists with name: {name}"
-        if not is_active:
+        if not enabled:
             message += f" (currently inactive, ID: {prompt_id})"
         super().__init__(message)
 
@@ -120,12 +126,12 @@ class PromptService:
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
             >>> service = PromptService()
-            >>> service._event_subscribers
-            []
+            >>> isinstance(service._event_service, EventService)
+            True
             >>> service._jinja_env is not None
             True
         """
-        self._event_subscribers: List[asyncio.Queue] = []
+        self._event_service = EventService(channel_name="mcpgateway:prompt_events")
         self._jinja_env = Environment(autoescape=select_autoescape(["html", "xml"]), trim_blocks=True, lstrip_blocks=True)
         # Initialize plugin manager with env overrides for testability
         env_flag = os.getenv("PLUGINS_ENABLED")
@@ -146,14 +152,15 @@ class PromptService:
 
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
+            >>> from unittest.mock import AsyncMock
             >>> import asyncio
             >>> service = PromptService()
-            >>> service._event_subscribers.append("test_subscriber")
+            >>> service._event_service = AsyncMock()
             >>> asyncio.run(service.shutdown())
-            >>> service._event_subscribers
-            []
+            >>> # Verify event service shutdown was called
+            >>> service._event_service.shutdown.assert_awaited_once()
         """
-        self._event_subscribers.clear()
+        await self._event_service.shutdown()
         logger.info("Prompt service shutdown complete")
 
     async def get_top_prompts(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
@@ -243,7 +250,7 @@ class PromptService:
             "arguments": arguments_list,
             "created_at": db_prompt.created_at,
             "updated_at": db_prompt.updated_at,
-            "is_active": db_prompt.is_active,
+            "enabled": db_prompt.enabled,
             "metrics": {
                 "totalExecutions": total,
                 "successfulExecutions": successful,
@@ -385,12 +392,12 @@ class PromptService:
                 # Check for existing public prompt with the same name
                 existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt.name, DbPrompt.visibility == "public")).scalar_one_or_none()
                 if existing_prompt:
-                    raise PromptNameConflictError(prompt.name, is_active=existing_prompt.is_active, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
+                    raise PromptNameConflictError(prompt.name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
             elif visibility.lower() == "team":
                 # Check for existing team prompt with the same name
                 existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt.name, DbPrompt.visibility == "team", DbPrompt.team_id == team_id)).scalar_one_or_none()
                 if existing_prompt:
-                    raise PromptNameConflictError(prompt.name, is_active=existing_prompt.is_active, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
+                    raise PromptNameConflictError(prompt.name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
 
             # Add to DB
             db.add(db_prompt)
@@ -400,18 +407,95 @@ class PromptService:
             await self._notify_prompt_added(db_prompt)
 
             logger.info(f"Registered prompt: {prompt.name}")
+
+            # Structured logging: Audit trail for prompt creation
+            audit_trail.log_action(
+                user_id=created_by or "system",
+                action="create_prompt",
+                resource_type="prompt",
+                resource_id=str(db_prompt.id),
+                resource_name=db_prompt.name,
+                user_email=owner_email,
+                team_id=team_id,
+                client_ip=created_from_ip,
+                user_agent=created_user_agent,
+                new_values={
+                    "name": db_prompt.name,
+                    "visibility": visibility,
+                },
+                context={
+                    "created_via": created_via,
+                    "import_batch_id": import_batch_id,
+                    "federation_source": federation_source,
+                },
+                db=db,
+            )
+
+            # Structured logging: Log successful prompt creation
+            structured_logger.log(
+                level="INFO",
+                message="Prompt created successfully",
+                event_type="prompt_created",
+                component="prompt_service",
+                user_id=created_by,
+                user_email=owner_email,
+                team_id=team_id,
+                resource_type="prompt",
+                resource_id=str(db_prompt.id),
+                custom_fields={
+                    "prompt_name": db_prompt.name,
+                    "visibility": visibility,
+                },
+                db=db,
+            )
+
             db_prompt.team = self._get_team_name(db, db_prompt.team_id)
             prompt_dict = self._convert_db_prompt(db_prompt)
             return PromptRead.model_validate(prompt_dict)
 
         except IntegrityError as ie:
             logger.error(f"IntegrityErrors in group: {ie}")
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt creation failed due to database integrity error",
+                event_type="prompt_creation_failed",
+                component="prompt_service",
+                user_id=created_by,
+                user_email=owner_email,
+                error=ie,
+                custom_fields={"prompt_name": prompt.name},
+                db=db,
+            )
             raise ie
         except PromptNameConflictError as se:
             db.rollback()
+
+            structured_logger.log(
+                level="WARNING",
+                message="Prompt creation failed due to name conflict",
+                event_type="prompt_name_conflict",
+                component="prompt_service",
+                user_id=created_by,
+                user_email=owner_email,
+                custom_fields={"prompt_name": prompt.name, "visibility": visibility},
+                db=db,
+            )
             raise se
         except Exception as e:
             db.rollback()
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt creation failed",
+                event_type="prompt_creation_failed",
+                component="prompt_service",
+                user_id=created_by,
+                user_email=owner_email,
+                error=e,
+                custom_fields={"prompt_name": prompt.name},
+                db=db,
+            )
             raise PromptError(f"Failed to register prompt: {str(e)}")
 
     async def list_prompts(self, db: Session, include_inactive: bool = False, cursor: Optional[str] = None, tags: Optional[List[str]] = None) -> tuple[List[PromptRead], Optional[str]]:
@@ -468,7 +552,7 @@ class PromptService:
             query = query.where(DbPrompt.id > last_id)
 
         if not include_inactive:
-            query = query.where(DbPrompt.is_active)
+            query = query.where(DbPrompt.enabled)
 
         # Add tag filtering if tags are provided
         if tags:
@@ -530,7 +614,7 @@ class PromptService:
 
         # Apply active/inactive filter
         if not include_inactive:
-            query = query.where(DbPrompt.is_active)
+            query = query.where(DbPrompt.enabled)
 
         if team_id:
             if team_id not in team_ids:
@@ -609,7 +693,7 @@ class PromptService:
         """
         query = select(DbPrompt).join(server_prompt_association, DbPrompt.id == server_prompt_association.c.prompt_id).where(server_prompt_association.c.server_id == server_id)
         if not include_inactive:
-            query = query.where(DbPrompt.is_active)
+            query = query.where(DbPrompt.enabled)
         # Cursor-based pagination logic can be implemented here in the future.
         logger.debug(cursor)
         prompts = db.execute(query).scalars().all()
@@ -652,6 +736,8 @@ class PromptService:
         tenant_id: Optional[str] = None,
         server_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        plugin_context_table: Optional[PluginContextTable] = None,
+        plugin_global_context: Optional[GlobalContext] = None,
     ) -> PromptResult:
         """Get a prompt template and optionally render it.
 
@@ -663,6 +749,8 @@ class PromptService:
             tenant_id: Optional tenant identifier for plugin context
             server_id: Optional server identifier for plugin context
             request_id: Optional request ID, generated if not provided
+            plugin_context_table: Optional plugin context table from previous hooks for cross-hook state sharing.
+            plugin_global_context: Optional global context from middleware for consistency across hooks.
 
         Returns:
             Prompt result with rendered messages
@@ -731,65 +819,57 @@ class PromptService:
         ) as span:
             try:
                 # Determine how to look up the prompt
-                prompt_id_int = None
                 prompt_name = None
 
-                if isinstance(prompt_id, int):
-                    prompt_id_int = prompt_id
-                elif isinstance(prompt_id, str):
-                    # Try to convert to int first (for backward compatibility with numeric string IDs)
-                    try:
-                        prompt_id_int = int(prompt_id)
-                    except ValueError:
-                        # Not a numeric string, treat as prompt name
-                        prompt_name = prompt_id
-                else:
-                    prompt_id_int = prompt_id
-
                 if self._plugin_manager:
-                    if not request_id:
-                        request_id = uuid.uuid4().hex
-                    global_context = GlobalContext(request_id=request_id, user=user, server_id=server_id, tenant_id=tenant_id)
+                    # Use existing context_table from previous hooks if available
+                    context_table = plugin_context_table
+
+                    # Reuse existing global_context from middleware or create new one
+                    if plugin_global_context:
+                        global_context = plugin_global_context
+                        # Update fields with prompt-specific information
+                        if user:
+                            global_context.user = user
+                        if server_id:
+                            global_context.server_id = server_id
+                        if tenant_id:
+                            global_context.tenant_id = tenant_id
+                    else:
+                        # Create new context (fallback when middleware didn't run)
+                        if not request_id:
+                            request_id = uuid.uuid4().hex
+                        global_context = GlobalContext(request_id=request_id, user=user, server_id=server_id, tenant_id=tenant_id)
+
                     pre_result, context_table = await self._plugin_manager.invoke_hook(
                         PromptHookType.PROMPT_PRE_FETCH,
-                        payload=PromptPrehookPayload(prompt_id=str(prompt_id), args=arguments),
+                        payload=PromptPrehookPayload(prompt_id=prompt_id, args=arguments),
                         global_context=global_context,
-                        local_contexts=None,
+                        local_contexts=context_table,  # Pass context from previous hooks
                         violations_as_exceptions=True,
                     )
 
                     # Use modified payload if provided
                     if pre_result.modified_payload:
                         payload = pre_result.modified_payload
-                        # Re-parse the modified prompt_id
-                        if isinstance(payload.prompt_id, int):
-                            prompt_id_int = payload.prompt_id
-                            prompt_name = None
-                        elif isinstance(payload.prompt_id, str):
-                            try:
-                                prompt_id_int = int(payload.prompt_id)
-                                prompt_name = None
-                            except ValueError:
-                                prompt_name = payload.prompt_id
-                                prompt_id_int = None
                         arguments = payload.args
 
                 # Find prompt by ID or name
-                if prompt_id_int is not None:
-                    prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id_int).where(DbPrompt.is_active)).scalar_one_or_none()
-                    search_key = prompt_id_int
+                if prompt_id is not None:
+                    prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id).where(DbPrompt.enabled)).scalar_one_or_none()
+                    search_key = prompt_id
                 else:
                     # Look up by name (active prompts only)
                     # Note: Team/owner scoping could be added here when user context is available
-                    prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_name).where(DbPrompt.is_active)).scalar_one_or_none()
+                    prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_name).where(DbPrompt.enabled)).scalar_one_or_none()
                     search_key = prompt_name
 
                 if not prompt:
                     # Check if an inactive prompt exists
-                    if prompt_id_int is not None:
-                        inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id_int).where(not_(DbPrompt.is_active))).scalar_one_or_none()
+                    if prompt_id is not None:
+                        inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id).where(not_(DbPrompt.enabled))).scalar_one_or_none()
                     else:
-                        inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_name).where(not_(DbPrompt.is_active))).scalar_one_or_none()
+                        inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_name).where(not_(DbPrompt.enabled))).scalar_one_or_none()
 
                     if inactive_prompt:
                         raise PromptNotFoundError(f"Prompt '{search_key}' exists but is inactive")
@@ -829,6 +909,43 @@ class PromptService:
                     # Use modified payload if provided
                     result = post_result.modified_payload.result if post_result.modified_payload else result
 
+                arguments_supplied = bool(arguments)
+
+                audit_trail.log_action(
+                    user_id=user or "anonymous",
+                    action="view_prompt",
+                    resource_type="prompt",
+                    resource_id=str(prompt.id),
+                    resource_name=prompt.name,
+                    team_id=prompt.team_id,
+                    context={
+                        "tenant_id": tenant_id,
+                        "server_id": server_id,
+                        "arguments_provided": arguments_supplied,
+                        "request_id": request_id,
+                    },
+                    db=db,
+                )
+
+                structured_logger.log(
+                    level="INFO",
+                    message="Prompt retrieved successfully",
+                    event_type="prompt_viewed",
+                    component="prompt_service",
+                    user_id=user,
+                    team_id=prompt.team_id,
+                    resource_type="prompt",
+                    resource_id=str(prompt.id),
+                    request_id=request_id,
+                    custom_fields={
+                        "prompt_name": prompt.name,
+                        "arguments_provided": arguments_supplied,
+                        "tenant_id": tenant_id,
+                        "server_id": server_id,
+                    },
+                    db=db,
+                )
+
                 # Set success attributes on span
                 if span:
                     span.set_attribute("success", True)
@@ -837,6 +954,7 @@ class PromptService:
                         span.set_attribute("messages.count", len(result.messages))
 
                 success = True
+                logger.info(f"Retrieved prompt: {prompt.id} successfully")
                 return result
 
             except Exception as e:
@@ -928,13 +1046,13 @@ class PromptService:
                     # Check for existing public prompts with the same name
                     existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_update.name, DbPrompt.visibility == "public")).scalar_one_or_none()
                     if existing_prompt:
-                        raise PromptNameConflictError(prompt_update.name, is_active=existing_prompt.is_active, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
+                        raise PromptNameConflictError(prompt_update.name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
                 elif visibility.lower() == "team" and team_id:
                     # Check for existing team prompt with the same name
                     existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_update.name, DbPrompt.visibility == "team", DbPrompt.team_id == team_id)).scalar_one_or_none()
                     logger.info(f"Existing prompt check result: {existing_prompt}")
                     if existing_prompt:
-                        raise PromptNameConflictError(prompt_update.name, is_active=existing_prompt.is_active, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
+                        raise PromptNameConflictError(prompt_update.name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
 
             # Check ownership if user_email provided
             if user_email:
@@ -992,26 +1110,117 @@ class PromptService:
             db.refresh(prompt)
 
             await self._notify_prompt_updated(prompt)
+
+            # Structured logging: Audit trail for prompt update
+            audit_trail.log_action(
+                user_id=user_email or modified_by or "system",
+                action="update_prompt",
+                resource_type="prompt",
+                resource_id=str(prompt.id),
+                resource_name=prompt.name,
+                user_email=user_email,
+                team_id=prompt.team_id,
+                client_ip=modified_from_ip,
+                user_agent=modified_user_agent,
+                new_values={"name": prompt.name, "version": prompt.version},
+                context={"modified_via": modified_via},
+                db=db,
+            )
+
+            structured_logger.log(
+                level="INFO",
+                message="Prompt updated successfully",
+                event_type="prompt_updated",
+                component="prompt_service",
+                user_id=modified_by,
+                user_email=user_email,
+                team_id=prompt.team_id,
+                resource_type="prompt",
+                resource_id=str(prompt.id),
+                custom_fields={"prompt_name": prompt.name, "version": prompt.version},
+                db=db,
+            )
+
             prompt.team = self._get_team_name(db, prompt.team_id)
             return PromptRead.model_validate(self._convert_db_prompt(prompt))
 
-        except PermissionError:
+        except PermissionError as pe:
             db.rollback()
+
+            structured_logger.log(
+                level="WARNING",
+                message="Prompt update failed due to permission error",
+                event_type="prompt_update_permission_denied",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=pe,
+                db=db,
+            )
             raise
         except IntegrityError as ie:
             db.rollback()
             logger.error(f"IntegrityErrors in group: {ie}")
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt update failed due to database integrity error",
+                event_type="prompt_update_failed",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=ie,
+                db=db,
+            )
             raise ie
         except PromptNotFoundError as e:
             db.rollback()
             logger.error(f"Prompt not found: {e}")
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt update failed - prompt not found",
+                event_type="prompt_not_found",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=e,
+                db=db,
+            )
             raise e
         except PromptNameConflictError as pnce:
             db.rollback()
             logger.error(f"Prompt name conflict: {pnce}")
+
+            structured_logger.log(
+                level="WARNING",
+                message="Prompt update failed due to name conflict",
+                event_type="prompt_name_conflict",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=pnce,
+                db=db,
+            )
             raise pnce
         except Exception as e:
             db.rollback()
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt update failed",
+                event_type="prompt_update_failed",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=e,
+                db=db,
+            )
             raise PromptError(f"Failed to update prompt: {str(e)}")
 
     async def toggle_prompt_status(self, db: Session, prompt_id: int, activate: bool, user_email: Optional[str] = None) -> PromptRead:
@@ -1063,8 +1272,8 @@ class PromptService:
                 if not await permission_service.check_resource_ownership(user_email, prompt):
                     raise PermissionError("Only the owner can activate the Prompt" if activate else "Only the owner can deactivate the Prompt")
 
-            if prompt.is_active != activate:
-                prompt.is_active = activate
+            if prompt.enabled != activate:
+                prompt.enabled = activate
                 prompt.updated_at = datetime.now(timezone.utc)
                 db.commit()
                 db.refresh(prompt)
@@ -1073,12 +1282,63 @@ class PromptService:
                 else:
                     await self._notify_prompt_deactivated(prompt)
                 logger.info(f"Prompt {prompt.name} {'activated' if activate else 'deactivated'}")
+
+                # Structured logging: Audit trail for prompt status toggle
+                audit_trail.log_action(
+                    user_id=user_email or "system",
+                    action="toggle_prompt_status",
+                    resource_type="prompt",
+                    resource_id=str(prompt.id),
+                    resource_name=prompt.name,
+                    user_email=user_email,
+                    team_id=prompt.team_id,
+                    new_values={"enabled": prompt.enabled},
+                    context={"action": "activate" if activate else "deactivate"},
+                    db=db,
+                )
+
+                structured_logger.log(
+                    level="INFO",
+                    message=f"Prompt {'activated' if activate else 'deactivated'} successfully",
+                    event_type="prompt_status_toggled",
+                    component="prompt_service",
+                    user_email=user_email,
+                    team_id=prompt.team_id,
+                    resource_type="prompt",
+                    resource_id=str(prompt.id),
+                    custom_fields={"prompt_name": prompt.name, "enabled": prompt.enabled},
+                    db=db,
+                )
+
             prompt.team = self._get_team_name(db, prompt.team_id)
             return PromptRead.model_validate(self._convert_db_prompt(prompt))
         except PermissionError as e:
+            structured_logger.log(
+                level="WARNING",
+                message="Prompt status toggle failed due to permission error",
+                event_type="prompt_toggle_permission_denied",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=e,
+                db=db,
+            )
             raise e
         except Exception as e:
             db.rollback()
+
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt status toggle failed",
+                event_type="prompt_toggle_failed",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=e,
+                db=db,
+            )
             raise PromptError(f"Failed to toggle prompt status: {str(e)}")
 
     # Get prompt details for admin ui
@@ -1115,7 +1375,35 @@ class PromptService:
             raise PromptNotFoundError(f"Prompt not found: {prompt_id}")
         # Return the fully converted prompt including metrics
         prompt.team = self._get_team_name(db, prompt.team_id)
-        return self._convert_db_prompt(prompt)
+        prompt_data = self._convert_db_prompt(prompt)
+
+        audit_trail.log_action(
+            user_id="system",
+            action="view_prompt_details",
+            resource_type="prompt",
+            resource_id=str(prompt.id),
+            resource_name=prompt.name,
+            team_id=prompt.team_id,
+            context={"include_inactive": include_inactive},
+            db=db,
+        )
+
+        structured_logger.log(
+            level="INFO",
+            message="Prompt details retrieved",
+            event_type="prompt_details_viewed",
+            component="prompt_service",
+            resource_type="prompt",
+            resource_id=str(prompt.id),
+            team_id=prompt.team_id,
+            custom_fields={
+                "prompt_name": prompt.name,
+                "include_inactive": include_inactive,
+            },
+            db=db,
+        )
+
+        return prompt_data
 
     async def delete_prompt(self, db: Session, prompt_id: Union[int, str], user_email: Optional[str] = None) -> None:
         """
@@ -1163,33 +1451,95 @@ class PromptService:
                     raise PermissionError("Only the owner can delete this prompt")
 
             prompt_info = {"id": prompt.id, "name": prompt.name}
+            prompt_name = prompt.name
+            prompt_team_id = prompt.team_id
+
             db.delete(prompt)
             db.commit()
             await self._notify_prompt_deleted(prompt_info)
             logger.info(f"Deleted prompt: {prompt_info['name']}")
-        except PermissionError:
+
+            # Structured logging: Audit trail for prompt deletion
+            audit_trail.log_action(
+                user_id=user_email or "system",
+                action="delete_prompt",
+                resource_type="prompt",
+                resource_id=str(prompt_info["id"]),
+                resource_name=prompt_name,
+                user_email=user_email,
+                team_id=prompt_team_id,
+                old_values={"name": prompt_name},
+                db=db,
+            )
+
+            # Structured logging: Log successful prompt deletion
+            structured_logger.log(
+                level="INFO",
+                message="Prompt deleted successfully",
+                event_type="prompt_deleted",
+                component="prompt_service",
+                user_email=user_email,
+                team_id=prompt_team_id,
+                resource_type="prompt",
+                resource_id=str(prompt_info["id"]),
+                custom_fields={"prompt_name": prompt_name},
+                db=db,
+            )
+        except PermissionError as pe:
             db.rollback()
+
+            # Structured logging: Log permission error
+            structured_logger.log(
+                level="WARNING",
+                message="Prompt deletion failed due to permission error",
+                event_type="prompt_delete_permission_denied",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=pe,
+                db=db,
+            )
             raise
         except Exception as e:
             db.rollback()
             if isinstance(e, PromptNotFoundError):
+                # Structured logging: Log not found error
+                structured_logger.log(
+                    level="ERROR",
+                    message="Prompt deletion failed - prompt not found",
+                    event_type="prompt_not_found",
+                    component="prompt_service",
+                    user_email=user_email,
+                    resource_type="prompt",
+                    resource_id=str(prompt_id),
+                    error=e,
+                    db=db,
+                )
                 raise e
+
+            # Structured logging: Log generic prompt deletion failure
+            structured_logger.log(
+                level="ERROR",
+                message="Prompt deletion failed",
+                event_type="prompt_deletion_failed",
+                component="prompt_service",
+                user_email=user_email,
+                resource_type="prompt",
+                resource_id=str(prompt_id),
+                error=e,
+                db=db,
+            )
             raise PromptError(f"Failed to delete prompt: {str(e)}")
 
     async def subscribe_events(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """Subscribe to prompt events.
+        """Subscribe to Prompt events via the EventService.
 
         Yields:
-            Prompt event messages
+            Prompt event messages.
         """
-        queue: asyncio.Queue = asyncio.Queue()
-        self._event_subscribers.append(queue)
-        try:
-            while True:
-                event = await queue.get()
-                yield event
-        finally:
-            self._event_subscribers.remove(queue)
+        async for event in self._event_service.subscribe_events():
+            yield event
 
     def _validate_template(self, template: str) -> None:
         """Validate template syntax.
@@ -1339,7 +1689,7 @@ class PromptService:
                 "id": prompt.id,
                 "name": prompt.name,
                 "description": prompt.description,
-                "is_active": prompt.is_active,
+                "enabled": prompt.enabled,
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -1358,7 +1708,7 @@ class PromptService:
                 "id": prompt.id,
                 "name": prompt.name,
                 "description": prompt.description,
-                "is_active": prompt.is_active,
+                "enabled": prompt.enabled,
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -1373,7 +1723,7 @@ class PromptService:
         """
         event = {
             "type": "prompt_activated",
-            "data": {"id": prompt.id, "name": prompt.name, "is_active": True},
+            "data": {"id": prompt.id, "name": prompt.name, "enabled": True},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
@@ -1387,7 +1737,7 @@ class PromptService:
         """
         event = {
             "type": "prompt_deactivated",
-            "data": {"id": prompt.id, "name": prompt.name, "is_active": False},
+            "data": {"id": prompt.id, "name": prompt.name, "enabled": False},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
@@ -1415,20 +1765,19 @@ class PromptService:
         """
         event = {
             "type": "prompt_removed",
-            "data": {"id": prompt.id, "name": prompt.name, "is_active": False},
+            "data": {"id": prompt.id, "name": prompt.name, "enabled": False},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await self._publish_event(event)
 
     async def _publish_event(self, event: Dict[str, Any]) -> None:
         """
-        Publish event to all subscribers.
+        Publish event to all subscribers via the EventService.
 
         Args:
-            event: Dictionary containing event info
+            event: Event to publish
         """
-        for queue in self._event_subscribers:
-            await queue.put(event)
+        await self._event_service.publish_event(event)
 
     # --- Metrics ---
     async def aggregate_metrics(self, db: Session) -> Dict[str, Any]:
