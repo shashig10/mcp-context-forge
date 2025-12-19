@@ -26,9 +26,9 @@ from __future__ import annotations
 # Standard
 import logging
 import re
-import time
 from collections import OrderedDict
 from typing import Dict, Optional, Any, Tuple
+from time import time
 
 # Third-Party
 import aioboto3
@@ -90,7 +90,7 @@ class TTLLRUCache:
             return None
 
         value, expiry = self.cache[key]
-        current_time = time.time()
+        current_time = time()
 
         if current_time >= expiry:
             # Expired, remove it
@@ -109,7 +109,7 @@ class TTLLRUCache:
             key: The cache key.
             value: The value to cache.
         """
-        current_time = time.time()
+        current_time = time()
         expiry = current_time + self.ttl
 
         if key in self.cache:
@@ -302,12 +302,7 @@ class AuthHeaderInjectorPlugin(Plugin):
             ttl=self._cfg.namespace_ttl_seconds
         )
 
-        # logger.error(
-        #     f"AuthHeaderInjectorPlugin initialized with {len(self._compiled_patterns)} path patterns, "
-        #     f"{len(self._cfg.headers)} global headers, "
-        #     f"bearer_token_ttl={self._cfg.bearer_token_ttl_seconds}s (cache_size={self._cfg.bearer_token_cache_size}), "
-        #     f"namespace_ttl={self._cfg.namespace_ttl_seconds}s (cache_size={self._cfg.namespace_cache_size})"
-        # )
+
 
     def _matches_pattern(self, path: str) -> list[tuple[Dict[str, str], str | None]]:
         """Check if the path matches any configured patterns.
@@ -347,25 +342,13 @@ class AuthHeaderInjectorPlugin(Plugin):
         Returns:
             The bearer token as a string.
         """
-        # start_time = time.time()
-
         # Check cache first
-        # cache_check_start = time.time()
         cached_token = self._bearer_token_cache.get(uid)
-        # cache_check_duration = (time.time() - cache_check_start) * 1000  # Convert to ms
 
         if cached_token is not None:
-            # total_duration = (time.time() - start_time) * 1000
-            # logger.error(
-            #     f"[LATENCY] Bearer token cache HIT for uid={uid} | "
-            #     f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
-            # )
             return cached_token
 
-        # logger.error(f"[LATENCY] Bearer token cache MISS for uid={uid} | cache_check={cache_check_duration:.2f}ms")
-
         # Fetch new token
-        # fetch_start = time.time()
         BASE_URL = "https://api.nlp.dev.uptimize.merckgroup.com"
         headers = {"api-key": uid, "content-type": "application/json"}
 
@@ -373,18 +356,8 @@ class AuthHeaderInjectorPlugin(Plugin):
         response.raise_for_status()
         token = response.json()["AccessToken"]
 
-        # fetch_duration = (time.time() - fetch_start) * 1000
-
         # Cache the token
-        # cache_set_start = time.time()
         self._bearer_token_cache.set(uid, token)
-        # cache_set_duration = (time.time() - cache_set_start) * 1000
-
-        # total_duration = (time.time() - start_time) * 1000
-        # logger.error(
-        #     f"[LATENCY] Bearer token fetched for uid={uid} | "
-        #     f"api_call={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
-        # )
 
         return token
 
@@ -397,39 +370,18 @@ class AuthHeaderInjectorPlugin(Plugin):
         Returns:
             The namespace record dict or None.
         """
-        start_time = time.time()
-
         # Check cache first
-        cache_check_start = time.time()
         cached_record = self._namespace_cache.get(namespace)
-        cache_check_duration = (time.time() - cache_check_start) * 1000
 
         if cached_record is not None:
-            total_duration = (time.time() - start_time) * 1000
-            logger.error(
-                f"[LATENCY] Namespace cache HIT for namespace={namespace} | "
-                f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
-            )
             return cached_record
 
-        logger.info(f"[LATENCY] Namespace cache MISS for namespace={namespace} | cache_check={cache_check_duration:.2f}ms")
-
         # Fetch the record
-        fetch_start = time.time()
         record = await get_record_by_namespace(namespace)
-        fetch_duration = (time.time() - fetch_start) * 1000
 
         # Cache the record
-        cache_set_start = time.time()
         if record is not None:
             self._namespace_cache.set(namespace, record)
-        cache_set_duration = (time.time() - cache_set_start) * 1000
-
-        total_duration = (time.time() - start_time) * 1000
-        logger.error(
-            f"[LATENCY] Namespace record fetched for namespace={namespace} | "
-            f"dynamodb_query={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
-        )
 
         return record
 
@@ -449,29 +401,17 @@ class AuthHeaderInjectorPlugin(Plugin):
         Returns:
             Result with modified headers if any patterns match.
         """
-        plugin_start_time = time.time()
-
         headers: dict[str, str] = payload.headers.model_dump() if payload.headers else {}
 
         # Extract namespace
-        extract_start = time.time()
         URL = context.dict().get("global_context").get("metadata").get("tool").get("url")
         runtime = self.extract_nameSpace(str(URL))
         namespace = runtime.split("-")[0]
-        extract_duration = (time.time() - extract_start) * 1000
-
-        logger.error(f"[LATENCY] Namespace extraction | namespace={namespace}, duration={extract_duration:.2f}ms")
 
         # Get namespace record (with caching)
-        namespace_start = time.time()
         record = await self.get_namespace_record(namespace)
-        namespace_duration = (time.time() - namespace_start) * 1000
 
         if not record:
-            total_duration = (time.time() - plugin_start_time) * 1000
-            logger.warning(
-                f"[LATENCY] No record found for namespace={namespace} | total={total_duration:.2f}ms"
-            )
             return PluginResult(
                 modified_payload=payload,
                 continue_processing=True,
@@ -479,37 +419,17 @@ class AuthHeaderInjectorPlugin(Plugin):
 
         uid = record.get("uid")
         if not uid:
-            total_duration = (time.time() - plugin_start_time) * 1000
-            logger.warning(
-                f"[LATENCY] No UID in record for namespace={namespace} | total={total_duration:.2f}ms"
-            )
             return PluginResult(
                 modified_payload=payload,
                 continue_processing=True,
             )
 
         # Get bearer token (with caching)
-        token_start = time.time()
         bearer_token = await self.get_bearer_token(uid)
-        token_duration = (time.time() - token_start) * 1000
 
         # Set authorization header
-        header_start = time.time()
         headers["Authorization"] = f"Bearer {bearer_token}"
         payload.headers = HttpHeaderPayload(root=headers)
-        header_duration = (time.time() - header_start) * 1000
-
-        total_duration = (time.time() - plugin_start_time) * 1000
-
-        logger.error(
-            f"[LATENCY] Auth header injection complete | "
-            f"namespace={namespace}, uid={uid[:8]}... | "
-            f"extract={extract_duration:.2f}ms, "
-            f"namespace_lookup={namespace_duration:.2f}ms, "
-            f"token_fetch={token_duration:.2f}ms, "
-            f"header_set={header_duration:.2f}ms, "
-            f"total={total_duration:.2f}ms"
-        )
 
         return PluginResult(
             modified_payload=payload,
