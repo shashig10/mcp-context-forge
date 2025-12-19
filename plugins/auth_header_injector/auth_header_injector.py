@@ -203,7 +203,7 @@ async def get_record_by_namespace(
         A normalized dict representing the record, or None if not found.
     """
     try:
-        logger.debug(f"Getting record {namespace}")
+        # logger.debug(f"Getting record {namespace}")
 
         async with session.client("dynamodb", region_name=DYNAMODB_REGION) as dynamodb_client:
             response = await dynamodb_client.query(
@@ -276,6 +276,8 @@ class AuthHeaderInjectorPlugin(Plugin):
         super().__init__(config)
         self._cfg = AuthHeaderInjectorConfig(**(config.config or {}))
 
+        self._http_client = httpx.AsyncClient()
+
         # Compile regex patterns for efficient matching
         self._compiled_patterns: list[tuple[re.Pattern, Dict[str, str], str | None]] = []
         for mapping in self._cfg.url_path_patterns:
@@ -300,12 +302,12 @@ class AuthHeaderInjectorPlugin(Plugin):
             ttl=self._cfg.namespace_ttl_seconds
         )
 
-        logger.error(
-            f"AuthHeaderInjectorPlugin initialized with {len(self._compiled_patterns)} path patterns, "
-            f"{len(self._cfg.headers)} global headers, "
-            f"bearer_token_ttl={self._cfg.bearer_token_ttl_seconds}s (cache_size={self._cfg.bearer_token_cache_size}), "
-            f"namespace_ttl={self._cfg.namespace_ttl_seconds}s (cache_size={self._cfg.namespace_cache_size})"
-        )
+        # logger.error(
+        #     f"AuthHeaderInjectorPlugin initialized with {len(self._compiled_patterns)} path patterns, "
+        #     f"{len(self._cfg.headers)} global headers, "
+        #     f"bearer_token_ttl={self._cfg.bearer_token_ttl_seconds}s (cache_size={self._cfg.bearer_token_cache_size}), "
+        #     f"namespace_ttl={self._cfg.namespace_ttl_seconds}s (cache_size={self._cfg.namespace_cache_size})"
+        # )
 
     def _matches_pattern(self, path: str) -> list[tuple[Dict[str, str], str | None]]:
         """Check if the path matches any configured patterns.
@@ -345,12 +347,12 @@ class AuthHeaderInjectorPlugin(Plugin):
         Returns:
             The bearer token as a string.
         """
-        start_time = time.time()
+        # start_time = time.time()
 
         # Check cache first
-        cache_check_start = time.time()
+        # cache_check_start = time.time()
         cached_token = self._bearer_token_cache.get(uid)
-        cache_check_duration = (time.time() - cache_check_start) * 1000  # Convert to ms
+        # cache_check_duration = (time.time() - cache_check_start) * 1000  # Convert to ms
 
         if cached_token is not None:
             total_duration = (time.time() - start_time) * 1000
@@ -363,27 +365,26 @@ class AuthHeaderInjectorPlugin(Plugin):
         logger.error(f"[LATENCY] Bearer token cache MISS for uid={uid} | cache_check={cache_check_duration:.2f}ms")
 
         # Fetch new token
-        fetch_start = time.time()
+        # fetch_start = time.time()
         BASE_URL = "https://api.nlp.dev.uptimize.merckgroup.com"
         headers = {"api-key": uid, "content-type": "application/json"}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(f"{BASE_URL}/aws/runtime/bearer", headers=headers)
-            response.raise_for_status()
-            token = response.json()["AccessToken"]
+        response = await self._http_client.post(f"{BASE_URL}/aws/runtime/bearer", headers=headers)
+        response.raise_for_status()
+        token = response.json()["AccessToken"]
 
-        fetch_duration = (time.time() - fetch_start) * 1000
+        # fetch_duration = (time.time() - fetch_start) * 1000
 
         # Cache the token
-        cache_set_start = time.time()
+        # cache_set_start = time.time()
         self._bearer_token_cache.set(uid, token)
-        cache_set_duration = (time.time() - cache_set_start) * 1000
+        # cache_set_duration = (time.time() - cache_set_start) * 1000
 
-        total_duration = (time.time() - start_time) * 1000
-        logger.error(
-            f"[LATENCY] Bearer token fetched for uid={uid} | "
-            f"api_call={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
-        )
+        # total_duration = (time.time() - start_time) * 1000
+        # logger.error(
+        #     f"[LATENCY] Bearer token fetched for uid={uid} | "
+        #     f"api_call={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
+        # )
 
         return token
 
