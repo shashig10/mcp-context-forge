@@ -24,7 +24,6 @@ Hook: http_pre_request
 from __future__ import annotations
 
 # Standard
-import asyncio
 import logging
 import re
 import time
@@ -32,9 +31,8 @@ from collections import OrderedDict
 from typing import Dict, Optional, Any, Tuple
 
 # Third-Party
-import boto3
+import aioboto3
 import httpx
-from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from pydantic import BaseModel, Field
 
@@ -55,23 +53,22 @@ TABLE_NAME = "agentcore"
 NAMESPACE_GSI_NAME = "namespace-index"
 DYNAMODB_REGION = "eu-central-1"
 
-# Initialize DynamoDB resource (reused across requests)
-dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
-table = dynamodb.Table(TABLE_NAME)
+# Initialize aioboto3 session (for async DynamoDB access)
+session = aioboto3.Session(region_name=DYNAMODB_REGION)
 
 
 class TTLLRUCache:
     """
     A simple TTL-aware LRU cache implementation.
-    
+
     This cache stores items with expiration times and automatically evicts
     expired entries. It uses OrderedDict for LRU behavior.
     """
-    
+
     def __init__(self, maxsize: int, ttl: float):
         """
         Initialize the TTL LRU cache.
-        
+
         Args:
             maxsize: Maximum number of items to store.
             ttl: Time-to-live in seconds for cached items.
@@ -79,11 +76,11 @@ class TTLLRUCache:
         self.maxsize = maxsize
         self.ttl = ttl
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
-    
+
     def get(self, key: str) -> Optional[Any]:
         """
         Get an item from the cache.
-        
+
         Args:
             key: The cache key.
         Returns:
@@ -91,30 +88,30 @@ class TTLLRUCache:
         """
         if key not in self.cache:
             return None
-        
+
         value, expiry = self.cache[key]
         current_time = time.time()
-        
+
         if current_time >= expiry:
             # Expired, remove it
             del self.cache[key]
             return None
-        
+
         # Move to end (most recently used)
         self.cache.move_to_end(key)
         return value
-    
+
     def set(self, key: str, value: Any) -> None:
         """
         Set an item in the cache.
-        
+
         Args:
             key: The cache key.
             value: The value to cache.
         """
         current_time = time.time()
         expiry = current_time + self.ttl
-        
+
         if key in self.cache:
             # Update existing entry
             self.cache[key] = (value, expiry)
@@ -122,15 +119,15 @@ class TTLLRUCache:
         else:
             # Add new entry
             self.cache[key] = (value, expiry)
-            
+
             # Evict oldest if over capacity
             if len(self.cache) > self.maxsize:
                 self.cache.popitem(last=False)
-    
+
     def clear(self) -> None:
         """Clear all items from the cache."""
         self.cache.clear()
-    
+
     def __len__(self) -> int:
         """Return the number of items in the cache."""
         return len(self.cache)
@@ -190,13 +187,13 @@ class AuthHeaderInjectorConfig(BaseModel):
     )
 
 
-def _get_record_by_namespace_sync(
+async def get_record_by_namespace(
     namespace: str,
     active_only: bool = False,
 ) -> Optional[Dict]:
     """
-    Synchronous helper to retrieve record by namespace.
-    
+    Async helper to retrieve record by namespace using aioboto3.
+
     Args:
         namespace: The namespace string to search for.
         active_only: If True, only return "active" items
@@ -207,53 +204,59 @@ def _get_record_by_namespace_sync(
     """
     try:
         logger.debug(f"Getting record {namespace}")
-        key_expr = Key("namespace").eq(namespace)
-        response = table.query(
-            IndexName=NAMESPACE_GSI_NAME,
-            KeyConditionExpression=key_expr,
-            Limit=1,
-        )
-        items = response.get("Items", [])
-        if not items:
-            return None
 
-        item = items[0]
+        async with session.client("dynamodb", region_name=DYNAMODB_REGION) as dynamodb_client:
+            response = await dynamodb_client.query(
+                TableName=TABLE_NAME,
+                IndexName=NAMESPACE_GSI_NAME,
+                KeyConditionExpression="namespace = :namespace",
+                ExpressionAttributeValues={
+                    ":namespace": {"S": namespace}
+                },
+                Limit=1,
+            )
 
-        # Map to desired shape
-        return {
-            "uid": item.get("uid"),
-            "role": item.get("role"),
-            "tools": item.get("tools", []),
-            "namespace": item.get("namespace"),
-            "usecase": item.get("usecase"),
-            "usecase_id": item.get("usecase_id"),
-            "description": item.get("description", ""),
-            "is_active": item.get("is_active", True),
-            "user_pool_id": item.get("user_pool_id", ""),
-            "client_id": item.get("client_id", ""),
-        }
+            items = response.get("Items", [])
+            if not items:
+                return None
+
+            item = items[0]
+
+            # Convert DynamoDB format to Python dict
+            def dynamodb_to_python(ddb_value):
+                """Convert DynamoDB typed value to Python value."""
+                if "S" in ddb_value:
+                    return ddb_value["S"]
+                elif "N" in ddb_value:
+                    return float(ddb_value["N"])
+                elif "BOOL" in ddb_value:
+                    return ddb_value["BOOL"]
+                elif "L" in ddb_value:
+                    return [dynamodb_to_python(v) for v in ddb_value["L"]]
+                elif "M" in ddb_value:
+                    return {k: dynamodb_to_python(v) for k, v in ddb_value["M"].items()}
+                elif "NULL" in ddb_value:
+                    return None
+                return ddb_value
+
+            # Map to desired shape
+            return {
+                "uid": dynamodb_to_python(item.get("uid", {"NULL": True})),
+                "role": dynamodb_to_python(item.get("role", {"NULL": True})),
+                "tools": dynamodb_to_python(item.get("tools", {"L": []})),
+                "namespace": dynamodb_to_python(item.get("namespace", {"NULL": True})),
+                "usecase": dynamodb_to_python(item.get("usecase", {"NULL": True})),
+                "usecase_id": dynamodb_to_python(item.get("usecase_id", {"NULL": True})),
+                "description": dynamodb_to_python(item.get("description", {"S": ""})),
+                "is_active": dynamodb_to_python(item.get("is_active", {"BOOL": True})),
+                "user_pool_id": dynamodb_to_python(item.get("user_pool_id", {"S": ""})),
+                "client_id": dynamodb_to_python(item.get("client_id", {"S": ""})),
+            }
 
     except ClientError as e:
         logger.error(f"Error getting record by namespace: {e}")
         raise
 
-
-async def get_record_by_namespace(
-    namespace: str,
-    active_only: bool = False,
-) -> Optional[Dict]:
-    """
-    Async wrapper to retrieve the first record matching the provided namespace via the GSI.
-
-    Args:
-        namespace: The namespace string to search for.
-        active_only: If True, only return "active" items
-                     (is_active is True or not set).
-
-    Returns:
-        A normalized dict representing the record, or None if not found.
-    """
-    return await asyncio.to_thread(_get_record_by_namespace_sync, namespace, active_only)
 
 
 class AuthHeaderInjectorPlugin(Plugin):
@@ -343,12 +346,12 @@ class AuthHeaderInjectorPlugin(Plugin):
             The bearer token as a string.
         """
         start_time = time.time()
-        
+
         # Check cache first
         cache_check_start = time.time()
         cached_token = self._bearer_token_cache.get(uid)
         cache_check_duration = (time.time() - cache_check_start) * 1000  # Convert to ms
-        
+
         if cached_token is not None:
             total_duration = (time.time() - start_time) * 1000
             logger.error(
@@ -356,32 +359,32 @@ class AuthHeaderInjectorPlugin(Plugin):
                 f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
             )
             return cached_token
-        
+
         logger.error(f"[LATENCY] Bearer token cache MISS for uid={uid} | cache_check={cache_check_duration:.2f}ms")
-        
+
         # Fetch new token
         fetch_start = time.time()
         BASE_URL = "https://api.nlp.dev.uptimize.merckgroup.com"
         headers = {"api-key": uid, "content-type": "application/json"}
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(f"{BASE_URL}/aws/runtime/bearer", headers=headers)
             response.raise_for_status()
             token = response.json()["AccessToken"]
-        
+
         fetch_duration = (time.time() - fetch_start) * 1000
-        
+
         # Cache the token
         cache_set_start = time.time()
         self._bearer_token_cache.set(uid, token)
         cache_set_duration = (time.time() - cache_set_start) * 1000
-        
+
         total_duration = (time.time() - start_time) * 1000
         logger.error(
             f"[LATENCY] Bearer token fetched for uid={uid} | "
             f"api_call={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
         )
-        
+
         return token
 
     async def get_namespace_record(self, namespace: str) -> Optional[Dict]:
@@ -394,12 +397,12 @@ class AuthHeaderInjectorPlugin(Plugin):
             The namespace record dict or None.
         """
         start_time = time.time()
-        
+
         # Check cache first
         cache_check_start = time.time()
         cached_record = self._namespace_cache.get(namespace)
         cache_check_duration = (time.time() - cache_check_start) * 1000
-        
+
         if cached_record is not None:
             total_duration = (time.time() - start_time) * 1000
             logger.error(
@@ -407,26 +410,26 @@ class AuthHeaderInjectorPlugin(Plugin):
                 f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
             )
             return cached_record
-        
+
         logger.info(f"[LATENCY] Namespace cache MISS for namespace={namespace} | cache_check={cache_check_duration:.2f}ms")
-        
+
         # Fetch the record
         fetch_start = time.time()
         record = await get_record_by_namespace(namespace)
         fetch_duration = (time.time() - fetch_start) * 1000
-        
+
         # Cache the record
         cache_set_start = time.time()
         if record is not None:
             self._namespace_cache.set(namespace, record)
         cache_set_duration = (time.time() - cache_set_start) * 1000
-        
+
         total_duration = (time.time() - start_time) * 1000
         logger.error(
             f"[LATENCY] Namespace record fetched for namespace={namespace} | "
             f"dynamodb_query={fetch_duration:.2f}ms, cache_set={cache_set_duration:.2f}ms, total={total_duration:.2f}ms"
         )
-        
+
         return record
 
     async def tool_pre_invoke(
@@ -455,14 +458,14 @@ class AuthHeaderInjectorPlugin(Plugin):
         runtime = self.extract_nameSpace(str(URL))
         namespace = runtime.split("-")[0]
         extract_duration = (time.time() - extract_start) * 1000
-        
+
         logger.error(f"[LATENCY] Namespace extraction | namespace={namespace}, duration={extract_duration:.2f}ms")
-        
+
         # Get namespace record (with caching)
         namespace_start = time.time()
         record = await self.get_namespace_record(namespace)
         namespace_duration = (time.time() - namespace_start) * 1000
-        
+
         if not record:
             total_duration = (time.time() - plugin_start_time) * 1000
             logger.warning(
@@ -472,7 +475,7 @@ class AuthHeaderInjectorPlugin(Plugin):
                 modified_payload=payload,
                 continue_processing=True,
             )
-        
+
         uid = record.get("uid")
         if not uid:
             total_duration = (time.time() - plugin_start_time) * 1000
@@ -494,9 +497,9 @@ class AuthHeaderInjectorPlugin(Plugin):
         headers["Authorization"] = f"Bearer {bearer_token}"
         payload.headers = HttpHeaderPayload(root=headers)
         header_duration = (time.time() - header_start) * 1000
-        
+
         total_duration = (time.time() - plugin_start_time) * 1000
-        
+
         logger.error(
             f"[LATENCY] Auth header injection complete | "
             f"namespace={namespace}, uid={uid[:8]}... | "
