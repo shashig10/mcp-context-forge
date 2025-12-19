@@ -322,7 +322,7 @@ class AuthHeaderInjectorPlugin(Plugin):
         for pattern, headers, description in self._compiled_patterns:
             if pattern.match(path):
                 matches.append((headers, description))
-        logger.debug(f"AuthHeaderInjectorPlugin Path '{path}' matched {len(matches)} patterns")
+        # logger.debug(f"AuthHeaderInjectorPlugin Path '{path}' matched {len(matches)} patterns")
         return matches
 
     def extract_nameSpace(self, url: str) -> str:
@@ -355,14 +355,14 @@ class AuthHeaderInjectorPlugin(Plugin):
         # cache_check_duration = (time.time() - cache_check_start) * 1000  # Convert to ms
 
         if cached_token is not None:
-            total_duration = (time.time() - start_time) * 1000
-            logger.error(
-                f"[LATENCY] Bearer token cache HIT for uid={uid} | "
-                f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
-            )
+            # total_duration = (time.time() - start_time) * 1000
+            # logger.error(
+            #     f"[LATENCY] Bearer token cache HIT for uid={uid} | "
+            #     f"cache_check={cache_check_duration:.2f}ms, total={total_duration:.2f}ms"
+            # )
             return cached_token
 
-        logger.error(f"[LATENCY] Bearer token cache MISS for uid={uid} | cache_check={cache_check_duration:.2f}ms")
+        # logger.error(f"[LATENCY] Bearer token cache MISS for uid={uid} | cache_check={cache_check_duration:.2f}ms")
 
         # Fetch new token
         # fetch_start = time.time()
