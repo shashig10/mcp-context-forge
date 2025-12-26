@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -144,19 +144,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fd/3c/53c4a17a05fb9ea2313ee1777ff53f5e001aefd5cc85aa2f4c2d982e1e38/aioitertools-0.13.0.tar.gz", hash = "sha256:620bd241acc0bbb9ec819f1ab215866871b4bbd1f73836a55f799200ee86950c", size = 19322, upload-time = "2025-11-06T22:17:07.609Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/a1/510b0a7fadc6f43a6ce50152e69dbd86415240835868bb0bd9b5b88b1e06/aioitertools-0.13.0-py3-none-any.whl", hash = "sha256:0be0292b856f08dfac90e31f4739432f4cb6d7520ab9eb73e143f4f2fa5259be", size = 24182, upload-time = "2025-11-06T22:17:06.502Z" },
-]
-
-[[package]]
-name = "aioredis"
-version = "2.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "async-timeout" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/cf/9eb144a0b05809ffc5d29045c4b51039000ea275bc1268d0351c9e7dfc06/aioredis-2.0.1.tar.gz", hash = "sha256:eaa51aaf993f2d71f54b70527c440437ba65340588afeb786cd87c55c89cd98e", size = 111047, upload-time = "2021-12-27T20:28:17.557Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9b/a9/0da089c3ae7a31cbcd2dcf0214f6f571e1295d292b6139e2bac68ec081d0/aioredis-2.0.1-py3-none-any.whl", hash = "sha256:9ac0d0b3b485d293b8ca1987e6de8658d7dafcca1cddfcd1d506cae8cdebfdd6", size = 71243, upload-time = "2021-12-27T20:28:16.36Z" },
 ]
 
 [[package]]
@@ -2718,7 +2705,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aioboto3" },
     { name = "aiohttp" },
-    { name = "aioredis" },
     { name = "alembic" },
     { name = "argon2-cffi" },
     { name = "boto3" },
@@ -2907,7 +2893,6 @@ requires-dist = [
     { name = "agent-lifecycle-toolkit", marker = "extra == 'toolops'", specifier = ">=0.9.0" },
     { name = "aioboto3", specifier = ">=7.0.0" },
     { name = "aiohttp", specifier = ">=3.13.2" },
-    { name = "aioredis", specifier = ">=2.0.1" },
     { name = "aiosqlite", marker = "extra == 'aiosqlite'", specifier = ">=0.22.0" },
     { name = "alembic", specifier = ">=1.17.2" },
     { name = "alembic", marker = "extra == 'alembic'", specifier = ">=1.17.2" },
@@ -2967,8 +2952,8 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'fuzz'", specifier = ">=3.8.0" },
     { name = "python-json-logger", specifier = ">=4.0.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "redis", specifier = ">=7.0.1" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=7.1.0" },
+    { name = "redis", extras = ["async"], specifier = ">=7.0.1" },
     { name = "requests-oauthlib", specifier = ">=2.0.0" },
     { name = "schemathesis", marker = "extra == 'fuzz'", specifier = ">=4.7.5" },
     { name = "setuptools", specifier = ">=80.9.0" },

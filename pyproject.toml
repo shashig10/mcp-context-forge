@@ -80,10 +80,9 @@ dependencies = [
     "typer>=0.20.0",
     "uvicorn>=0.38.0",
     "zeroconf>=0.148.0",
-    "redis>=7.0.1",
+    "redis[async]>=7.0.1",
     "boto3>=1.42.2",
     "aioboto3>=7.0.0",
-    "aioredis>=2.0.1",
     "setuptools>=80.9.0",
 ]
 

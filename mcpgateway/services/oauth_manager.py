@@ -61,7 +61,7 @@ async def _get_redis_client():
     if settings.cache_type == "redis" and settings.redis_url:
         try:
             # Third-Party
-            import aioredis  # pylint: disable=import-outside-toplevel
+            import redis.asyncio as aioredis  # pylint: disable=import-outside-toplevel
 
             _redis_client = await aioredis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
             # Test connection
