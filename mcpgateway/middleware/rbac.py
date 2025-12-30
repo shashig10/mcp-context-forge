@@ -37,8 +37,14 @@ security = HTTPBearer(auto_error=False)
 def get_db() -> Generator[Session, None, None]:
     """Get database session for dependency injection.
 
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
     Yields:
         Session: SQLAlchemy database session
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
 
     Examples:
         >>> gen = get_db()
@@ -49,6 +55,16 @@ def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
     finally:
         db.close()
 
@@ -142,7 +158,7 @@ async def get_current_user_with_permissions(
 
         # Extract user from token using the email auth function
         # Pass request to get_current_user so plugins can store auth_method in request.state
-        user = await get_current_user(credentials, db, request=request)
+        user = await get_current_user(credentials, request=request)
 
         # Read auth_method and request_id from request.state
         # (auth_method set by plugin in get_current_user, request_id set by HTTP middleware)

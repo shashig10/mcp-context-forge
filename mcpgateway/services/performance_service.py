@@ -43,6 +43,26 @@ from mcpgateway.schemas import (
     SystemMetricsSchema,
     WorkerMetrics,
 )
+from mcpgateway.utils.redis_client import get_redis_client
+
+# Cache import (lazy to avoid circular dependencies)
+_ADMIN_STATS_CACHE = None
+
+
+def _get_admin_stats_cache():
+    """Get admin stats cache singleton lazily.
+
+    Returns:
+        AdminStatsCache instance.
+    """
+    global _ADMIN_STATS_CACHE  # pylint: disable=global-statement
+    if _ADMIN_STATS_CACHE is None:
+        # First-Party
+        from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
+
+        _ADMIN_STATS_CACHE = admin_stats_cache
+    return _ADMIN_STATS_CACHE
+
 
 # Optional psutil import
 try:
@@ -405,7 +425,11 @@ class PerformanceService:
             return metrics
 
         try:
-            client = aioredis.Redis.from_url(settings.redis_url)
+            # Use shared Redis client from factory
+            client = await get_redis_client()
+            if not client:
+                return metrics
+
             info = await client.info()
 
             metrics.connected = True
@@ -424,7 +448,7 @@ class PerformanceService:
             if total > 0:
                 metrics.hit_rate = round((hits / total) * 100, 2)
 
-            await client.close()
+            # Don't close the shared client
         except Exception as e:
             logger.warning(f"Error collecting Redis metrics: {e}")
             metrics.connected = False
@@ -534,7 +558,7 @@ class PerformanceService:
             db.rollback()
             return 0
 
-    def get_history(
+    async def get_history(
         self,
         db: Session,
         period_type: str = "hourly",
@@ -556,6 +580,18 @@ class PerformanceService:
         Returns:
             PerformanceHistoryResponse: Historical aggregates.
         """
+        # Build cache key from parameters
+        start_str = start_time.isoformat() if start_time else "none"
+        end_str = end_time.isoformat() if end_time else "none"
+        host_str = host or "all"
+        cache_key = f"{period_type}:{start_str}:{end_str}:{host_str}:{limit}"
+
+        # Check cache first
+        cache = _get_admin_stats_cache()
+        cached = await cache.get_performance_history(cache_key)
+        if cached is not None:
+            return PerformanceHistoryResponse.model_validate(cached)
+
         query = db.query(PerformanceAggregate).filter(PerformanceAggregate.period_type == period_type)
 
         if start_time:
@@ -568,11 +604,16 @@ class PerformanceService:
         total_count = query.count()
         aggregates = query.order_by(desc(PerformanceAggregate.period_start)).limit(limit).all()
 
-        return PerformanceHistoryResponse(
+        result = PerformanceHistoryResponse(
             aggregates=[PerformanceAggregateRead.model_validate(a) for a in aggregates],
             period_type=period_type,
             total_count=total_count,
         )
+
+        # Store in cache
+        await cache.set_performance_history(result.model_dump(), cache_key)
+
+        return result
 
     def create_hourly_aggregate(self, db: Session, hour_start: datetime) -> Optional[PerformanceAggregate]:
         """Create an hourly aggregate from snapshots.

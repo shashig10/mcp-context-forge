@@ -53,6 +53,10 @@ MCP Gateway provides flexible logging with **stdout/stderr by default** and **op
 | `LOG_ROTATION_ENABLED`  | **Enable log file rotation**       | **`false`**       | **`true`, `false`**         |
 | `LOG_MAX_SIZE_MB`       | Max file size before rotation (MB) | `1`               | `10`, `50`, `100`           |
 | `LOG_BACKUP_COUNT`      | Number of backup files to keep     | `5`               | `3`, `10`, `0` (no backups) |
+| `STRUCTURED_LOGGING_DATABASE_ENABLED` | **Persist logs to database** | **`false`** | **`true`, `false`** |
+| `AUDIT_TRAIL_ENABLED` | **Enable audit trail logging for compliance** | **`false`** | **`true`, `false`** |
+| `SECURITY_LOGGING_ENABLED` | **Enable security event logging** | **`false`** | **`true`, `false`** |
+| `SECURITY_LOGGING_LEVEL` | Security logging verbosity level | `failures_only` | `all`, `failures_only`, `high_severity` |
 
 ### Logging Behavior
 
@@ -94,6 +98,81 @@ LOG_FOLDER=./logs
 LOG_FILE=debug.log
 LOG_FORMAT=text
 ```
+
+---
+
+## 📋 Audit Trail Logging
+
+Audit trail logging records all CRUD operations (create, read, update, delete) on resources for compliance purposes. **This is disabled by default for performance**.
+
+### Configuration
+
+```bash
+# Audit trail logging - disabled by default for performance
+AUDIT_TRAIL_ENABLED=false
+```
+
+### What Gets Logged
+
+When enabled, all API operations are recorded in the `audit_trails` table:
+
+- **Create** - New tools, servers, gateways, resources, prompts
+- **Read** - View operations on any resource
+- **Update** - Modifications with before/after values
+- **Delete** - Deletions with snapshot of deleted data
+
+### Use Cases
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Production compliance (SOC2, HIPAA, GDPR) | `AUDIT_TRAIL_ENABLED=true` |
+| Load testing / benchmarking | `AUDIT_TRAIL_ENABLED=false` |
+| Development / debugging | `AUDIT_TRAIL_ENABLED=false` |
+
+!!! warning "Performance Impact"
+    Enabling audit trails causes a **database write on every API request**. During load testing with 2000 concurrent users, this can generate ~1 million rows in a few hours, consuming 788+ MB of database space and causing PostgreSQL memory pressure. **Always disable for load testing.**
+
+### Audit Trails Table
+
+Query audit trails via the API: `GET /api/logs/audit-trails`
+
+---
+
+## 🔐 Security Event Logging
+
+Security event logging records authentication attempts, authorization failures, and other security-relevant events to the database. **This is disabled by default for performance**.
+
+### Configuration
+
+```bash
+# Security event logging - disabled by default for performance
+SECURITY_LOGGING_ENABLED=false
+
+# Security logging level controls what gets logged
+SECURITY_LOGGING_LEVEL=failures_only  # all, failures_only, high_severity
+```
+
+### Logging Levels
+
+| Level | Description | Use Case |
+|-------|-------------|----------|
+| `all` | Log all events including successful authentications | Debugging, compliance auditing (high DB load) |
+| `failures_only` | Log only authentication/authorization failures | Production monitoring without excessive writes |
+| `high_severity` | Log only high/critical severity events | Minimal logging for high-traffic environments |
+
+!!! warning "Performance Impact"
+    Setting `SECURITY_LOGGING_LEVEL=all` logs **every authenticated request** to the database. During load testing, this can generate 300+ database writes per second, causing significant performance degradation. Use `failures_only` or `high_severity` in production.
+
+### Security Events Table
+
+When enabled, events are stored in the `security_events` table:
+
+- Authentication success/failure
+- Authorization denials
+- Rate limiting triggers
+- Suspicious activity detection
+
+Query security events via the API: `GET /api/logs/security-events`
 
 ---
 
@@ -295,6 +374,71 @@ You can:
 * Mount log files to a sidecar container
 * Use a logging agent (e.g., Filebeat)
 * Pipe logs to syslog-compatible services
+
+---
+
+## 🗄️ Database Log Persistence
+
+MCP Gateway can optionally persist structured logs to the database for advanced search, request tracing, and performance metrics. **This feature is disabled by default for performance reasons.**
+
+### Enabling Database Logging
+
+```bash
+# Enable database persistence for logs
+STRUCTURED_LOGGING_DATABASE_ENABLED=true
+```
+
+### Features When Enabled
+
+When `STRUCTURED_LOGGING_DATABASE_ENABLED=true`, you get:
+
+| Feature | API Endpoint | Description |
+|---------|--------------|-------------|
+| **Log Search** | `POST /api/logs/search` | Search logs by level, component, user, time range, correlation ID |
+| **Request Tracing** | `GET /api/logs/trace/{correlation_id}` | View all logs, security events, and audit trails for a single request |
+| **Performance Metrics** | `GET /api/logs/performance-metrics` | Aggregated p50/p95/p99 latencies, error rates by component |
+| **Security Events** | `GET /api/logs/security-events` | Authentication failures, threat detection, security audit |
+| **Audit Trails** | `GET /api/logs/audit-trails` | CRUD operations, data access compliance logging |
+
+### Example: Search Logs via API
+
+```bash
+# Search for error logs in the last hour
+curl -X POST "http://localhost:4444/api/logs/search" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "level": ["ERROR", "CRITICAL"],
+    "limit": 50,
+    "sort_order": "desc"
+  }'
+
+# Trace all logs for a specific request
+curl "http://localhost:4444/api/logs/trace/abc-123-correlation-id" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Performance Considerations
+
+!!! warning "Performance Impact"
+    When enabled, **each log entry triggers a synchronous database write**. This can significantly impact performance under high load.
+
+**Recommendations:**
+
+- **Disable in production** if you use an external log aggregator (ELK, Datadog, Splunk)
+- **Enable for development** or low-traffic deployments where built-in search is useful
+- **Consider external logging** for high-throughput production environments
+
+### When to Enable vs Disable
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Development/testing | ✅ Enable - useful for debugging |
+| Low-traffic production | ✅ Enable - built-in observability |
+| High-traffic production | ❌ Disable - use external aggregator |
+| Using ELK/Datadog/Splunk | ❌ Disable - redundant storage |
+| Need request tracing | ✅ Enable - correlation ID tracing |
+| Performance-critical | ❌ Disable - avoid DB I/O overhead |
 
 ---
 

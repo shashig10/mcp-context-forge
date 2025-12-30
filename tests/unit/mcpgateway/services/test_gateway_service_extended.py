@@ -306,10 +306,6 @@ class TestGatewayServiceExtended:
         service = GatewayService()
         service._health_check_interval = 0.1  # Short interval for testing
 
-        # Mock database session
-        mock_db = MagicMock()
-        service._get_db = MagicMock(return_value=mock_db)
-
         # Mock gateways
         mock_gateway1 = MagicMock()
         mock_gateway1.id = "gateway1"
@@ -335,8 +331,8 @@ class TestGatewayServiceExtended:
         with patch("mcpgateway.services.gateway_service.settings") as mock_settings:
             mock_settings.cache_type = "none"
 
-            # Run health checks for a short time
-            health_check_task = asyncio.create_task(service._run_health_checks(service._get_db, "user@example.com"))
+            # Run health checks for a short time (no db parameter - uses fresh_db_session internally)
+            health_check_task = asyncio.create_task(service._run_health_checks("user@example.com"))
             await asyncio.sleep(0.2)
             health_check_task.cancel()
 
@@ -426,21 +422,29 @@ class TestGatewayServiceExtended:
     @pytest.mark.asyncio
     async def test_init_with_redis_enabled(self):
         """Test initialization with Redis enabled (lines 233-236)."""
-        with patch("mcpgateway.services.gateway_service.REDIS_AVAILABLE", True):
-            with patch("mcpgateway.services.gateway_service.redis") as mock_redis:
-                mock_redis_client = MagicMock()
-                mock_redis.from_url.return_value = mock_redis_client
+        mock_redis_client = AsyncMock()
+        mock_redis_client.ping = AsyncMock()
+        mock_redis_client.set = AsyncMock(return_value=True)
 
+        async def mock_get_redis_client():
+            return mock_redis_client
+
+        with patch("mcpgateway.services.gateway_service.REDIS_AVAILABLE", True):
+            with patch("mcpgateway.services.gateway_service.get_redis_client", mock_get_redis_client):
                 with patch("mcpgateway.services.gateway_service.settings") as mock_settings:
                     mock_settings.cache_type = "redis"
                     mock_settings.redis_url = "redis://localhost:6379"
+                    mock_settings.redis_leader_key = "gateway_service_leader"
+                    mock_settings.redis_leader_ttl = 15
+                    mock_settings.redis_leader_heartbeat_interval = 5
 
                     service = GatewayService()
+                    await service.initialize()
 
                     assert service._redis_client is mock_redis_client
                     assert isinstance(service._instance_id, str)
                     assert service._leader_key == "gateway_service_leader"
-                    assert service._leader_ttl == 40
+                    assert service._leader_ttl == 15
 
     @pytest.mark.asyncio
     async def test_init_with_file_cache_path_adjustment(self):

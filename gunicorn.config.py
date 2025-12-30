@@ -26,10 +26,10 @@ from mcpgateway.config import settings
 # Bind to exactly what .env (or defaults) says
 bind = f"{settings.host}:{settings.port}"
 
-workers = 8  # A positive integer generally in the 2-4 x $(NUM_CORES)
+workers = 2  # A positive integer generally in the 2-4 x $(NUM_CORES)
 timeout = 600  # Set a timeout of 600
 loglevel = "info"  # debug info warning error critical
-max_requests = 10000  # The maximum number of requests a worker will process before restarting
+max_requests = 100000  # The maximum number of requests a worker will process before restarting
 max_requests_jitter = 100  # The maximum jitter to add to the max_requests setting.
 
 # Optimization https://docs.gunicorn.org/en/stable/settings.html#preload-app
@@ -107,6 +107,14 @@ def when_ready(server):
 
 def post_fork(server, worker):
     server.log.info("Worker spawned (pid: %s)", worker.pid)
+    # Reset Redis client state so each worker creates its own connection
+    # This is necessary because --preload causes the client to be initialized
+    # in the master process, but each forked worker needs its own event loop
+    try:
+        from mcpgateway.utils.redis_client import _reset_client
+        _reset_client()
+    except ImportError:
+        pass
 
 
 def post_worker_init(worker):

@@ -308,7 +308,8 @@ class TestPromptService:
         upd = PromptUpdate(description="new desc", template="Hi, {{ name }}!")
         res = await prompt_service.update_prompt(test_db, 1, upd)
 
-        test_db.commit.assert_called_once()
+        # commit called twice: once for update, once in _get_team_name to release transaction
+        assert test_db.commit.call_count == 2
         prompt_service._notify_prompt_updated.assert_called_once()
         assert res["description"] == "new desc"
         assert res["template"] == "Hi, {{ name }}!"
@@ -514,18 +515,19 @@ class TestPromptService:
 
     @pytest.mark.asyncio
     async def test_aggregate_and_reset_metrics(self, prompt_service, test_db):
-        # Metrics numbers to be returned by scalar() calls
-        test_db.execute = Mock(
-            side_effect=[
-                _make_execute_result(scalar=10),  # total
-                _make_execute_result(scalar=8),  # successful
-                _make_execute_result(scalar=2),  # failed
-                _make_execute_result(scalar=0.1),  # min_rt
-                _make_execute_result(scalar=0.9),  # max_rt
-                _make_execute_result(scalar=0.5),  # avg_rt
-                _make_execute_result(scalar=datetime(2025, 1, 1, tzinfo=timezone.utc)),  # last_time
-            ]
-        )
+        # Mock a single aggregated query result with .one() call
+        mock_result = MagicMock()
+        mock_result.total_executions = 10
+        mock_result.successful_executions = 8
+        mock_result.failed_executions = 2
+        mock_result.min_response_time = 0.1
+        mock_result.max_response_time = 0.9
+        mock_result.avg_response_time = 0.5
+        mock_result.last_execution_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+        execute_result = MagicMock()
+        execute_result.one.return_value = mock_result
+        test_db.execute = Mock(return_value=execute_result)
 
         metrics = await prompt_service.aggregate_metrics(test_db)
         assert metrics["total_executions"] == 10
@@ -573,8 +575,9 @@ class TestPromptService:
                 assert called_args[0] is session  # session passed through
                 # third positional arg is the tags list (signature: session, col, values, match_any=True)
                 assert called_args[2] == ["test", "production"]
-                # and the fake condition returned must have been passed to where()
-                mock_query.where.assert_called_with(fake_condition)
+                # and the fake condition returned must have been passed to where() at some point
+                # (there may be multiple where() calls for enabled filter and tags filter)
+                mock_query.where.assert_any_call(fake_condition)
                 # finally, your service should return the list produced by mock_db.execute(...)
                 assert isinstance(result, list)
                 assert len(result) == 1

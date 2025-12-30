@@ -19,8 +19,10 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 # First-Party
+from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.db import Gateway as DbGateway
 from mcpgateway.db import Tool as DbTool
+from mcpgateway.config import settings
 from mcpgateway.plugins.framework import PluginManager
 from mcpgateway.schemas import AuthenticationValues, ToolCreate, ToolRead, ToolUpdate
 from mcpgateway.services.tool_service import (
@@ -34,16 +36,70 @@ from mcpgateway.services.tool_service import (
     ToolValidationError,
 )
 from mcpgateway.utils.services_auth import encode_auth
+from mcpgateway.utils.pagination import decode_cursor
 
 
 @pytest.fixture(autouse=True)
 def mock_logging_services():
     """Mock audit_trail and structured_logger to prevent database writes during tests."""
-    with patch("mcpgateway.services.tool_service.audit_trail") as mock_audit, \
-         patch("mcpgateway.services.tool_service.structured_logger") as mock_logger:
+    with patch("mcpgateway.services.tool_service.audit_trail") as mock_audit, patch("mcpgateway.services.tool_service.structured_logger") as mock_logger:
         mock_audit.log_action = MagicMock(return_value=None)
         mock_logger.log = MagicMock(return_value=None)
         yield {"audit_trail": mock_audit, "structured_logger": mock_logger}
+
+
+@pytest.fixture(autouse=True)
+def mock_fresh_db_session():
+    """Mock fresh_db_session context manager to prevent real DB operations during tests.
+
+    This is needed because invoke_tool now uses fresh_db_session for metrics recording.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def mock_fresh_session():
+        mock_db = MagicMock()
+        yield mock_db
+
+    with patch("mcpgateway.services.tool_service.fresh_db_session", mock_fresh_session):
+        yield
+
+
+@pytest.fixture
+def mock_global_config_obj():
+    """Create a mock GlobalConfig object for tests.
+
+    This is needed because invoke_tool queries GlobalConfig for passthrough headers.
+    """
+    config = MagicMock()
+    config.passthrough_headers = ["X-Tenant-Id", "X-Request-Id"]
+    return config
+
+
+def setup_db_execute_mock(test_db, mock_tool, mock_global_config):
+    """Helper to set up test_db.execute to return tool for queries.
+
+    invoke_tool() makes db.execute() calls for tool queries.
+    GlobalConfig is now cached via global_config_cache (Issue #1715),
+    so db.execute() only needs to return the tool.
+
+    Args:
+        test_db: The mock database session.
+        mock_tool: The mock tool to return for tool queries.
+        mock_global_config: The mock GlobalConfig to return for config queries.
+    """
+    # Invalidate cache to ensure fresh state for each test
+    global_config_cache.invalidate()
+
+    # db.execute() always returns the tool (GlobalConfig is now cached)
+    mock_scalar_tool = Mock()
+    mock_scalar_tool.scalar_one_or_none.return_value = mock_tool
+    test_db.execute = Mock(return_value=mock_scalar_tool)
+
+    # Mock db.query() for GlobalConfig cache (Issue #1715)
+    mock_query_result = Mock()
+    mock_query_result.first.return_value = mock_global_config
+    test_db.query = Mock(return_value=mock_query_result)
 
 
 @pytest.fixture
@@ -529,28 +585,119 @@ class TestToolService:
         )
         tool_service._convert_tool_to_read = Mock(return_value=tool_read)
 
+        # Mock DB to return a tuple of (tool, team_name) from LEFT JOIN
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
+        mock_row.team_name = None
+        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=[mock_row])))
+
         # Call method
         result, next_cursor = await tool_service.list_tools(test_db)
 
-        # Verify DB query: should be called twice
-        assert test_db.execute.call_count == 2
+        # Verify DB query: should be called once (LEFT JOIN optimization)
+        assert test_db.execute.call_count == 1
 
         # Verify result
         assert len(result) == 1
         assert result[0] == tool_read
         assert next_cursor is None  # No pagination needed for single result
-        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool)
+        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False)
+
+    @pytest.mark.asyncio
+    async def test_list_tools_for_user_pagination(self, tool_service, test_db, monkeypatch):
+        """Test list_tools_for_user returns next_cursor when page size is exceeded."""
+        monkeypatch.setattr(settings, "pagination_default_page_size", 1)
+
+        tool_1 = MagicMock(spec=DbTool, id="1")
+        tool_2 = MagicMock(spec=DbTool, id="2")
+
+        row_1 = MagicMock()
+        row_1.__getitem__ = lambda self, idx: tool_1 if idx == 0 else None
+        row_1.team_name = None
+
+        row_2 = MagicMock()
+        row_2.__getitem__ = lambda self, idx: tool_2 if idx == 0 else None
+        row_2.team_name = None
+
+        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=[row_1, row_2])))
+
+        mock_team = MagicMock(id="team-1", is_personal=True)
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
+            tool_service._convert_tool_to_read = Mock(side_effect=[MagicMock(), MagicMock()])
+
+            result, next_cursor = await tool_service.list_tools_for_user(test_db, user_email="user@example.com", team_id="team-1")
+
+        assert len(result) == 1
+        assert next_cursor is not None
+        assert decode_cursor(next_cursor)["id"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_list_tools_for_user_denies_unknown_team(self, tool_service, test_db):
+        """Test list_tools_for_user returns empty when user lacks team membership."""
+        test_db.execute = Mock()
+        mock_team = MagicMock(id="other-team", is_personal=True)
+
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
+            result, next_cursor = await tool_service.list_tools_for_user(test_db, user_email="user@example.com", team_id="team-1")
+
+        assert result == []
+        assert next_cursor is None
+        test_db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_tools_with_limit(self, tool_service, test_db, monkeypatch):
+        """Test list_tools respects custom limit parameter."""
+        monkeypatch.setattr(settings, "pagination_default_page_size", 50)
+        monkeypatch.setattr(settings, "pagination_max_page_size", 500)
+
+        tools = [MagicMock(spec=DbTool, id=str(i)) for i in range(150)]
+        rows = []
+        for tool in tools:
+            row = MagicMock()
+            row.__getitem__ = lambda self, idx, t=tool: t if idx == 0 else None
+            row.team_name = None
+            rows.append(row)
+
+        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=rows[:101])))  # 100 + 1 for has_more check
+        tool_service._convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
+
+        result, next_cursor = await tool_service.list_tools(test_db, limit=100)
+
+        assert len(result) == 100
+        assert next_cursor is not None  # More results available
+
+    @pytest.mark.asyncio
+    async def test_list_tools_with_limit_zero_returns_all(self, tool_service, test_db, monkeypatch):
+        """Test list_tools with limit=0 returns all tools without pagination."""
+        monkeypatch.setattr(settings, "pagination_default_page_size", 50)
+
+        tools = [MagicMock(spec=DbTool, id=str(i)) for i in range(200)]
+        rows = []
+        for tool in tools:
+            row = MagicMock()
+            row.__getitem__ = lambda self, idx, t=tool: t if idx == 0 else None
+            row.team_name = None
+            rows.append(row)
+
+        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=rows)))
+        tool_service._convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
+
+        result, next_cursor = await tool_service.list_tools(test_db, limit=0)
+
+        assert len(result) == 200
+        assert next_cursor is None  # No pagination when limit=0
 
     @pytest.mark.asyncio
     async def test_list_inactive_tools(self, tool_service, mock_tool, test_db):
         """Test listing tools."""
-        # Mock DB to return a list of tools
-        mock_scalars = MagicMock()
+        # Mock DB to return a tuple of (tool, team_name) from LEFT JOIN
         mock_tool.enabled = False
-        mock_scalars.all.return_value = [mock_tool]
-        mock_scalar_result = MagicMock()
-        mock_scalar_result.scalars.return_value = mock_scalars
-        mock_execute = Mock(return_value=mock_scalar_result)
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
+        mock_row.team_name = None
+        mock_execute = Mock(return_value=MagicMock(all=Mock(return_value=[mock_row])))
         test_db.execute = mock_execute
 
         # Mock conversion
@@ -592,25 +739,23 @@ class TestToolService:
         # Call method
         result, _ = await tool_service.list_tools(test_db, include_inactive=True)
 
-        # Verify DB query: should be called twice
-        assert test_db.execute.call_count == 2
+        # Verify DB query: should be called once (LEFT JOIN optimization)
+        assert test_db.execute.call_count == 1
 
         # Verify result
         assert len(result) == 1
         assert result[0] == tool_read
-        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool)
+        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False)
 
     @pytest.mark.asyncio
     async def test_list_server_tools_active_only(self):
         mock_db = Mock()
-        mock_scalars = Mock()
         mock_tool = Mock(enabled=True, team_id=None)
-        mock_scalars.all.return_value = [mock_tool]
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
+        mock_row.team_name = None
 
-        mock_db.execute.return_value.scalars.return_value = mock_scalars
-
-        # Mock the db.query() call for team fetching
-        mock_db.query.return_value.filter.return_value.all.return_value = []
+        mock_db.execute.return_value.all.return_value = [mock_row]
 
         service = ToolService()
         service._convert_tool_to_read = Mock(return_value="converted_tool")
@@ -623,15 +768,18 @@ class TestToolService:
     @pytest.mark.asyncio
     async def test_list_server_tools_include_inactive(self):
         mock_db = Mock()
-        mock_scalars = Mock()
         active_tool = Mock(enabled=True, reachable=True, team_id=None)
         inactive_tool = Mock(enabled=False, reachable=True, team_id=None)
-        mock_scalars.all.return_value = [active_tool, inactive_tool]
 
-        mock_db.execute.return_value.scalars.return_value = mock_scalars
+        active_row = MagicMock()
+        active_row.__getitem__ = lambda self, idx: active_tool if idx == 0 else None
+        active_row.team_name = None
 
-        # Mock the db.query() call for team fetching
-        mock_db.query.return_value.filter.return_value.all.return_value = []
+        inactive_row = MagicMock()
+        inactive_row.__getitem__ = lambda self, idx: inactive_tool if idx == 0 else None
+        inactive_row.team_name = None
+
+        mock_db.execute.return_value.all.return_value = [active_row, inactive_row]
 
         service = ToolService()
         service._convert_tool_to_read = Mock(side_effect=["active_converted", "inactive_converted"])
@@ -877,7 +1025,6 @@ class TestToolService:
         assert calls[0][0][0]["data"]["enabled"] is True
 
         assert calls[3][0][0]["data"] == tool_info
-
 
     @pytest.mark.asyncio
     async def test_publish_event_with_real_queue(self, tool_service):
@@ -1227,16 +1374,15 @@ class TestToolService:
         assert "Tool 'test_tool' exists but is inactive" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_rest_get(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_get(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         # ----------------  DB  -----------------
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "GET"
         mock_tool.jsonpath_filter = ""
         mock_tool.auth_value = None
 
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Set up mock to return tool for first query, GlobalConfig for second
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # --------------- HTTP ------------------
         mock_response = AsyncMock()
@@ -1249,19 +1395,25 @@ class TestToolService:
         tool_service._http_client.get = AsyncMock(return_value=mock_response)
 
         # ------------- metrics -----------------
-        tool_service._record_tool_metric = AsyncMock()
+        # Mock the metrics buffer service
+        mock_metrics_buffer = Mock()
+        with patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service", return_value=mock_metrics_buffer):
+            # -------------- invoke -----------------
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
-        # -------------- invoke -----------------
-        result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
-
-        # ------------- asserts -----------------
-        tool_service._http_client.get.assert_called_once_with(
-            mock_tool.url,
-            params={},  # payload is empty
-            headers=mock_tool.headers,
-        )
-        assert result.content[0].text == '{\n  "result": "REST tool response"\n}'
-        tool_service._record_tool_metric.assert_called_once_with(test_db, mock_tool, ANY, True, None)
+            # ------------- asserts -----------------
+            tool_service._http_client.get.assert_called_once_with(
+                mock_tool.url,
+                params={},  # payload is empty
+                headers=mock_tool.headers,
+            )
+            assert result.content[0].text == '{\n  "result": "REST tool response"\n}'
+            # Verify metrics were recorded via buffer service
+            mock_metrics_buffer.record_tool_metric.assert_called_once()
+            call_kwargs = mock_metrics_buffer.record_tool_metric.call_args[1]
+            assert call_kwargs["tool_id"] == str(mock_tool.id)
+            assert call_kwargs["success"] is True
+            assert call_kwargs["error_message"] is None
 
         # Test 204 status
         mock_response = AsyncMock()
@@ -1272,7 +1424,7 @@ class TestToolService:
         tool_service._http_client.get = AsyncMock(return_value=mock_response)
 
         # ------------- metrics -----------------
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         # -------------- invoke -----------------
         result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
@@ -1288,7 +1440,7 @@ class TestToolService:
         tool_service._http_client.get = AsyncMock(return_value=mock_response)
 
         # ------------- metrics -----------------
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         # -------------- invoke -----------------
         result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
@@ -1296,7 +1448,7 @@ class TestToolService:
         assert result.content[0].text == "Tool error encountered"
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_rest_post(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_post(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking a REST tool."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
@@ -1304,10 +1456,8 @@ class TestToolService:
         mock_tool.jsonpath_filter = ""
         mock_tool.auth_value = None  # No auth
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -1316,37 +1466,36 @@ class TestToolService:
         mock_response.json = Mock(return_value={"result": "REST tool response"})  # Make json() synchronous
         tool_service._http_client.request.return_value = mock_response
 
-        # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
-
-        # Mock decode_auth to return empty dict when auth_value is None
-        # Mock extract_using_jq to return the input unmodified when filter is empty
-        with patch("mcpgateway.services.tool_service.decode_auth", return_value={}), patch("mcpgateway.services.tool_service.extract_using_jq", return_value={"result": "REST tool response"}):
+        # Mock metrics buffer service and other dependencies
+        mock_metrics_buffer = Mock()
+        with (
+            patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service", return_value=mock_metrics_buffer),
+            patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
+            patch("mcpgateway.services.tool_service.extract_using_jq", return_value={"result": "REST tool response"}),
+        ):
             # Invoke tool
             result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
 
-        # Verify HTTP request
-        tool_service._http_client.request.assert_called_once_with(
-            "POST",
-            mock_tool.url,
-            json={"param": "value"},
-            headers=mock_tool.headers,
-        )
+            # Verify HTTP request
+            tool_service._http_client.request.assert_called_once_with(
+                "POST",
+                mock_tool.url,
+                json={"param": "value"},
+                headers=mock_tool.headers,
+            )
 
-        # Verify result
-        assert result.content[0].text == '{\n  "result": "REST tool response"\n}'
+            # Verify result
+            assert result.content[0].text == '{\n  "result": "REST tool response"\n}'
 
-        # Verify metrics recorded
-        tool_service._record_tool_metric.assert_called_once_with(
-            test_db,
-            mock_tool,
-            ANY,  # Start time
-            True,  # Success
-            None,  # No error
-        )
+            # Verify metrics recorded via buffer service
+            mock_metrics_buffer.record_tool_metric.assert_called_once()
+            call_kwargs = mock_metrics_buffer.record_tool_metric.call_args[1]
+            assert call_kwargs["tool_id"] == str(mock_tool.id)
+            assert call_kwargs["success"] is True
+            assert call_kwargs["error_message"] is None
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_rest_parameter_substitution(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_parameter_substitution(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking a REST tool."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
@@ -1357,10 +1506,8 @@ class TestToolService:
 
         payload = {"id": 123, "type": "summary", "other_param": "value"}
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         mock_response = Mock()
         mock_response.raise_for_status = Mock()
@@ -1379,7 +1526,7 @@ class TestToolService:
         )
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_rest_parameter_substitution_missed_input(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_parameter_substitution_missed_input(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking a REST tool."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
@@ -1390,10 +1537,8 @@ class TestToolService:
 
         payload = {"id": 123, "other_param": "value"}
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         with pytest.raises(ToolInvocationError) as exc_info:
             await tool_service.invoke_tool(test_db, "test_tool", payload, request_headers=None)
@@ -1590,7 +1735,7 @@ class TestToolService:
         assert metric.response_time >= 0  # You can check with a tolerance if needed
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_invalid_tool_type(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_invalid_tool_type(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking an invalid tool type."""
         # Configure tool as REST
         mock_tool.integration_type = "ABC"
@@ -1601,10 +1746,8 @@ class TestToolService:
 
         payload = {"param": "value"}
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         response = await tool_service.invoke_tool(test_db, "test_tool", payload, request_headers=None)
 
@@ -1640,7 +1783,7 @@ class TestToolService:
         mock_gateway.enabled = True
         mock_gateway.reachable = True
         mock_gateway.id = mock_tool.gateway_id
-        mock_gateway.slug="test-gateway"
+        mock_gateway.slug = "test-gateway"
         mock_gateway.capabilities = {"tools": {"listChanged": True}}
         mock_gateway.transport = "SSE"
         mock_gateway.passthrough_headers = []
@@ -1707,40 +1850,37 @@ class TestToolService:
         )
 
     @pytest.mark.asyncio
-    async def test_invoke_tool_error(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_error(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking a tool that returns an error."""
         # Configure tool
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None  # No auth
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
-        # Mock decode_auth to return empty dict
-        with patch("mcpgateway.services.tool_service.decode_auth", return_value={}):
-            # Mock HTTP client to raise an error
-            tool_service._http_client.request.side_effect = Exception("HTTP error")
+        # Mock HTTP client to raise an error
+        tool_service._http_client.request.side_effect = Exception("HTTP error")
 
-            # Mock metrics recording
-            tool_service._record_tool_metric = AsyncMock()
-
+        # Mock metrics buffer service and decode_auth
+        mock_metrics_buffer = Mock()
+        with (
+            patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service", return_value=mock_metrics_buffer),
+            patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
+        ):
             # Should raise ToolInvocationError
             with pytest.raises(ToolInvocationError) as exc_info:
                 await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
 
             assert "Tool invocation failed: HTTP error" in str(exc_info.value)
 
-            # Verify metrics recorded with error
-            tool_service._record_tool_metric.assert_called_once_with(
-                test_db,
-                mock_tool,
-                ANY,  # Start time
-                False,  # Failed
-                "HTTP error",  # Error message
-            )
+            # Verify metrics recorded with error via buffer service
+            mock_metrics_buffer.record_tool_metric.assert_called_once()
+            call_kwargs = mock_metrics_buffer.record_tool_metric.call_args[1]
+            assert call_kwargs["tool_id"] == str(mock_tool.id)
+            assert call_kwargs["success"] is False
+            assert call_kwargs["error_message"] == "HTTP error"
 
     @pytest.mark.asyncio
     async def test_reset_metrics(self, tool_service, test_db):
@@ -2023,7 +2163,12 @@ class TestToolService:
         mock_query.limit.return_value = mock_query
 
         session = MagicMock()
-        session.execute.return_value.scalars.return_value.all.return_value = [mock_tool]
+
+        # Mock LEFT JOIN row result
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
+        mock_row.team_name = "test-team"
+        session.execute.return_value.all.return_value = [mock_row]
 
         bind = MagicMock()
         bind.dialect = MagicMock()
@@ -2036,26 +2181,19 @@ class TestToolService:
                 fake_condition = MagicMock()
                 mock_json_contains.return_value = fake_condition
 
-                # Patch team name lookup to return a real string, not a MagicMock
-                mock_team = MagicMock()
-                mock_team.name = "test-team"
-                session.query().filter().first.return_value = mock_team
-
                 result, _ = await tool_service.list_tools(session, tags=["test", "production"])
 
-                # helper should be called once with the tags list (not once per tag)
-                mock_json_contains.assert_called_once()  # called exactly once
+                # json_contains_expr should be called once with the tags list
+                mock_json_contains.assert_called_once()
                 called_args = mock_json_contains.call_args[0]  # positional args tuple
                 assert called_args[0] is session  # session passed through
                 # third positional arg is the tags list (signature: session, col, values, match_any=True)
                 assert called_args[2] == ["test", "production"]
-                # and the fake condition returned must have been passed to where()
-                mock_query.where.assert_called_with(fake_condition)
-                # finally, your service should return the list produced by mock_db.execute(...)
+                # finally, your service should return the list produced by session.execute(...)
                 assert isinstance(result, list)
                 assert len(result) == 1
 
-    async def test_invoke_tool_rest_oauth_success(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_oauth_success(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking REST tool with successful OAuth authentication."""
         # Configure tool with OAuth
         mock_tool.integration_type = "REST"
@@ -2063,10 +2201,8 @@ class TestToolService:
         mock_tool.auth_type = "oauth"
         mock_tool.oauth_config = {"client_id": "test_id", "client_secret": "test_secret"}
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock OAuth manager
         tool_service.oauth_manager.get_access_token = AsyncMock(return_value="test_access_token")
@@ -2079,7 +2215,7 @@ class TestToolService:
         tool_service._http_client.request.return_value = mock_response
 
         # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         with patch("mcpgateway.services.tool_service.extract_using_jq", return_value={"result": "OAuth success"}):
             # Invoke tool
@@ -2098,7 +2234,7 @@ class TestToolService:
         # Verify result
         assert result.content[0].text == '{\n  "result": "OAuth success"\n}'
 
-    async def test_invoke_tool_rest_oauth_failure(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_rest_oauth_failure(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking REST tool with failed OAuth authentication."""
         # Configure tool with OAuth
         mock_tool.integration_type = "REST"
@@ -2106,16 +2242,14 @@ class TestToolService:
         mock_tool.auth_type = "oauth"
         mock_tool.oauth_config = {"client_id": "test_id", "client_secret": "test_secret"}
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock OAuth manager to fail
         tool_service.oauth_manager.get_access_token = AsyncMock(side_effect=Exception("OAuth failed"))
 
         # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         # Should raise ToolInvocationError
         with pytest.raises(ToolInvocationError) as exc_info:
@@ -2171,17 +2305,15 @@ class TestToolService:
         session_mock.initialize.assert_awaited_once()
         session_mock.call_tool.assert_awaited_once()
 
-    async def test_invoke_tool_with_passthrough_headers_rest(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_passthrough_headers_rest(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking REST tool with passthrough headers."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2190,9 +2322,9 @@ class TestToolService:
         mock_response.json = Mock(return_value={"result": "success with headers"})
         tool_service._http_client.request.return_value = mock_response
 
-        # Mock get_passthrough_headers to return modified headers
-        def mock_passthrough(req_headers, tool_headers, db_session):
-            combined = tool_headers.copy()
+        # Mock compute_passthrough_headers_cached to return modified headers
+        def mock_passthrough(req_headers, base_headers, allowed_headers, gateway_auth_type=None, gateway_passthrough_headers=None):
+            combined = base_headers.copy()
             combined["X-Request-ID"] = req_headers.get("X-Request-ID", "test-123")
             return combined
 
@@ -2200,7 +2332,7 @@ class TestToolService:
 
         with (
             patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
-            patch("mcpgateway.services.tool_service.get_passthrough_headers", side_effect=mock_passthrough),
+            patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=mock_passthrough),
             patch("mcpgateway.services.tool_service.extract_using_jq", return_value={"result": "success with headers"}),
         ):
             result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
@@ -2242,9 +2374,9 @@ class TestToolService:
         sse_ctx = AsyncMock()
         sse_ctx.__aenter__.return_value = ("read", "write")
 
-        # Mock get_passthrough_headers to return modified headers
-        def mock_passthrough(req_headers, tool_headers, db_session, gateway=None):
-            combined = tool_headers.copy()
+        # Mock compute_passthrough_headers_cached to return modified headers
+        def mock_passthrough(req_headers, base_headers, allowed_headers, gateway_auth_type=None, gateway_passthrough_headers=None):
+            combined = base_headers.copy()
             combined["X-Custom-Header"] = req_headers.get("X-Custom-Header", "default")
             return combined
 
@@ -2254,7 +2386,7 @@ class TestToolService:
             patch("mcpgateway.services.tool_service.sse_client", return_value=sse_ctx),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=client_session_cm),
             patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
-            patch("mcpgateway.services.tool_service.get_passthrough_headers", side_effect=mock_passthrough),
+            patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=mock_passthrough),
             patch("mcpgateway.services.tool_service.extract_using_jq", side_effect=lambda data, _filt: data),
         ):
             result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
@@ -2263,7 +2395,7 @@ class TestToolService:
         session_mock.initialize.assert_awaited_once()
         session_mock.call_tool.assert_awaited_once()
 
-    async def test_invoke_tool_with_plugin_post_invoke_success(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_plugin_post_invoke_success(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking tool with successful plugin post-invoke hook."""
         # First-Party
         from mcpgateway.plugins.framework.models import PluginResult
@@ -2274,10 +2406,8 @@ class TestToolService:
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2314,17 +2444,15 @@ class TestToolService:
         # Verify result
         assert result.content[0].text == '{\n  "result": "original response"\n}'
 
-    async def test_invoke_tool_with_plugin_post_invoke_modified_payload(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_plugin_post_invoke_modified_payload(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking tool with plugin post-invoke hook modifying payload."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2367,17 +2495,15 @@ class TestToolService:
         # Verify result was modified by plugin
         assert result.content[0].text == "Modified by plugin"
 
-    async def test_invoke_tool_with_plugin_post_invoke_invalid_modified_payload(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_plugin_post_invoke_invalid_modified_payload(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking tool with plugin post-invoke hook providing invalid modified payload."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2421,17 +2547,15 @@ class TestToolService:
         # Verify result was converted to string since format was invalid
         assert result.content[0].text == "Invalid format - not a dict"
 
-    async def test_invoke_tool_with_plugin_post_invoke_error_fail_on_error(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_plugin_post_invoke_error_fail_on_error(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking tool with plugin post-invoke hook error when fail_on_plugin_error is True."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2463,7 +2587,7 @@ class TestToolService:
         tool_service._plugin_manager.config = mock_config
 
         # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         with (
             patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
@@ -2474,17 +2598,15 @@ class TestToolService:
 
         assert "Plugin error" in str(exc_info.value)
 
-    async def test_invoke_tool_with_plugin_metadata_rest(self, tool_service, mock_tool, test_db):
+    async def test_invoke_tool_with_plugin_metadata_rest(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         """Test invoking tool with plugin post-invoke hook error when fail_on_plugin_error is True."""
         # Configure tool as REST
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "POST"
         mock_tool.auth_value = None
 
-        # Mock DB to return the tool
-        mock_scalar = Mock()
-        mock_scalar.scalar_one_or_none.return_value = mock_tool
-        test_db.execute = Mock(return_value=mock_scalar)
+        # Mock DB to return the tool and GlobalConfig
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
         # Mock HTTP client response
         mock_response = AsyncMock()
@@ -2497,7 +2619,7 @@ class TestToolService:
         tool_service._plugin_manager = PluginManager("./tests/unit/mcpgateway/plugins/fixtures/configs/tool_headers_metadata_plugin.yaml")
         await tool_service._plugin_manager.initialize()
         # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         with (
             patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
@@ -2548,7 +2670,7 @@ class TestToolService:
         tool_service._plugin_manager = PluginManager("./tests/unit/mcpgateway/plugins/fixtures/configs/tool_headers_metadata_plugin.yaml")
         await tool_service._plugin_manager.initialize()
         # Mock metrics recording
-        tool_service._record_tool_metric = AsyncMock()
+        tool_service._record_tool_metric_sync = Mock()
 
         with (
             patch("mcpgateway.services.tool_service.sse_client", return_value=sse_ctx),

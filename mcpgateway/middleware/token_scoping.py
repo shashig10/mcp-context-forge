@@ -18,12 +18,12 @@ from typing import Optional
 
 # Third-Party
 from fastapi import HTTPException, Request, status
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
 
 # First-Party
 from mcpgateway.db import Permissions
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.verify_credentials import verify_jwt_token
 
 # Security scheme
@@ -384,6 +384,7 @@ class TokenScopingMiddleware:
 
             return True
         finally:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
             db.close()
 
     def _check_resource_team_ownership(self, request_path: str, token_teams: list) -> bool:  # pylint: disable=too-many-return-statements
@@ -432,11 +433,12 @@ class TokenScopingMiddleware:
             logger.debug(f"Processing request with TEAM-SCOPED token (teams: {token_teams})")
 
         # Extract resource type and ID from path using regex patterns
+        # IDs are UUID hex strings (32 chars) or UUID with dashes (36 chars)
         resource_patterns = [
-            (r"/servers/?([a-f0-9\-]*)", "server"),
-            (r"/tools/?([a-f0-9\-]*)", "tool"),
-            (r"/resources/?(\d*)", "resource"),
-            (r"/prompts/?(\d*)", "prompt"),
+            (r"/servers/?([a-f0-9\-]+)", "server"),
+            (r"/tools/?([a-f0-9\-]+)", "tool"),
+            (r"/resources/?([a-f0-9\-]+)", "resource"),
+            (r"/prompts/?([a-f0-9\-]+)", "prompt"),
         ]
 
         resource_id = None
@@ -554,7 +556,7 @@ class TokenScopingMiddleware:
 
             # CHECK RESOURCES
             if resource_type == "resource":
-                resource = db.execute(select(Resource).where(Resource.id == int(resource_id))).scalar_one_or_none()
+                resource = db.execute(select(Resource).where(Resource.id == resource_id)).scalar_one_or_none()
 
                 if not resource:
                     logger.warning(f"Resource {resource_id} not found in database")
@@ -599,7 +601,7 @@ class TokenScopingMiddleware:
 
             # CHECK PROMPTS
             if resource_type == "prompt":
-                prompt = db.execute(select(Prompt).where(Prompt.id == int(resource_id))).scalar_one_or_none()
+                prompt = db.execute(select(Prompt).where(Prompt.id == resource_id)).scalar_one_or_none()
 
                 if not prompt:
                     logger.warning(f"Prompt {resource_id} not found in database")
@@ -651,6 +653,7 @@ class TokenScopingMiddleware:
             # Fail securely - deny access on error
             return False
         finally:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
             db.close()
 
     async def __call__(self, request: Request, call_next):
@@ -738,7 +741,7 @@ class TokenScopingMiddleware:
 
         except HTTPException as exc:
             # Return clean JSON response instead of traceback
-            return JSONResponse(
+            return ORJSONResponse(
                 status_code=exc.status_code,
                 content={"detail": exc.detail},
             )

@@ -47,6 +47,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jsonpath_ng.ext import parse
 from jsonpath_ng.jsonpath import JSONPath
+import orjson
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -130,6 +131,7 @@ from mcpgateway.utils.error_formatter import ErrorFormatter
 from mcpgateway.utils.metadata_capture import MetadataCapture
 from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.passthrough_headers import set_global_passthrough_headers
+from mcpgateway.utils.redis_client import close_redis_client, get_redis_client
 from mcpgateway.utils.redis_isready import wait_for_redis_ready
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.verify_credentials import require_auth, require_docs_auth_override, verify_jwt_token
@@ -417,6 +419,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await logging_service.initialize()
     logger.info("Starting MCP Gateway services")
 
+    # Initialize Redis client early (shared pool for all services)
+    await get_redis_client()
+
+    # Initialize LLM chat router Redis client
+    # First-Party
+    from mcpgateway.routers.llmchat_router import init_redis as init_llmchat_redis  # pylint: disable=import-outside-toplevel
+
+    await init_llmchat_redis()
+
     # Initialize observability (Phoenix tracing)
     init_telemetry()
     logger.info("Observability initialized")
@@ -447,6 +458,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await a2a_service.initialize()
         await resource_cache.initialize()
         await streamable_http_session.initialize()
+        await session_registry.initialize()
 
         # Initialize elicitation service
         if settings.mcpgateway_elicitation_enabled:
@@ -456,6 +468,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             elicitation_service = get_elicitation_service()
             await elicitation_service.start()
             logger.info("Elicitation service initialized")
+
+        # Initialize metrics buffer service for batching metric writes
+        if settings.metrics_buffer_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
+
+            metrics_buffer_service = get_metrics_buffer_service()
+            await metrics_buffer_service.start()
+            logger.info("Metrics buffer service initialized")
 
         refresh_slugs_on_startup()
 
@@ -560,6 +581,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             resource_service,
             tool_service,
             streamable_http_session,
+            session_registry,
         ]
 
         if a2a_service:
@@ -573,7 +595,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             elicitation_service = get_elicitation_service()
             services_to_shutdown.insert(5, elicitation_service)
 
+        # Add metrics buffer service if enabled (flush remaining metrics before shutdown)
+        if settings.metrics_buffer_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
+
+            metrics_buffer_service = get_metrics_buffer_service()
+            services_to_shutdown.insert(0, metrics_buffer_service)  # Shutdown first to flush metrics
+
         await shutdown_services(services_to_shutdown)
+
+        # Close Redis client last (after all services that use it)
+        await close_redis_client()
 
         logger.info("Shutdown complete")
 
@@ -606,6 +639,7 @@ async def setup_passthrough_headers():
     try:
         await set_global_passthrough_headers(db)
     finally:
+        db.commit()  # End transaction cleanly
         db.close()
 
 
@@ -777,7 +811,7 @@ async def validation_exception_handler(_request: Request, exc: ValidationError):
         ...     result.status_code
         422
     """
-    return JSONResponse(status_code=422, content=ErrorFormatter.format_validation_error(exc))
+    return ORJSONResponse(status_code=422, content=ErrorFormatter.format_validation_error(exc))
 
 
 @app.exception_handler(RequestValidationError)
@@ -811,7 +845,7 @@ async def request_validation_exception_handler(_request: Request, exc: RequestVa
             error_details.append(error_detail)
 
         response_content = {"detail": error_details}
-        return JSONResponse(status_code=422, content=response_content)
+        return ORJSONResponse(status_code=422, content=response_content)
     return await fastapi_default_validation_handler(_request, exc)
 
 
@@ -847,7 +881,7 @@ async def database_exception_handler(_request: Request, exc: IntegrityError):
         >>> hasattr(result, 'body')
         True
     """
-    return JSONResponse(status_code=409, content=ErrorFormatter.format_database_error(exc))
+    return ORJSONResponse(status_code=409, content=ErrorFormatter.format_database_error(exc))
 
 
 @app.exception_handler(PluginViolationError)
@@ -906,7 +940,7 @@ async def plugin_violation_exception_handler(_request: Request, exc: PluginViola
         if exc.violation.plugin_name:
             violation_details["plugin_name"] = exc.violation.plugin_name
     json_rpc_error = PydanticJSONRPCError(code=status_code, message="Plugin Violation: " + message, data=violation_details)
-    return JSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
+    return ORJSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
 
 
 @app.exception_handler(PluginError)
@@ -963,7 +997,7 @@ async def plugin_exception_handler(_request: Request, exc: PluginError):
         if exc.error.plugin_name:
             error_details["plugin_name"] = exc.error.plugin_name
     json_rpc_error = PydanticJSONRPCError(code=status_code, message="Plugin Error: " + message, data=error_details)
-    return JSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
+    return ORJSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
 
 
 class DocsAuthMiddleware(BaseHTTPMiddleware):
@@ -1031,7 +1065,7 @@ class DocsAuthMiddleware(BaseHTTPMiddleware):
                 # Use dedicated docs authentication that bypasses global auth settings
                 await require_docs_auth_override(token, cookie_token)
             except HTTPException as e:
-                return JSONResponse(status_code=e.status_code, content={"detail": e.detail}, headers=e.headers if e.headers else None)
+                return ORJSONResponse(status_code=e.status_code, content={"detail": e.detail}, headers=e.headers if e.headers else None)
 
         # Proceed to next middleware or route
         return await call_next(request)
@@ -1335,8 +1369,20 @@ def get_db():
     """
     Dependency function to provide a database session.
 
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
+    This function handles connection failures gracefully by invalidating broken
+    connections. When a connection is broken (e.g., due to PgBouncer timeout or
+    network issues), the rollback will fail. In this case, we invalidate the
+    session to ensure the broken connection is discarded from the pool rather
+    than being returned in a bad state.
+
     Yields:
         Session: A SQLAlchemy session object for interacting with the database.
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
 
     Ensures:
         The database session is closed after the request completes, even in the case of an exception.
@@ -1355,11 +1401,24 @@ def get_db():
         ...         next(db_gen)
         ...     except StopIteration:
         ...         pass  # Expected - generator cleanup
-        'Session'
+        'ResilientSession'
     """
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            # Connection is broken - invalidate to remove from pool
+            # This handles cases like PgBouncer query_wait_timeout where
+            # the connection is dead and rollback itself fails
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
     finally:
         db.close()
 
@@ -1633,14 +1692,14 @@ async def ping(request: Request, user=Depends(get_current_user)) -> JSONResponse
         logger.debug(f"Authenticated user {user} sent ping request.")
         # Return an empty result per the MCP ping specification.
         response: dict = {"jsonrpc": "2.0", "id": req_id, "result": {}}
-        return JSONResponse(content=response)
+        return ORJSONResponse(content=response)
     except Exception as e:
         error_response: dict = {
             "jsonrpc": "2.0",
             "id": req_id,  # Now req_id is always defined
             "error": {"code": -32603, "message": "Internal error", "data": str(e)},
         }
-        return JSONResponse(status_code=500, content=error_response)
+        return ORJSONResponse(status_code=500, content=error_response)
 
 
 @protocol_router.post("/notifications")
@@ -1749,7 +1808,7 @@ async def list_servers(
 
     # Check for team ID mismatch
     if team_id is not None and token_team_id is not None and team_id != token_team_id:
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Access issue: This API token does not have the required permissions for this team."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
@@ -1832,7 +1891,7 @@ async def create_server(
 
         # Check for team ID mismatch
         if team_id is not None and token_team_id is not None and team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -2085,7 +2144,7 @@ async def message_endpoint(request: Request, server_id: str, user=Depends(get_cu
                 message=message,
             )
 
-        return JSONResponse(content={"status": "success"}, status_code=202)
+        return ORJSONResponse(content={"status": "success"}, status_code=202)
     except ValueError as e:
         logger.error(f"Invalid message format: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -2305,7 +2364,7 @@ async def create_a2a_agent(
 
         # Check for team ID mismatch
         if team_id is not None and token_team_id is not None and team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -2530,6 +2589,8 @@ async def invoke_a2a_agent(
 async def list_tools(
     request: Request,
     cursor: Optional[str] = None,
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of tools to return. 0 means all (no limit). Default uses pagination_default_page_size."),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = Query(None, description="Filter by team ID"),
@@ -2544,6 +2605,9 @@ async def list_tools(
     Args:
         request (Request): The FastAPI request object for team_id retrieval
         cursor: Pagination cursor for fetching the next set of results
+        include_pagination: Whether to include cursor pagination metadata in the response
+        limit: Maximum number of tools to return. Use 0 for all tools (no limit).
+            If not specified, uses pagination_default_page_size (default: 50).
         include_inactive: Whether to include inactive tools in the results
         tags: Comma-separated list of tags to filter by (e.g., "api,data")
         team_id: Optional team ID to filter tools by specific team
@@ -2570,7 +2634,7 @@ async def list_tools(
 
     # Check for team ID mismatch
     if team_id is not None and token_team_id is not None and team_id != token_team_id:
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Access issue: This API token does not have the required permissions for this team."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
@@ -2580,20 +2644,27 @@ async def list_tools(
 
     # Use team-filtered tool listing
     if team_id or visibility:
-        data = await tool_service.list_tools_for_user(db=db, user_email=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive)
-
-        # Apply tag filtering to team-filtered results if needed
-        if tags_list:
-            data = [tool for tool in data if any(tag in tool.tags for tag in tags_list)]
+        data, next_cursor = await tool_service.list_tools_for_user(
+            db=db,
+            user_email=user_email,
+            team_id=team_id,
+            visibility=visibility,
+            include_inactive=include_inactive,
+            cursor=cursor,
+            gateway_id=gateway_id,
+            tags=tags_list,
+            limit=limit,
+        )
     else:
         # Use existing method for backward compatibility when no team filtering
-        data, _ = await tool_service.list_tools(db, cursor=cursor, include_inactive=include_inactive, tags=tags_list)
-
-    # Apply gateway_id filtering if provided
-    if gateway_id:
-        data = [tool for tool in data if str(tool.gateway_id) == gateway_id]
+        data, next_cursor = await tool_service.list_tools(db, cursor=cursor, include_inactive=include_inactive, tags=tags_list, gateway_id=gateway_id, limit=limit)
 
     if apijsonpath is None:
+        if include_pagination:
+            payload = {"tools": [tool.model_dump(by_alias=True) for tool in data]}
+            if next_cursor:
+                payload["nextCursor"] = next_cursor
+            return payload
         return data
 
     tools_dict_list = [tool.to_dict(use_alias=True) for tool in data]
@@ -2638,7 +2709,7 @@ async def create_tool(
 
         # Check for team ID mismatch
         if team_id is not None and token_team_id is not None and team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -2844,6 +2915,8 @@ async def toggle_tool_status(
         }
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except ToolNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2908,6 +2981,8 @@ async def toggle_resource_status(
         }
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2953,7 +3028,7 @@ async def list_resources(
 
     # Check for team ID mismatch
     if team_id is not None and token_team_id is not None and team_id != token_team_id:
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Access issue: This API token does not have the required permissions for this team."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
@@ -3016,7 +3091,7 @@ async def create_resource(
 
         # Check for team ID mismatch
         if team_id is not None and token_team_id is not None and team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -3267,6 +3342,8 @@ async def toggle_prompt_status(
         }
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except PromptNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -3312,7 +3389,7 @@ async def list_prompts(
 
     # Check for team ID mismatch
     if team_id is not None and token_team_id is not None and team_id != token_team_id:
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Access issue: This API token does not have the required permissions for this team."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
@@ -3374,7 +3451,7 @@ async def create_prompt(
 
         # Check for team ID mismatch
         if team_id is not None and token_team_id is not None and team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -3464,10 +3541,10 @@ async def get_prompt(
         logger.error(f"Could not retrieve prompt {prompt_id}: {ex}")
         if isinstance(ex, PluginViolationError):
             # Return the actual plugin violation message
-            return JSONResponse(content={"message": ex.message, "details": str(ex.violation) if hasattr(ex, "violation") else None}, status_code=422)
+            return ORJSONResponse(content={"message": ex.message, "details": str(ex.violation) if hasattr(ex, "violation") else None}, status_code=422)
         if isinstance(ex, (ValueError, PromptError)):
             # Return the actual error message
-            return JSONResponse(content={"message": str(ex)}, status_code=422)
+            return ORJSONResponse(content={"message": str(ex)}, status_code=422)
         raise
 
     return result
@@ -3495,7 +3572,7 @@ async def get_prompt_no_args(
         The prompt template information
 
     Raises:
-        Exception: Re-raised from prompt service.
+        HTTPException: 404 if prompt not found, 403 if permission denied.
     """
     logger.debug(f"User: {user} requested prompt: {prompt_id} with no arguments")
 
@@ -3503,13 +3580,18 @@ async def get_prompt_no_args(
     plugin_context_table = getattr(request.state, "plugin_context_table", None)
     plugin_global_context = getattr(request.state, "plugin_global_context", None)
 
-    return await prompt_service.get_prompt(
-        db,
-        prompt_id,
-        {},
-        plugin_context_table=plugin_context_table,
-        plugin_global_context=plugin_global_context,
-    )
+    try:
+        return await prompt_service.get_prompt(
+            db,
+            prompt_id,
+            {},
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
+    except PromptNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @prompt_router.put("/{prompt_id}", response_model=PromptRead)
@@ -3656,6 +3738,8 @@ async def toggle_gateway_status(
         }
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -3694,7 +3778,7 @@ async def list_gateways(
 
     # Check for team ID mismatch
     if team_id is not None and token_team_id is not None and team_id != token_team_id:
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Access issue: This API token does not have the required permissions for this team."},
             status_code=status.HTTP_403_FORBIDDEN,
         )
@@ -3742,7 +3826,7 @@ async def register_gateway(
 
         # Check for team ID mismatch
         if gateway_team_id is not None and token_team_id is not None and gateway_team_id != token_team_id:
-            return JSONResponse(
+            return ORJSONResponse(
                 content={"message": "Access issue: This API token does not have the required permissions for this team."},
                 status_code=status.HTTP_403_FORBIDDEN,
             )
@@ -3766,20 +3850,20 @@ async def register_gateway(
         )
     except Exception as ex:
         if isinstance(ex, GatewayConnectionError):
-            return JSONResponse(content={"message": "Unable to connect to gateway"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return ORJSONResponse(content={"message": "Unable to connect to gateway"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         if isinstance(ex, ValueError):
-            return JSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
+            return ORJSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
         if isinstance(ex, GatewayNameConflictError):
-            return JSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
+            return ORJSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
         if isinstance(ex, GatewayDuplicateConflictError):
-            return JSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
+            return ORJSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
         if isinstance(ex, RuntimeError):
-            return JSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return ORJSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
         if isinstance(ex, ValidationError):
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
         if isinstance(ex, IntegrityError):
-            return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
-        return JSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return ORJSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
+        return ORJSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @gateway_router.get("/{gateway_id}", response_model=GatewayRead)
@@ -3795,9 +3879,15 @@ async def get_gateway(gateway_id: str, db: Session = Depends(get_db), user=Depen
 
     Returns:
         Gateway data.
+
+    Raises:
+        HTTPException: 404 if gateway not found.
     """
     logger.debug(f"User '{user}' requested gateway {gateway_id}")
-    return await gateway_service.get_gateway(db, gateway_id)
+    try:
+        return await gateway_service.get_gateway(db, gateway_id)
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @gateway_router.put("/{gateway_id}", response_model=GatewayRead)
@@ -3840,24 +3930,24 @@ async def update_gateway(
         )
     except Exception as ex:
         if isinstance(ex, PermissionError):
-            return JSONResponse(content={"message": str(ex)}, status_code=403)
+            return ORJSONResponse(content={"message": str(ex)}, status_code=403)
         if isinstance(ex, GatewayNotFoundError):
-            return JSONResponse(content={"message": "Gateway not found"}, status_code=status.HTTP_404_NOT_FOUND)
+            return ORJSONResponse(content={"message": "Gateway not found"}, status_code=status.HTTP_404_NOT_FOUND)
         if isinstance(ex, GatewayConnectionError):
-            return JSONResponse(content={"message": "Unable to connect to gateway"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return ORJSONResponse(content={"message": "Unable to connect to gateway"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         if isinstance(ex, ValueError):
-            return JSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
+            return ORJSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
         if isinstance(ex, GatewayNameConflictError):
-            return JSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
+            return ORJSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
         if isinstance(ex, GatewayDuplicateConflictError):
-            return JSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
+            return ORJSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
         if isinstance(ex, RuntimeError):
-            return JSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return ORJSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
         if isinstance(ex, ValidationError):
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
         if isinstance(ex, IntegrityError):
-            return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
-        return JSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return ORJSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
+        return ORJSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @gateway_router.delete("/{gateway_id}")
@@ -3983,7 +4073,7 @@ async def subscribe_roots_changes(
             str: SSE-formatted event data.
         """
         async for event in root_service.subscribe_changes():
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {orjson.dumps(event).decode()}\n\n"
 
     return StreamingResponse(generate_events(), media_type="text/event-stream")
 
@@ -4344,7 +4434,7 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depen
         return {"jsonrpc": "2.0", "error": error["error"], "id": req_id}
     except Exception as e:
         if isinstance(e, ValueError):
-            return JSONResponse(content={"message": "Method invalid"}, status_code=422)
+            return ORJSONResponse(content={"message": "Method invalid"}, status_code=422)
         logger.error(f"RPC error: {str(e)}")
         return {
             "jsonrpc": "2.0",
@@ -4404,21 +4494,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 async with ResilientHttpClient(client_args=client_args) as client:
                     response = await client.post(
                         f"http://localhost:{settings.port}{settings.app_root_path}/rpc",
-                        json=json.loads(data),
+                        json=orjson.loads(data),
                         headers={"Content-Type": "application/json"},
                     )
                     await websocket.send_text(response.text)
             except JSONRPCError as e:
-                await websocket.send_text(json.dumps(e.to_dict()))
-            except json.JSONDecodeError:
+                await websocket.send_text(orjson.dumps(e.to_dict()).decode())
+            except orjson.JSONDecodeError:
                 await websocket.send_text(
-                    json.dumps(
+                    orjson.dumps(
                         {
                             "jsonrpc": "2.0",
                             "error": {"code": -32700, "message": "Parse error"},
                             "id": None,
                         }
-                    )
+                    ).decode()
                 )
             except Exception as e:
                 logger.error(f"WebSocket error: {str(e)}")
@@ -4504,7 +4594,7 @@ async def utility_message_endpoint(request: Request, user=Depends(get_current_us
             message=message,
         )
 
-        return JSONResponse(content={"status": "success"}, status_code=202)
+        return ORJSONResponse(content={"status": "success"}, status_code=202)
 
     except ValueError as e:
         logger.error("Invalid message format: %s", e)
@@ -4657,11 +4747,11 @@ async def readiness_check(db: Session = Depends(get_db)):
     try:
         # Run the blocking DB check in a thread to avoid blocking the event loop
         await asyncio.to_thread(db.execute, text("SELECT 1"))
-        return JSONResponse(content={"status": "ready"}, status_code=200)
+        return ORJSONResponse(content={"status": "ready"}, status_code=200)
     except Exception as e:
         error_message = f"Readiness check failed: {str(e)}"
         logger.error(error_message)
-        return JSONResponse(content={"status": "not ready", "error": error_message}, status_code=503)
+        return ORJSONResponse(content={"status": "not ready", "error": error_message}, status_code=503)
 
 
 @app.get("/health/security", tags=["health"])

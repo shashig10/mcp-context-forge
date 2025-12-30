@@ -17,7 +17,6 @@ It handles:
 # Standard
 import base64
 from datetime import datetime, timezone
-import json
 import os
 import re
 import ssl
@@ -33,20 +32,20 @@ import jsonschema
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
+import orjson
 from sqlalchemy import and_, case, delete, desc, Float, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, selectinload, Session
 
 # First-Party
+from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.common.models import Gateway as PydanticGateway
 from mcpgateway.common.models import TextContent
 from mcpgateway.common.models import Tool as PydanticTool
 from mcpgateway.common.models import ToolResult
 from mcpgateway.config import settings
 from mcpgateway.db import A2AAgent as DbA2AAgent
-from mcpgateway.db import EmailTeam
-from mcpgateway.db import Gateway as DbGateway
-from mcpgateway.db import server_tool_association
+from mcpgateway.db import EmailTeam, fresh_db_session, server_tool_association
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.db import ToolMetric
 from mcpgateway.observability import create_span
@@ -76,11 +75,30 @@ from mcpgateway.utils.create_slug import slugify
 from mcpgateway.utils.display_name import generate_display_name
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.pagination import decode_cursor, encode_cursor
-from mcpgateway.utils.passthrough_headers import get_passthrough_headers
+from mcpgateway.utils.passthrough_headers import compute_passthrough_headers_cached
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.services_auth import decode_auth
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 from mcpgateway.utils.validate_signature import validate_signature
+
+# Cache import (lazy to avoid circular dependencies)
+_REGISTRY_CACHE = None
+
+
+def _get_registry_cache():
+    """Get registry cache singleton lazily.
+
+    Returns:
+        RegistryCache instance.
+    """
+    global _REGISTRY_CACHE  # pylint: disable=global-statement
+    if _REGISTRY_CACHE is None:
+        # First-Party
+        from mcpgateway.cache.registry_cache import registry_cache  # pylint: disable=import-outside-toplevel
+
+        _REGISTRY_CACHE = registry_cache
+    return _REGISTRY_CACHE
+
 
 # Initialize logging service first
 logging_service = LoggingService()
@@ -120,8 +138,8 @@ def extract_using_jq(data, jq_filter=""):
     if isinstance(data, str):
         # If the input is a string, parse it as JSON
         try:
-            data = json.loads(data)
-        except json.JSONDecodeError:
+            data = orjson.loads(data)
+        except orjson.JSONDecodeError:
             return ["Invalid JSON string provided."]
 
     elif not isinstance(data, (dict, list)):
@@ -140,7 +158,6 @@ def extract_using_jq(data, jq_filter=""):
         return message
 
     return result
-
 
 
 class ToolError(Exception):
@@ -284,6 +301,7 @@ class ToolService:
             >>> asyncio.run(service.initialize())  # Should log "Initializing tool service"
         """
         logger.info("Initializing tool service")
+        await self._event_service.initialize()
 
     async def shutdown(self) -> None:
         """Shutdown the service.
@@ -303,11 +321,11 @@ class ToolService:
 
         Queries the database to get tools with their metrics, ordered by the number of executions
         in descending order. Returns a list of TopPerformer objects containing tool details and
-        performance metrics.
+        performance metrics. Results are cached for performance.
 
         Args:
             db (Session): Database session for querying tool metrics.
-            limit (Optional[int]): Maximum number of tools to return. Defaults to 5. If None, returns all tools.
+            limit (Optional[int]): Maximum number of tools to return. Defaults to 5.
 
         Returns:
             List[TopPerformer]: A list of TopPerformer objects, each containing:
@@ -318,6 +336,17 @@ class ToolService:
                 - success_rate: Success rate percentage, or None if no metrics.
                 - last_execution: Timestamp of the last execution, or None if no metrics.
         """
+        # Check cache first (if enabled)
+        # First-Party
+        from mcpgateway.cache.metrics_cache import is_cache_enabled, metrics_cache  # pylint: disable=import-outside-toplevel
+
+        effective_limit = limit or 5
+        cache_key = f"top_tools:{effective_limit}"
+
+        if is_cache_enabled():
+            cached = metrics_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         success_rate = case(
             (func.count(ToolMetric.id) > 0, func.sum(case((ToolMetric.is_success.is_(True), 1), else_=0)).cast(Float) * 100 / func.count(ToolMetric.id)), else_=None  # pylint: disable=not-callable
@@ -335,12 +364,17 @@ class ToolService:
             .outerjoin(ToolMetric, ToolMetric.tool_id == DbTool.id)
             .group_by(DbTool.id, DbTool.name)
             .order_by(desc("execution_count"))
-            .limit(limit or 5)
+            .limit(effective_limit)
         )
 
         results = db.execute(query).all()
+        top_performers = build_top_performers(results)
 
-        return build_top_performers(results)
+        # Cache the result (if enabled)
+        if is_cache_enabled():
+            metrics_cache.set(cache_key, top_performers)
+
+        return top_performers
 
     def _get_team_name(self, db: Session, team_id: Optional[str]) -> Optional[str]:
         """Retrieve the team name given a team ID.
@@ -355,15 +389,16 @@ class ToolService:
         if not team_id:
             return None
         team = db.query(EmailTeam).filter(EmailTeam.id == team_id, EmailTeam.is_active.is_(True)).first()
+        db.commit()  # Release transaction to avoid idle-in-transaction
         return team.name if team else None
 
-    def _convert_tool_to_read(self, tool: DbTool, include_metrics: bool = True) -> ToolRead:
+    def _convert_tool_to_read(self, tool: DbTool, include_metrics: bool = False) -> ToolRead:
         """Converts a DbTool instance into a ToolRead model, including aggregated metrics and
         new API gateway fields: request_type and authentication credentials (masked).
 
         Args:
             tool (DbTool): The ORM instance of the tool.
-            include_metrics (bool): Whether to include metrics in the result. Defaults to True.
+            include_metrics (bool): Whether to include metrics in the result. Defaults to False.
 
         Returns:
             ToolRead: The Pydantic model representing the tool, including aggregated metrics and new fields.
@@ -452,6 +487,66 @@ class ToolService:
         db.add(metric)
         db.commit()
 
+    def _record_tool_metric_by_id(
+        self,
+        db: Session,
+        tool_id: str,
+        start_time: float,
+        success: bool,
+        error_message: Optional[str],
+    ) -> None:
+        """Record tool metric using tool ID instead of ORM object.
+
+        This method is designed to be used with a fresh database session after the main
+        request session has been released. It avoids requiring the ORM tool object,
+        which may have been detached from the session.
+
+        Args:
+            db: A fresh database session (not the request session).
+            tool_id: The UUID string of the tool.
+            start_time: The monotonic start time of the invocation.
+            success: True if the invocation succeeded; otherwise, False.
+            error_message: The error message if the invocation failed, otherwise None.
+        """
+        end_time = time.monotonic()
+        response_time = end_time - start_time
+        metric = ToolMetric(
+            tool_id=tool_id,
+            response_time=response_time,
+            is_success=success,
+            error_message=error_message,
+        )
+        db.add(metric)
+        db.commit()
+
+    def _record_tool_metric_sync(
+        self,
+        tool_id: str,
+        start_time: float,
+        success: bool,
+        error_message: Optional[str],
+    ) -> None:
+        """Synchronous helper to record tool metrics with its own session.
+
+        This method creates a fresh database session, records the metric, and closes
+        the session. Designed to be called via asyncio.to_thread() to avoid blocking
+        the event loop.
+
+        Args:
+            tool_id: The UUID string of the tool.
+            start_time: The monotonic start time of the invocation.
+            success: True if the invocation succeeded; otherwise, False.
+            error_message: The error message if the invocation failed, otherwise None.
+        """
+        with fresh_db_session() as db_metrics:
+            self._record_tool_metric_by_id(
+                db_metrics,
+                tool_id=tool_id,
+                start_time=start_time,
+                success=success,
+                error_message=error_message,
+            )
+
     def _extract_and_validate_structured_content(self, tool: DbTool, tool_result: "ToolResult", candidate: Optional[Any] = None) -> bool:
         """
         Extract structured content (if any) and validate it against ``tool.output_schema``.
@@ -513,7 +608,7 @@ class ToolService:
                 False
                 >>> r.is_error
                 True
-                >>> details = json.loads(r.content[0].text)
+                >>> details = orjson.loads(r.content[0].text)
                 >>> "received" in details
                 True
         """
@@ -532,9 +627,9 @@ class ToolService:
                 for c in getattr(tool_result, "content", []) or []:
                     try:
                         if isinstance(c, dict) and "type" in c and c.get("type") == "text" and "text" in c:
-                            structured = json.loads(c.get("text") or "null")
+                            structured = orjson.loads(c.get("text") or "null")
                             break
-                    except (json.JSONDecodeError, TypeError, ValueError):
+                    except (orjson.JSONDecodeError, TypeError, ValueError):
                         # ignore JSON parse errors and continue
                         continue
 
@@ -556,7 +651,7 @@ class ToolService:
                 # If inner is a TextContent-like dict with 'text' JSON string, parse it
                 if isinstance(inner, dict) and "text" in inner and "type" in inner and inner.get("type") == "text":
                     try:
-                        structured = json.loads(inner.get("text") or "null")
+                        structured = orjson.loads(inner.get("text") or "null")
                     except Exception:
                         # leave as-is if parsing fails
                         structured = inner
@@ -582,7 +677,7 @@ class ToolService:
                     "message": e.message,
                 }
                 try:
-                    tool_result.content = [TextContent(type="text", text=json.dumps(details))]
+                    tool_result.content = [TextContent(type="text", text=orjson.dumps(details).decode())]
                 except Exception:
                     tool_result.content = [TextContent(type="text", text=str(details))]
                 tool_result.is_error = True
@@ -774,6 +869,16 @@ class ToolService:
 
             # Refresh db_tool after logging commits (they expire the session objects)
             db.refresh(db_tool)
+
+            # Invalidate cache after successful creation
+            cache = _get_registry_cache()
+            await cache.invalidate_tools()
+            # Also invalidate tags cache since tool tags may have changed
+            # First-Party
+            from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
+
+            await admin_stats_cache.invalidate_tags()
+
             return self._convert_tool_to_read(db_tool)
         except IntegrityError as ie:
             db.rollback()
@@ -832,8 +937,434 @@ class ToolService:
             )
             raise ToolError(f"Failed to register tool: {str(e)}")
 
+    async def register_tools_bulk(
+        self,
+        db: Session,
+        tools: List[ToolCreate],
+        created_by: Optional[str] = None,
+        created_from_ip: Optional[str] = None,
+        created_via: Optional[str] = None,
+        created_user_agent: Optional[str] = None,
+        import_batch_id: Optional[str] = None,
+        federation_source: Optional[str] = None,
+        team_id: Optional[str] = None,
+        owner_email: Optional[str] = None,
+        visibility: Optional[str] = "public",
+        conflict_strategy: str = "skip",
+    ) -> Dict[str, Any]:
+        """Register multiple tools in bulk with a single commit.
+
+        This method provides significant performance improvements over individual
+        tool registration by:
+        - Using db.add_all() instead of individual db.add() calls
+        - Performing a single commit for all tools
+        - Batch conflict detection
+        - Chunking for very large imports (>500 items)
+
+        Args:
+            db: Database session
+            tools: List of tool creation schemas
+            created_by: Username who created these tools
+            created_from_ip: IP address of creator
+            created_via: Creation method (ui, api, import, federation)
+            created_user_agent: User agent of creation request
+            import_batch_id: UUID for bulk import operations
+            federation_source: Source gateway for federated tools
+            team_id: Team ID to assign the tools to
+            owner_email: Email of the user who owns these tools
+            visibility: Tool visibility level (private, team, public)
+            conflict_strategy: How to handle conflicts (skip, update, rename, fail)
+
+        Returns:
+            Dict with statistics:
+                - created: Number of tools created
+                - updated: Number of tools updated
+                - skipped: Number of tools skipped
+                - failed: Number of tools that failed
+                - errors: List of error messages
+
+        Raises:
+            ToolError: If bulk registration fails critically
+
+        Examples:
+            >>> from mcpgateway.services.tool_service import ToolService
+            >>> from unittest.mock import MagicMock
+            >>> service = ToolService()
+            >>> db = MagicMock()
+            >>> tools = [MagicMock(), MagicMock()]
+            >>> import asyncio
+            >>> try:
+            ...     result = asyncio.run(service.register_tools_bulk(db, tools))
+            ... except Exception:
+            ...     pass
+        """
+        if not tools:
+            return {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+
+        stats = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+
+        # Process in chunks to avoid memory issues and SQLite parameter limits
+        chunk_size = 500
+
+        for chunk_start in range(0, len(tools), chunk_size):
+            chunk = tools[chunk_start : chunk_start + chunk_size]
+            chunk_stats = self._process_tool_chunk(
+                db=db,
+                chunk=chunk,
+                conflict_strategy=conflict_strategy,
+                visibility=visibility,
+                team_id=team_id,
+                owner_email=owner_email,
+                created_by=created_by,
+                created_from_ip=created_from_ip,
+                created_via=created_via,
+                created_user_agent=created_user_agent,
+                import_batch_id=import_batch_id,
+                federation_source=federation_source,
+            )
+
+            # Aggregate stats
+            for key, value in chunk_stats.items():
+                if key == "errors":
+                    stats[key].extend(value)
+                else:
+                    stats[key] += value
+
+        return stats
+
+    def _process_tool_chunk(
+        self,
+        db: Session,
+        chunk: List[ToolCreate],
+        conflict_strategy: str,
+        visibility: str,
+        team_id: Optional[int],
+        owner_email: Optional[str],
+        created_by: str,
+        created_from_ip: Optional[str],
+        created_via: Optional[str],
+        created_user_agent: Optional[str],
+        import_batch_id: Optional[str],
+        federation_source: Optional[str],
+    ) -> dict:
+        """Process a chunk of tools for bulk import.
+
+        Args:
+            db: The SQLAlchemy database session.
+            chunk: List of ToolCreate objects to process.
+            conflict_strategy: Strategy for handling conflicts ("skip", "update", or "fail").
+            visibility: Tool visibility level ("public", "team", or "private").
+            team_id: Team ID for team-scoped tools.
+            owner_email: Email of the tool owner.
+            created_by: Email of the user creating the tools.
+            created_from_ip: IP address of the request origin.
+            created_via: Source of the creation (e.g., "api", "ui").
+            created_user_agent: User agent string from the request.
+            import_batch_id: Batch identifier for bulk imports.
+            federation_source: Source identifier for federated tools.
+
+        Returns:
+            dict: Statistics dictionary with keys "created", "updated", "skipped", "failed", and "errors".
+        """
+        stats = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+
+        try:
+            # Batch check for existing tools to detect conflicts
+            tool_names = [tool.name for tool in chunk]
+
+            if visibility.lower() == "public":
+                existing_tools_query = select(DbTool).where(DbTool.name.in_(tool_names), DbTool.visibility == "public")
+            elif visibility.lower() == "team" and team_id:
+                existing_tools_query = select(DbTool).where(DbTool.name.in_(tool_names), DbTool.visibility == "team", DbTool.team_id == team_id)
+            else:
+                # Private tools - check by owner
+                existing_tools_query = select(DbTool).where(DbTool.name.in_(tool_names), DbTool.visibility == "private", DbTool.owner_email == (owner_email or created_by))
+
+            existing_tools = db.execute(existing_tools_query).scalars().all()
+            existing_tools_map = {tool.name: tool for tool in existing_tools}
+
+            tools_to_add = []
+            tools_to_update = []
+
+            for tool in chunk:
+                result = self._process_single_tool_for_bulk(
+                    tool=tool,
+                    existing_tools_map=existing_tools_map,
+                    conflict_strategy=conflict_strategy,
+                    visibility=visibility,
+                    team_id=team_id,
+                    owner_email=owner_email,
+                    created_by=created_by,
+                    created_from_ip=created_from_ip,
+                    created_via=created_via,
+                    created_user_agent=created_user_agent,
+                    import_batch_id=import_batch_id,
+                    federation_source=federation_source,
+                )
+
+                if result["status"] == "add":
+                    tools_to_add.append(result["tool"])
+                    stats["created"] += 1
+                elif result["status"] == "update":
+                    tools_to_update.append(result["tool"])
+                    stats["updated"] += 1
+                elif result["status"] == "skip":
+                    stats["skipped"] += 1
+                elif result["status"] == "fail":
+                    stats["failed"] += 1
+                    stats["errors"].append(result["error"])
+
+            # Bulk add new tools
+            if tools_to_add:
+                db.add_all(tools_to_add)
+
+            # Commit the chunk
+            db.commit()
+
+            # Refresh tools for notifications and audit trail
+            for db_tool in tools_to_add:
+                db.refresh(db_tool)
+                # Notify subscribers (sync call in async context handled by caller)
+
+            # Log bulk audit trail entry
+            if tools_to_add or tools_to_update:
+                audit_trail.log_action(
+                    user_id=created_by or "system",
+                    action="bulk_create_tools" if tools_to_add else "bulk_update_tools",
+                    resource_type="tool",
+                    resource_id=None,
+                    details={"count": len(tools_to_add) + len(tools_to_update), "import_batch_id": import_batch_id},
+                    db=db,
+                )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to process tool chunk: {str(e)}")
+            stats["failed"] += len(chunk)
+            stats["errors"].append(f"Chunk processing failed: {str(e)}")
+
+        return stats
+
+    def _process_single_tool_for_bulk(
+        self,
+        tool: ToolCreate,
+        existing_tools_map: dict,
+        conflict_strategy: str,
+        visibility: str,
+        team_id: Optional[int],
+        owner_email: Optional[str],
+        created_by: str,
+        created_from_ip: Optional[str],
+        created_via: Optional[str],
+        created_user_agent: Optional[str],
+        import_batch_id: Optional[str],
+        federation_source: Optional[str],
+    ) -> dict:
+        """Process a single tool for bulk import.
+
+        Args:
+            tool: ToolCreate object to process.
+            existing_tools_map: Dictionary mapping tool names to existing DbTool objects.
+            conflict_strategy: Strategy for handling conflicts ("skip", "update", or "fail").
+            visibility: Tool visibility level ("public", "team", or "private").
+            team_id: Team ID for team-scoped tools.
+            owner_email: Email of the tool owner.
+            created_by: Email of the user creating the tool.
+            created_from_ip: IP address of the request origin.
+            created_via: Source of the creation (e.g., "api", "ui").
+            created_user_agent: User agent string from the request.
+            import_batch_id: Batch identifier for bulk imports.
+            federation_source: Source identifier for federated tools.
+
+        Returns:
+            dict: Result dictionary with "status" key ("add", "update", "skip", or "fail")
+                and either "tool" (DbTool object) or "error" (error message).
+        """
+        try:
+            # Extract auth information
+            if tool.auth is None:
+                auth_type = None
+                auth_value = None
+            else:
+                auth_type = tool.auth.auth_type
+                auth_value = tool.auth.auth_value
+
+            # Use provided parameters or schema values
+            tool_team_id = team_id if team_id is not None else getattr(tool, "team_id", None)
+            tool_owner_email = owner_email or getattr(tool, "owner_email", None) or created_by
+            tool_visibility = visibility if visibility is not None else getattr(tool, "visibility", "public")
+
+            existing_tool = existing_tools_map.get(tool.name)
+
+            if existing_tool:
+                # Handle conflict based on strategy
+                if conflict_strategy == "skip":
+                    return {"status": "skip"}
+                if conflict_strategy == "update":
+                    # Update existing tool
+                    existing_tool.display_name = tool.displayName or tool.name
+                    existing_tool.url = str(tool.url)
+                    existing_tool.description = tool.description
+                    existing_tool.integration_type = tool.integration_type
+                    existing_tool.request_type = tool.request_type
+                    existing_tool.headers = tool.headers
+                    existing_tool.input_schema = tool.input_schema
+                    existing_tool.output_schema = tool.output_schema
+                    existing_tool.annotations = tool.annotations
+                    existing_tool.jsonpath_filter = tool.jsonpath_filter
+                    existing_tool.auth_type = auth_type
+                    existing_tool.auth_value = auth_value
+                    existing_tool.tags = tool.tags or []
+                    existing_tool.modified_by = created_by
+                    existing_tool.modified_from_ip = created_from_ip
+                    existing_tool.modified_via = created_via
+                    existing_tool.modified_user_agent = created_user_agent
+                    existing_tool.updated_at = datetime.now(timezone.utc)
+                    existing_tool.version = (existing_tool.version or 1) + 1
+
+                    # Update REST-specific fields if applicable
+                    if tool.integration_type == "REST":
+                        existing_tool.base_url = tool.base_url
+                        existing_tool.path_template = tool.path_template
+                        existing_tool.query_mapping = tool.query_mapping
+                        existing_tool.header_mapping = tool.header_mapping
+                        existing_tool.timeout_ms = tool.timeout_ms
+                        existing_tool.expose_passthrough = tool.expose_passthrough if tool.expose_passthrough is not None else True
+                        existing_tool.allowlist = tool.allowlist
+                        existing_tool.plugin_chain_pre = tool.plugin_chain_pre
+                        existing_tool.plugin_chain_post = tool.plugin_chain_post
+
+                    return {"status": "update", "tool": existing_tool}
+
+                if conflict_strategy == "rename":
+                    # Create with renamed tool
+                    new_name = f"{tool.name}_imported_{int(datetime.now().timestamp())}"
+                    db_tool = self._create_tool_object(
+                        tool,
+                        new_name,
+                        auth_type,
+                        auth_value,
+                        tool_team_id,
+                        tool_owner_email,
+                        tool_visibility,
+                        created_by,
+                        created_from_ip,
+                        created_via,
+                        created_user_agent,
+                        import_batch_id,
+                        federation_source,
+                    )
+                    return {"status": "add", "tool": db_tool}
+
+                if conflict_strategy == "fail":
+                    return {"status": "fail", "error": f"Tool name conflict: {tool.name}"}
+
+            # Create new tool
+            db_tool = self._create_tool_object(
+                tool,
+                tool.name,
+                auth_type,
+                auth_value,
+                tool_team_id,
+                tool_owner_email,
+                tool_visibility,
+                created_by,
+                created_from_ip,
+                created_via,
+                created_user_agent,
+                import_batch_id,
+                federation_source,
+            )
+            return {"status": "add", "tool": db_tool}
+
+        except Exception as e:
+            logger.warning(f"Failed to process tool {tool.name} in bulk operation: {str(e)}")
+            return {"status": "fail", "error": f"Failed to process tool {tool.name}: {str(e)}"}
+
+    def _create_tool_object(
+        self,
+        tool: ToolCreate,
+        name: str,
+        auth_type: Optional[str],
+        auth_value: Optional[str],
+        tool_team_id: Optional[int],
+        tool_owner_email: Optional[str],
+        tool_visibility: str,
+        created_by: str,
+        created_from_ip: Optional[str],
+        created_via: Optional[str],
+        created_user_agent: Optional[str],
+        import_batch_id: Optional[str],
+        federation_source: Optional[str],
+    ) -> DbTool:
+        """Create a DbTool object from ToolCreate schema.
+
+        Args:
+            tool: ToolCreate schema object containing tool data.
+            name: Name of the tool.
+            auth_type: Authentication type for the tool.
+            auth_value: Authentication value/credentials for the tool.
+            tool_team_id: Team ID for team-scoped tools.
+            tool_owner_email: Email of the tool owner.
+            tool_visibility: Tool visibility level ("public", "team", or "private").
+            created_by: Email of the user creating the tool.
+            created_from_ip: IP address of the request origin.
+            created_via: Source of the creation (e.g., "api", "ui").
+            created_user_agent: User agent string from the request.
+            import_batch_id: Batch identifier for bulk imports.
+            federation_source: Source identifier for federated tools.
+
+        Returns:
+            DbTool: Database model instance ready to be added to the session.
+        """
+        return DbTool(
+            original_name=name,
+            custom_name=name,
+            custom_name_slug=slugify(name),
+            display_name=tool.displayName or name,
+            url=str(tool.url),
+            description=tool.description,
+            integration_type=tool.integration_type,
+            request_type=tool.request_type,
+            headers=tool.headers,
+            input_schema=tool.input_schema,
+            output_schema=tool.output_schema,
+            annotations=tool.annotations,
+            jsonpath_filter=tool.jsonpath_filter,
+            auth_type=auth_type,
+            auth_value=auth_value,
+            gateway_id=tool.gateway_id,
+            tags=tool.tags or [],
+            created_by=created_by,
+            created_from_ip=created_from_ip,
+            created_via=created_via,
+            created_user_agent=created_user_agent,
+            import_batch_id=import_batch_id,
+            federation_source=federation_source,
+            version=1,
+            team_id=tool_team_id,
+            owner_email=tool_owner_email,
+            visibility=tool_visibility,
+            base_url=tool.base_url if tool.integration_type == "REST" else None,
+            path_template=tool.path_template if tool.integration_type == "REST" else None,
+            query_mapping=tool.query_mapping if tool.integration_type == "REST" else None,
+            header_mapping=tool.header_mapping if tool.integration_type == "REST" else None,
+            timeout_ms=tool.timeout_ms if tool.integration_type == "REST" else None,
+            expose_passthrough=((tool.expose_passthrough if tool.integration_type == "REST" and tool.expose_passthrough is not None else True) if tool.integration_type == "REST" else None),
+            allowlist=tool.allowlist if tool.integration_type == "REST" else None,
+            plugin_chain_pre=tool.plugin_chain_pre if tool.integration_type == "REST" else None,
+            plugin_chain_post=tool.plugin_chain_post if tool.integration_type == "REST" else None,
+        )
+
     async def list_tools(
-        self, db: Session, include_inactive: bool = False, cursor: Optional[str] = None, tags: Optional[List[str]] = None, _request_headers: Optional[Dict[str, str]] = None
+        self,
+        db: Session,
+        include_inactive: bool = False,
+        cursor: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        gateway_id: Optional[str] = None,
+        limit: Optional[int] = None,
+        _request_headers: Optional[Dict[str, str]] = None,
     ) -> tuple[List[ToolRead], Optional[str]]:
         """
         Retrieve a list of registered tools from the database with pagination support.
@@ -845,6 +1376,9 @@ class ToolService:
             cursor (Optional[str], optional): An opaque cursor token for pagination.
                 Opaque base64-encoded string containing last item's ID.
             tags (Optional[List[str]]): Filter tools by tags. If provided, only tools with at least one matching tag will be returned.
+            gateway_id (Optional[str]): Filter tools by gateway ID. Accepts the literal value 'null' to match NULL gateway_id.
+            limit (Optional[int]): Maximum number of tools to return. Use 0 for all tools (no limit).
+                If not specified, uses pagination_default_page_size.
             _request_headers (Optional[Dict[str, str]], optional): Headers from the request to pass through.
                 Currently unused but kept for API consistency. Defaults to None.
 
@@ -866,8 +1400,24 @@ class ToolService:
             >>> isinstance(tools, list)
             True
         """
-        page_size = settings.pagination_default_page_size
-        query = select(DbTool).order_by(DbTool.id)  # Consistent ordering for cursor pagination
+        # Check cache for first page only (cursor=None)
+        cache = _get_registry_cache()
+        if cursor is None:
+            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, gateway_id=gateway_id, limit=limit)
+            cached = await cache.get("tools", filters_hash)
+            if cached is not None:
+                # Reconstruct ToolRead objects from cached dicts
+                cached_tools = [ToolRead.model_validate(t) for t in cached["tools"]]
+                return (cached_tools, cached.get("next_cursor"))
+
+        # Determine page size based on limit parameter
+        # limit=None: use default, limit=0: no limit (all), limit>0: use specified (capped)
+        if limit is None:
+            page_size = settings.pagination_default_page_size
+        elif limit == 0:
+            page_size = None  # No limit - fetch all
+        else:
+            page_size = min(limit, settings.pagination_max_page_size)
 
         # Decode cursor to get last_id if provided
         last_id = None
@@ -879,11 +1429,21 @@ class ToolService:
             except ValueError as e:
                 logger.warning(f"Invalid cursor, ignoring: {e}")
 
+        logger.debug(
+            "Listing tools with include_inactive=%s, cursor=%s, tags=%s, gateway_id=%s, page_size=%s",
+            include_inactive,
+            cursor,
+            tags,
+            gateway_id,
+            page_size,
+        )
+
+        # Build query with LEFT JOIN for team names in single query instead of batch fetching
+        query = select(DbTool, EmailTeam.name.label("team_name")).outerjoin(EmailTeam, and_(DbTool.team_id == EmailTeam.id, EmailTeam.is_active.is_(True))).order_by(DbTool.id)
+
         # Apply cursor filter (WHERE id > last_id)
         if last_id:
             query = query.where(DbTool.id > last_id)
-
-        logger.debug(f"Listing tools with include_inactive={include_inactive}, cursor={cursor}, tags={tags}, page_size={page_size}")
 
         if not include_inactive:
             query = query.where(DbTool.enabled)
@@ -892,28 +1452,32 @@ class ToolService:
         if tags:
             query = query.where(json_contains_expr(db, DbTool.tags, tags, match_any=True))
 
-        # Fetch page_size + 1 to determine if there are more results
-        query = query.limit(page_size + 1)
-        tools = db.execute(query).scalars().all()
+        if gateway_id:
+            if gateway_id.lower() == "null":
+                query = query.where(DbTool.gateway_id.is_(None))
+            else:
+                query = query.where(DbTool.gateway_id == gateway_id)
 
-        # Check if there are more results
-        has_more = len(tools) > page_size
+        # Fetch page_size + 1 to determine if there are more results (unless no limit)
+        if page_size is not None:
+            query = query.limit(page_size + 1)
+        rows = db.execute(query).all()
+
+        db.commit()  # Release transaction to avoid idle-in-transaction
+
+        # Check if there are more results (only when paginating)
+        has_more = page_size is not None and len(rows) > page_size
         if has_more:
-            tools = tools[:page_size]  # Trim to page_size
+            rows = rows[:page_size]  # Trim to page_size
 
-        # Batch fetch team names for all tools at once
-        team_ids = {getattr(t, "team_id", None) for t in tools if getattr(t, "team_id", None)}
-        team_name_map = {}
-        if team_ids:
-            teams = db.query(EmailTeam.id, EmailTeam.name).filter(EmailTeam.id.in_(team_ids), EmailTeam.is_active.is_(True)).all()
-            team_name_map = {team.id: team.name for team in teams}
-
-        # Convert to ToolRead objects
+        # Convert to ToolRead objects with team names from join result
         result = []
-        for t in tools:
-            team_name = team_name_map.get(getattr(t, "team_id", None))
-            t.team = team_name
-            result.append(self._convert_tool_to_read(t))
+        tools = []
+        for row in rows:
+            tool, team_name = row[0], row.team_name
+            tool.team = team_name
+            tools.append(tool)
+            result.append(self._convert_tool_to_read(tool, include_metrics=False))
 
         # Generate next_cursor if there are more results
         next_cursor = None
@@ -921,6 +1485,14 @@ class ToolService:
             last_tool = tools[-1]  # Get last DB object (not ToolRead)
             next_cursor = encode_cursor({"id": last_tool.id})
             logger.debug(f"Generated next_cursor for id={last_tool.id}")
+
+        # Cache first page results
+        if cursor is None:
+            try:
+                cache_data = {"tools": [t.model_dump(mode="json") for t in result], "next_cursor": next_cursor}
+                await cache.set("tools", cache_data, filters_hash)
+            except AttributeError:
+                pass  # Skip caching if result objects don't support model_dump (e.g., in doctests)
 
         return (result, next_cursor)
 
@@ -978,32 +1550,40 @@ class ToolService:
         if not include_inactive:
             query = query.where(DbTool.enabled)
 
-        # Execute the query and retrieve tools
-        tools = db.execute(query).scalars().all()
+        # Execute the query with LEFT JOIN for team names in single query
+        query_with_join = query.outerjoin(EmailTeam, and_(DbTool.team_id == EmailTeam.id, EmailTeam.is_active.is_(True))).add_columns(EmailTeam.name.label("team_name"))
 
-        team_ids = {getattr(t, "team_id", None) for t in tools if getattr(t, "team_id", None)}
+        rows = db.execute(query_with_join).all()
 
-        # If there are team_ids, fetch all corresponding team names at once
-        if team_ids:
-            teams = db.query(EmailTeam.id, EmailTeam.name).filter(EmailTeam.id.in_(team_ids), EmailTeam.is_active.is_(True)).all()
-            team_name_map = {team.id: team.name for team in teams}
-        else:
-            team_name_map = {}
+        db.commit()  # Release transaction to avoid idle-in-transaction
 
-        # Add team names to tools based on the map
+        # Add team names to tools based on join result
         result = []
-        for t in tools:
-            team_name = team_name_map.get(getattr(t, "team_id", None))
-            t.team = team_name
-            result.append(self._convert_tool_to_read(t, include_metrics=include_metrics))
+        for row in rows:
+            tool = row[0]
+            team_name = row.team_name
+            tool.team = team_name
+            result.append(self._convert_tool_to_read(tool, include_metrics=include_metrics))
 
         return result
 
     async def list_tools_for_user(
-        self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, _skip: int = 0, _limit: int = 100
-    ) -> List[ToolRead]:
+        self,
+        db: Session,
+        user_email: str,
+        team_id: Optional[str] = None,
+        visibility: Optional[str] = None,
+        include_inactive: bool = False,
+        _skip: int = 0,
+        _limit: int = 100,
+        *,
+        cursor: Optional[str] = None,
+        gateway_id: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[List[ToolRead], Optional[str]]:
         """
-        List tools user has access to with team filtering.
+        List tools user has access to with team filtering and cursor pagination.
 
         Args:
             db: Database session
@@ -1011,12 +1591,36 @@ class ToolService:
             team_id: Optional team ID to filter by specific team
             visibility: Optional visibility filter (private, team, public)
             include_inactive: Whether to include inactive tools
-            _skip: Number of tools to skip for pagination
-            _limit: Maximum number of tools to return
+            _skip: Number of tools to skip for pagination (deprecated)
+            _limit: Maximum number of tools to return (deprecated)
+            cursor: Opaque cursor token for pagination
+            gateway_id: Filter tools by gateway ID. Accepts literal 'null' for NULL gateway_id.
+            tags: Filter tools by tags (match any)
+            limit: Maximum number of tools to return. Use 0 for all tools (no limit).
+                If not specified, uses pagination_default_page_size.
 
         Returns:
-            List[ToolRead]: Tools the user has access to
+            tuple[List[ToolRead], Optional[str]]: Tools the user has access to and optional next_cursor
         """
+        # Determine page size based on limit parameter
+        # limit=None: use default, limit=0: no limit (all), limit>0: use specified (capped)
+        if limit is None:
+            page_size = settings.pagination_default_page_size
+        elif limit == 0:
+            page_size = None  # No limit - fetch all
+        else:
+            page_size = min(limit, settings.pagination_max_page_size)
+
+        # Decode cursor to get last_id if provided
+        last_id = None
+        if cursor:
+            try:
+                cursor_data = decode_cursor(cursor)
+                last_id = cursor_data.get("id")
+                logger.debug(f"Decoded cursor: last_id={last_id}")
+            except ValueError as e:
+                logger.warning(f"Invalid cursor, ignoring: {e}")
+
         # Build query following existing patterns from list_tools()
         team_service = TeamManagementService(db)
         user_teams = await team_service.get_user_teams(user_email)
@@ -1024,69 +1628,78 @@ class ToolService:
 
         query = select(DbTool)
 
-        offset = 0
-        per_page = settings.pagination_default_page_size
-
         # Apply active/inactive filter
         if not include_inactive:
             query = query.where(DbTool.enabled.is_(True))
 
         if team_id:
             if team_id not in team_ids:
-                return []  # No access to team
+                return ([], None)  # No access to team
 
-            access_conditions = []
-            # Filter by specific team
-            access_conditions.append(and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])))
-
-            access_conditions.append(and_(DbTool.team_id == team_id, DbTool.owner_email == user_email))
-
+            access_conditions = [
+                and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
+                and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+            ]
             query = query.where(or_(*access_conditions))
-
-            query = query.offset(offset).limit(per_page)
         else:
-            # Get user's accessible teams
-            # Build access conditions following existing patterns
-
-            access_conditions = []
-
-            # 1. User's personal resources (owner_email matches)
-            access_conditions.append(DbTool.owner_email == user_email)
-
-            # 2. Team resources where user is member
+            access_conditions = [
+                DbTool.owner_email == user_email,
+                DbTool.visibility == "public",
+            ]
             if team_ids:
                 access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
 
-            # 3. Public resources (if visibility allows)
-            access_conditions.append(DbTool.visibility == "public")
-
             query = query.where(or_(*access_conditions))
-
-            query = query.offset(offset).limit(per_page)
 
         # Apply visibility filter if specified
         if visibility:
             query = query.where(DbTool.visibility == visibility)
 
-        # Note: Pagination is currently not implemented so this limit is not supporeted as of now
-        # # Apply pagination following existing patterns
-        # query = query.offset(skip).limit(limit)
+        if gateway_id:
+            if gateway_id.lower() == "null":
+                query = query.where(DbTool.gateway_id.is_(None))
+            else:
+                query = query.where(DbTool.gateway_id == gateway_id)
 
-        tools = db.execute(query).scalars().all()
+        if tags:
+            query = query.where(json_contains_expr(db, DbTool.tags, tags, match_any=True))
 
-        # Batch fetch team names for all tools at once
-        tool_team_ids = {getattr(t, "team_id", None) for t in tools if getattr(t, "team_id", None)}
-        team_name_map = {}
-        if tool_team_ids:
-            teams = db.query(EmailTeam.id, EmailTeam.name).filter(EmailTeam.id.in_(tool_team_ids), EmailTeam.is_active.is_(True)).all()
-            team_name_map = {team.id: team.name for team in teams}
+        # Apply cursor filter (WHERE id > last_id)
+        if last_id:
+            query = query.where(DbTool.id > last_id)
 
+        query = query.order_by(DbTool.id)
+
+        # Execute query with LEFT JOIN for team names in single query
+        query_with_join = query.outerjoin(EmailTeam, and_(DbTool.team_id == EmailTeam.id, EmailTeam.is_active.is_(True))).add_columns(EmailTeam.name.label("team_name"))
+        if page_size is not None:
+            rows = db.execute(query_with_join.limit(page_size + 1)).all()
+        else:
+            rows = db.execute(query_with_join).all()
+
+        db.commit()  # Release transaction to avoid idle-in-transaction
+
+        # Check if there are more results (only when paginating)
+        has_more = page_size is not None and len(rows) > page_size
+        if has_more:
+            rows = rows[:page_size]
+
+        # Convert to ToolRead objects with team names from join result
         result = []
-        for t in tools:
-            team_name = team_name_map.get(getattr(t, "team_id", None))
-            t.team = team_name
-            result.append(self._convert_tool_to_read(t))
-        return result
+        tools = []
+        for row in rows:
+            tool = row[0]
+            team_name = row.team_name
+            tool.team = team_name
+            tools.append(tool)
+            result.append(self._convert_tool_to_read(tool, include_metrics=False))
+
+        next_cursor = None
+        if has_more and tools:
+            last_tool = tools[-1]
+            next_cursor = encode_cursor({"id": last_tool.id})
+
+        return (result, next_cursor)
 
     async def get_tool(self, db: Session, tool_id: str) -> ToolRead:
         """
@@ -1218,6 +1831,15 @@ class ToolService:
                 },
                 db=db,
             )
+
+            # Invalidate cache after successful deletion
+            cache = _get_registry_cache()
+            await cache.invalidate_tools()
+            # Also invalidate tags cache since tool tags may have changed
+            # First-Party
+            from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
+
+            await admin_stats_cache.invalidate_tags()
         except PermissionError as pe:
             db.rollback()
 
@@ -1251,7 +1873,7 @@ class ToolService:
             )
             raise ToolError(f"Failed to delete tool: {str(e)}")
 
-    async def toggle_tool_status(self, db: Session, tool_id: str, activate: bool, reachable: bool, user_email: Optional[str] = None) -> ToolRead:
+    async def toggle_tool_status(self, db: Session, tool_id: str, activate: bool, reachable: bool, user_email: Optional[str] = None, skip_cache_invalidation: bool = False) -> ToolRead:
         """
         Toggle the activation status of a tool.
 
@@ -1261,6 +1883,7 @@ class ToolService:
             activate (bool): True to activate, False to deactivate.
             reachable (bool): True if the tool is reachable.
             user_email: Optional[str] The email of the user to check if the user has permission to modify.
+            skip_cache_invalidation: If True, skip cache invalidation (used for batch operations).
 
         Returns:
             ToolRead: The updated tool object.
@@ -1315,6 +1938,11 @@ class ToolService:
 
                 db.commit()
                 db.refresh(tool)
+
+                # Invalidate cache after status change (skip for batch operations)
+                if not skip_cache_invalidation:
+                    cache = _get_registry_cache()
+                    await cache.invalidate_tools()
 
                 if not tool.enabled:
                     # Inactive
@@ -1447,7 +2075,13 @@ class ToolService:
         """
         # pylint: disable=comparison-with-callable
         logger.info(f"Invoking tool: {name} with arguments: {arguments.keys() if arguments else None} and headers: {request_headers.keys() if request_headers else None}")
-        tool = db.execute(select(DbTool).where(DbTool.name == name).where(DbTool.enabled)).scalar_one_or_none()
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # PHASE 1: Fetch all required data with eager loading to minimize DB queries
+        # ═══════════════════════════════════════════════════════════════════════════
+
+        # Eager load tool WITH gateway in single query to prevent lazy load N+1
+        tool = db.execute(select(DbTool).options(joinedload(DbTool.gateway)).where(DbTool.name == name).where(DbTool.enabled)).scalar_one_or_none()
         if not tool:
             inactive_tool = db.execute(select(DbTool).where(DbTool.name == name).where(not_(DbTool.enabled))).scalar_one_or_none()
             if inactive_tool:
@@ -1463,17 +2097,74 @@ class ToolService:
         if tool.integration_type == "A2A" and tool.annotations and "a2a_agent_id" in tool.annotations:
             return await self._invoke_a2a_tool(db=db, tool=tool, arguments=arguments)
 
+        # Get passthrough headers from in-memory cache (Issue #1715)
+        # This eliminates 42,000+ redundant DB queries under load
+        passthrough_allowed = global_config_cache.get_passthrough_headers(db, settings.default_passthrough_headers)
+
+        # Access gateway now (already eager-loaded) to prevent later lazy load
+        gateway = tool.gateway
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # PHASE 2: Extract all needed data to local variables before network I/O
+        # This allows us to release the DB session before making HTTP calls
+        # ═══════════════════════════════════════════════════════════════════════════
+
+        tool_id = str(tool.id)
+        tool_name_original = tool.original_name
+        tool_name_computed = tool.name
+        tool_url = tool.url
+        tool_integration_type = tool.integration_type
+        tool_request_type = tool.request_type
+        tool_headers = dict(tool.headers) if tool.headers else {}
+        tool_auth_type = tool.auth_type
+        tool_auth_value = tool.auth_value
+        tool_jsonpath_filter = tool.jsonpath_filter
+        tool_output_schema = tool.output_schema
+        tool_oauth_config = getattr(tool, "oauth_config", None)
+        tool_gateway_id = tool.gateway_id
+
+        # Save gateway existence as local boolean BEFORE db.close()
+        # to avoid checking ORM object truthiness after session is closed
+        has_gateway = gateway is not None
+        gateway_url = gateway.url if has_gateway else None
+        gateway_name = gateway.name if has_gateway else None
+        gateway_auth_type = gateway.auth_type if has_gateway else None
+        gateway_auth_value = gateway.auth_value if has_gateway else None
+        gateway_oauth_config = gateway.oauth_config if has_gateway else None
+        gateway_ca_cert = gateway.ca_certificate if has_gateway else None
+        gateway_ca_cert_sig = gateway.ca_certificate_sig if has_gateway else None
+        gateway_passthrough = gateway.passthrough_headers if has_gateway else None
+        gateway_id_str = str(gateway.id) if has_gateway else None
+
+        # Create Pydantic models for plugins BEFORE HTTP calls (use ORM objects while still valid)
+        # This prevents lazy loading during HTTP calls
+        tool_metadata: Optional[PydanticTool] = None
+        gateway_metadata: Optional[PydanticGateway] = None
+        if self._plugin_manager:
+            tool_metadata = PydanticTool.model_validate(tool)
+            if has_gateway:
+                gateway_metadata = PydanticGateway.model_validate(gateway)
+
+        # ═══════════════════════════════════════════════════════════════════════════
+        # CRITICAL: Release DB connection back to pool BEFORE making HTTP calls
+        # This prevents connection pool exhaustion during slow upstream requests.
+        # All needed data has been extracted to local variables above.
+        # The session will be closed again by FastAPI's get_db() finally block (safe no-op).
+        # ═══════════════════════════════════════════════════════════════════════════
+        db.commit()  # End read-only transaction cleanly (commit not rollback to avoid inflating rollback stats)
+        db.close()
+
         # Plugin hook: tool pre-invoke
         # Use existing context_table from previous hooks if available
         context_table = plugin_context_table
 
         # Reuse existing global_context from middleware or create new one
+        # IMPORTANT: Use local variables (tool_gateway_id) instead of ORM object access
         if plugin_global_context:
             global_context = plugin_global_context
-            # Update server_id if we have better information
-            gateway_id = getattr(tool, "gateway_id", None)
-            if gateway_id and isinstance(gateway_id, str):
-                global_context.server_id = gateway_id
+            # Update server_id using local variable (not ORM access)
+            if tool_gateway_id and isinstance(tool_gateway_id, str):
+                global_context.server_id = tool_gateway_id
             # Propagate user email to global context for plugin access
             if app_user_email and isinstance(app_user_email, str):
                 global_context.user = app_user_email
@@ -1481,52 +2172,53 @@ class ToolService:
             # Create new context (fallback when middleware didn't run)
             # Use correlation ID from context if available, otherwise generate new one
             request_id = get_correlation_id() or uuid.uuid4().hex
-            gateway_id = getattr(tool, "gateway_id", "unknown")
-            server_id = gateway_id if isinstance(gateway_id, str) else "unknown"
+            server_id = tool_gateway_id if tool_gateway_id and isinstance(tool_gateway_id, str) else "unknown"
             global_context = GlobalContext(request_id=request_id, server_id=server_id, tenant_id=None, user=app_user_email)
 
         start_time = time.monotonic()
         success = False
         error_message = None
 
-        # Create a trace span for the tool invocation
+        # Create a trace span for the tool invocation (using local variables)
         with create_span(
             "tool.invoke",
             {
                 "tool.name": name,
-                "tool.id": str(tool.id) if tool else "unknown",
-                "tool.integration_type": tool.integration_type if tool else "unknown",
-                "tool.gateway_id": str(tool.gateway_id) if tool and tool.gateway_id else None,
+                "tool.id": tool_id,
+                "tool.integration_type": tool_integration_type,
+                "tool.gateway_id": tool_gateway_id,
                 "arguments_count": len(arguments) if arguments else 0,
                 "has_headers": bool(request_headers),
             },
         ) as span:
             try:
                 # Get combined headers for the tool including base headers, auth, and passthrough headers
-                # headers = self._get_combined_headers(db, tool, tool.headers or {}, request_headers)
-                headers = tool.headers or {}
-                if tool.integration_type == "REST":
+                headers = tool_headers.copy()
+                if tool_integration_type == "REST":
                     # Handle OAuth authentication for REST tools
-                    if tool.auth_type == "oauth" and hasattr(tool, "oauth_config") and tool.oauth_config:
+                    if tool_auth_type == "oauth" and tool_oauth_config:
                         try:
-                            access_token = await self.oauth_manager.get_access_token(tool.oauth_config)
+                            access_token = await self.oauth_manager.get_access_token(tool_oauth_config)
                             headers["Authorization"] = f"Bearer {access_token}"
                         except Exception as e:
-                            logger.error(f"Failed to obtain OAuth access token for tool {tool.name}: {e}")
+                            logger.error(f"Failed to obtain OAuth access token for tool {tool_name_computed}: {e}")
                             raise ToolInvocationError(f"OAuth authentication failed: {str(e)}")
                     else:
-                        credentials = decode_auth(tool.auth_value)
+                        credentials = decode_auth(tool_auth_value)
                         # Filter out empty header names/values to avoid "Illegal header name" errors
                         filtered_credentials = {k: v for k, v in credentials.items() if k and v}
                         headers.update(filtered_credentials)
 
-                    # Only call get_passthrough_headers if we actually have request headers to pass through
+                    # Use cached passthrough headers (no DB query needed)
                     if request_headers:
-                        headers = get_passthrough_headers(request_headers, headers, db)
+                        headers = compute_passthrough_headers_cached(
+                            request_headers, headers, passthrough_allowed, gateway_auth_type=None, gateway_passthrough_headers=None  # REST tools don't use gateway auth here
+                        )
 
                     if self._plugin_manager:
-                        tool_metadata = PydanticTool.model_validate(tool)
-                        global_context.metadata[TOOL_METADATA] = tool_metadata
+                        # Use pre-created Pydantic model from Phase 2 (no ORM access)
+                        if tool_metadata:
+                            global_context.metadata[TOOL_METADATA] = tool_metadata
                         pre_result, context_table = await self._plugin_manager.invoke_hook(
                             ToolHookType.TOOL_PRE_INVOKE,
                             payload=ToolPreInvokePayload(name=name, args=arguments, headers=HttpHeaderPayload(root=headers)),
@@ -1544,11 +2236,11 @@ class ToolService:
                     # Build the payload based on integration type
                     payload = arguments.copy()
 
-                    # Handle URL path parameter substitution
-                    final_url = tool.url
-                    if "{" in tool.url and "}" in tool.url:
+                    # Handle URL path parameter substitution (using local variable)
+                    final_url = tool_url
+                    if "{" in tool_url and "}" in tool_url:
                         # Extract path parameters from URL template and arguments
-                        url_params = re.findall(r"\{(\w+)\}", tool.url)
+                        url_params = re.findall(r"\{(\w+)\}", tool_url)
                         url_substitutions = {}
 
                         for param in url_params:
@@ -1567,8 +2259,8 @@ class ToolService:
                     # Merge leftover payload + query params
                     payload.update(query_params)
 
-                    # Use the tool's request_type rather than defaulting to POST.
-                    method = tool.request_type.upper()
+                    # Use the tool's request_type rather than defaulting to POST (using local variable)
+                    method = tool_request_type.upper() if tool_request_type else "POST"
                     if method == "GET":
                         response = await self._http_client.get(final_url, params=payload, headers=headers)
                     else:
@@ -1582,7 +2274,7 @@ class ToolService:
                     elif response.status_code not in [200, 201, 202, 206]:
                         try:
                             result = response.json()
-                        except json.JSONDecodeError:
+                        except orjson.JSONDecodeError:
                             result = {"response_text": response.text} if response.text else {}
                         tool_result = ToolResult(
                             content=[TextContent(type="text", text=str(result["error"]) if "error" in result else "Tool error encountered")],
@@ -1592,63 +2284,64 @@ class ToolService:
                     else:
                         try:
                             result = response.json()
-                        except json.JSONDecodeError:
+                        except orjson.JSONDecodeError:
                             result = {"response_text": response.text} if response.text else {}
                         logger.debug(f"REST API tool response: {result}")
-                        filtered_response = extract_using_jq(result, tool.jsonpath_filter)
-                        tool_result = ToolResult(content=[TextContent(type="text", text=json.dumps(filtered_response, indent=2))])
+                        filtered_response = extract_using_jq(result, tool_jsonpath_filter)
+                        tool_result = ToolResult(content=[TextContent(type="text", text=orjson.dumps(filtered_response, option=orjson.OPT_INDENT_2).decode())])
                         success = True
                         # If output schema is present, validate and attach structured content
-                        if getattr(tool, "output_schema", None):
+                        if tool_output_schema:
                             valid = self._extract_and_validate_structured_content(tool, tool_result, candidate=filtered_response)
                             success = bool(valid)
-                elif tool.integration_type == "MCP":
-                    transport = tool.request_type.lower()
-                    # gateway = db.execute(select(DbGateway).where(DbGateway.id == tool.gateway_id).where(DbGateway.enabled)).scalar_one_or_none()
-                    gateway = tool.gateway
+                elif tool_integration_type == "MCP":
+                    transport = tool_request_type.lower() if tool_request_type else "sse"
 
-                    # Handle OAuth authentication for the gateway
-                    if gateway and gateway.auth_type == "oauth" and gateway.oauth_config:
-                        grant_type = gateway.oauth_config.get("grant_type", "client_credentials")
+                    # Handle OAuth authentication for the gateway (using local variables)
+                    # NOTE: Use has_gateway instead of gateway to avoid accessing detached ORM object
+                    if has_gateway and gateway_auth_type == "oauth" and gateway_oauth_config:
+                        grant_type = gateway_oauth_config.get("grant_type", "client_credentials")
 
                         if grant_type == "authorization_code":
                             # For Authorization Code flow, try to get stored tokens
+                            # NOTE: Use fresh_db_session() since the original db was closed
                             try:
                                 # First-Party
                                 from mcpgateway.services.token_storage_service import TokenStorageService  # pylint: disable=import-outside-toplevel
 
-                                token_storage = TokenStorageService(db)
+                                with fresh_db_session() as token_db:
+                                    token_storage = TokenStorageService(token_db)
 
-                                # Get user-specific OAuth token
-                                if not app_user_email:
-                                    raise ToolInvocationError(f"User authentication required for OAuth-protected gateway '{gateway.name}'. Please ensure you are authenticated.")
+                                    # Get user-specific OAuth token
+                                    if not app_user_email:
+                                        raise ToolInvocationError(f"User authentication required for OAuth-protected gateway '{gateway_name}'. Please ensure you are authenticated.")
 
-                                access_token = await token_storage.get_user_token(gateway.id, app_user_email)
+                                    access_token = await token_storage.get_user_token(gateway_id_str, app_user_email)
 
                                 if access_token:
                                     headers = {"Authorization": f"Bearer {access_token}"}
                                 else:
                                     # User hasn't authorized this gateway yet
-                                    raise ToolInvocationError(f"Please authorize {gateway.name} first. Visit /oauth/authorize/{gateway.id} to complete OAuth flow.")
+                                    raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
                             except Exception as e:
-                                logger.error(f"Failed to obtain stored OAuth token for gateway {gateway.name}: {e}")
+                                logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
                                 raise ToolInvocationError(f"OAuth token retrieval failed for gateway: {str(e)}")
                         else:
-                            # For Client Credentials flow, get token directly
+                            # For Client Credentials flow, get token directly (no DB needed)
                             try:
-                                access_token = await self.oauth_manager.get_access_token(gateway.oauth_config)
+                                access_token = await self.oauth_manager.get_access_token(gateway_oauth_config)
                                 headers = {"Authorization": f"Bearer {access_token}"}
                             except Exception as e:
-                                logger.error(f"Failed to obtain OAuth access token for gateway {gateway.name}: {e}")
+                                logger.error(f"Failed to obtain OAuth access token for gateway {gateway_name}: {e}")
                                 raise ToolInvocationError(f"OAuth authentication failed for gateway: {str(e)}")
                     else:
-                        headers = decode_auth(gateway.auth_value if gateway else None)
+                        headers = decode_auth(gateway_auth_value)
 
-                    # Get combined headers including gateway auth and passthrough
+                    # Use cached passthrough headers (no DB query needed)
                     if request_headers:
-                        headers = get_passthrough_headers(request_headers, headers, db, gateway)
-
-
+                        headers = compute_passthrough_headers_cached(
+                            request_headers, headers, passthrough_allowed, gateway_auth_type=gateway_auth_type, gateway_passthrough_headers=gateway_passthrough
+                        )
 
                     def create_ssl_context(ca_certificate: str) -> ssl.SSLContext:
                         """Create an SSL context with the provided CA certificate.
@@ -1681,15 +2374,16 @@ class ToolService:
                         Raises:
                             Exception: If CA certificate signature is invalid
                         """
+                        # Use local variables instead of ORM objects (captured from outer scope)
                         valid = False
-                        if gateway.ca_certificate:
+                        if gateway_ca_cert:
                             if settings.enable_ed25519_signing:
                                 public_key_pem = settings.ed25519_public_key
-                                valid = validate_signature(gateway.ca_certificate.encode(), gateway.ca_certificate_sig, public_key_pem)
+                                valid = validate_signature(gateway_ca_cert.encode(), gateway_ca_cert_sig, public_key_pem)
                             else:
                                 valid = True
                         if valid:
-                            ctx = create_ssl_context(gateway.ca_certificate)
+                            ctx = create_ssl_context(gateway_ca_cert)
                         else:
                             ctx = None
                         return httpx.AsyncClient(
@@ -1720,45 +2414,45 @@ class ToolService:
                         if correlation_id and headers:
                             headers["X-Correlation-ID"] = correlation_id
 
-                        # Log MCP call start
+                        # Log MCP call start (using local variables)
                         mcp_start_time = time.time()
                         structured_logger.log(
                             level="INFO",
-                            message=f"MCP tool call started: {tool.original_name}",
+                            message=f"MCP tool call started: {tool_name_original}",
                             component="tool_service",
                             correlation_id=correlation_id,
-                            metadata={"event": "mcp_call_started", "tool_name": tool.original_name, "tool_id": tool.id, "server_url": server_url, "transport": "sse"},
+                            metadata={"event": "mcp_call_started", "tool_name": tool_name_original, "tool_id": tool_id, "server_url": server_url, "transport": "sse"},
                         )
 
                         try:
                             async with sse_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as streams:
                                 async with ClientSession(*streams) as session:
                                     await session.initialize()
-                                    tool_call_result = await session.call_tool(tool.original_name, arguments)
+                                    tool_call_result = await session.call_tool(tool_name_original, arguments)
 
                             # Log successful MCP call
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
                                 level="INFO",
-                                message=f"MCP tool call completed: {tool.original_name}",
+                                message=f"MCP tool call completed: {tool_name_original}",
                                 component="tool_service",
                                 correlation_id=correlation_id,
                                 duration_ms=mcp_duration_ms,
-                                metadata={"event": "mcp_call_completed", "tool_name": tool.original_name, "tool_id": tool.id, "transport": "sse", "success": True},
+                                metadata={"event": "mcp_call_completed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "sse", "success": True},
                             )
 
                             return tool_call_result
                         except Exception as e:
-                            # Log failed MCP call
+                            # Log failed MCP call (using local variables)
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
                                 level="ERROR",
-                                message=f"MCP tool call failed: {tool.original_name}",
+                                message=f"MCP tool call failed: {tool_name_original}",
                                 component="tool_service",
                                 correlation_id=correlation_id,
                                 duration_ms=mcp_duration_ms,
                                 error_details={"error_type": type(e).__name__, "error_message": str(e)},
-                                metadata={"event": "mcp_call_failed", "tool_name": tool.original_name, "tool_id": tool.id, "transport": "sse"},
+                                metadata={"event": "mcp_call_failed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "sse"},
                             )
                             raise
 
@@ -1782,16 +2476,14 @@ class ToolService:
                         if correlation_id and headers:
                             headers["X-Correlation-ID"] = correlation_id
 
-                        # logger.error(f"************Request FINAL Headers ******** {headers}")
-
-                        # Log MCP call start
+                        # Log MCP call start (using local variables)
                         mcp_start_time = time.time()
                         structured_logger.log(
                             level="INFO",
-                            message=f"MCP tool call started: {tool.original_name}",
+                            message=f"MCP tool call started: {tool_name_original}",
                             component="tool_service",
                             correlation_id=correlation_id,
-                            metadata={"event": "mcp_call_started", "tool_name": tool.original_name, "tool_id": tool.id, "server_url": server_url, "transport": "streamablehttp"},
+                            metadata={"event": "mcp_call_started", "tool_name": tool_name_original, "tool_id": tool_id, "server_url": server_url, "transport": "streamablehttp"},
                         )
 
                         try:
@@ -1809,12 +2501,12 @@ class ToolService:
                                 mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                                 structured_logger.log(
                                     level="INFO",
-                                    message=f"MCP tool call completed: {tool.original_name}",
+                                    message=f"MCP tool call completed: {tool_original_name}",
                                     component="tool_service",
                                     correlation_id=correlation_id,
                                     duration_ms=mcp_duration_ms,
-                                    metadata={"event": "mcp_call_completed", "tool_name": tool.original_name,
-                                              "tool_id": tool.id, "transport": "streamablehttp", "success": True},
+                                    metadata={"event": "mcp_call_completed", "tool_name": tool_original_name,
+                                              "tool_id": tool_id, "transport": "streamablehttp", "success": True},
                                 )
 
                                 return tool_call_result
@@ -1829,12 +2521,26 @@ class ToolService:
                                 mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                                 structured_logger.log(
                                     level="INFO",
-                                    message=f"MCP tool call completed: {tool.original_name}",
+                                    message=f"MCP tool call completed: {tool_original_name}",
                                     component="tool_service",
                                     correlation_id=correlation_id,
                                     duration_ms=mcp_duration_ms,
-                                    metadata={"event": "mcp_call_completed", "tool_name": tool.original_name, "tool_id": tool.id, "transport": "streamablehttp", "success": True},
+                                    metadata={"event": "mcp_call_completed", "tool_name": tool_original_name, "tool_id": tool_id, "transport": "streamablehttp", "success": True},
                                 )
+                            async with streamablehttp_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as (read_stream, write_stream, _get_session_id):
+                                async with ClientSession(read_stream, write_stream) as session:
+                                    await session.initialize()
+                                    tool_call_result = await session.call_tool(tool_name_original, arguments)
+                            # Log successful MCP call
+                            mcp_duration_ms = (time.time() - mcp_start_time) * 1000
+                            structured_logger.log(
+                                level="INFO",
+                                message=f"MCP tool call completed: {tool_name_original}",
+                                component="tool_service",
+                                correlation_id=correlation_id,
+                                duration_ms=mcp_duration_ms,
+                                metadata={"event": "mcp_call_completed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "streamablehttp", "success": True},
+                            )
 
                             return tool_call_result
                         except Exception as e:
@@ -1842,23 +2548,23 @@ class ToolService:
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
                                 level="ERROR",
-                                message=f"MCP tool call failed: {tool.original_name}",
+                                message=f"MCP tool call failed: {tool_name_original}",
                                 component="tool_service",
                                 correlation_id=correlation_id,
                                 duration_ms=mcp_duration_ms,
                                 error_details={"error_type": type(e).__name__, "error_message": str(e)},
-                                metadata={"event": "mcp_call_failed", "tool_name": tool.original_name, "tool_id": tool.id, "transport": "streamablehttp"},
+                                metadata={"event": "mcp_call_failed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "streamablehttp"},
                             )
                             raise
 
-                    tool_gateway_id = tool.gateway_id
-                    tool_gateway = db.execute(select(DbGateway).where(DbGateway.id == tool_gateway_id).where(DbGateway.enabled)).scalar_one_or_none()
+                    # REMOVED: Redundant gateway query - gateway already eager-loaded via joinedload
+                    # tool_gateway = db.execute(select(DbGateway).where(DbGateway.id == tool_gateway_id)...)
 
                     if self._plugin_manager:
-                        tool_metadata = PydanticTool.model_validate(tool)
-                        global_context.metadata[TOOL_METADATA] = tool_metadata
-                        if tool_gateway:
-                            gateway_metadata = PydanticGateway.model_validate(tool_gateway)
+                        # Use pre-created Pydantic models from Phase 2 (no ORM access)
+                        if tool_metadata:
+                            global_context.metadata[TOOL_METADATA] = tool_metadata
+                        if gateway_metadata:
                             global_context.metadata[GATEWAY_METADATA] = gateway_metadata
                             global_context.metadata["request_headers"] = request_headers
                         pre_result, context_table = await self._plugin_manager.invoke_hook(
@@ -1877,15 +2583,15 @@ class ToolService:
 
                     tool_call_result = ToolResult(content=[TextContent(text="", type="text")])
                     if transport == "sse":
-                        tool_call_result = await connect_to_sse_server(tool_gateway.url, headers=headers)
+                        tool_call_result = await connect_to_sse_server(gateway_url, headers=headers)
                     elif transport == "streamablehttp":
-                        tool_call_result = await connect_to_streamablehttp_server(tool_gateway.url, headers=headers)
+                        tool_call_result = await connect_to_streamablehttp_server(gateway_url, headers=headers)
                     dump = tool_call_result.model_dump(by_alias=True)
                     logger.debug(f"Tool call result dump: {dump}")
                     content = dump.get("content", [])
                     # Accept both alias and pythonic names for structured content
                     structured = dump.get("structuredContent") or dump.get("structured_content")
-                    filtered_response = extract_using_jq(content, tool.jsonpath_filter)
+                    filtered_response = extract_using_jq(content, tool_jsonpath_filter)
 
                     is_err = getattr(tool_call_result, "is_error", None)
                     if is_err is None:
@@ -1938,19 +2644,33 @@ class ToolService:
                     span.set_attribute("success", success)
                     span.set_attribute("duration.ms", duration_ms)
 
-                # Record tool metric
-                await self._record_tool_metric(db, tool, start_time, success, error_message)
+                # ═══════════════════════════════════════════════════════════════════════════
+                # PHASE 4: Record metrics via buffered service (batches writes for performance)
+                # ═══════════════════════════════════════════════════════════════════════════
+                try:
+                    # First-Party
+                    from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
 
-                # Log structured message with performance tracking
+                    metrics_buffer = get_metrics_buffer_service()
+                    metrics_buffer.record_tool_metric(
+                        tool_id=tool_id,
+                        start_time=start_time,
+                        success=success,
+                        error_message=error_message,
+                    )
+                except Exception as metric_error:
+                    logger.warning(f"Failed to record tool metric: {metric_error}")
+
+                # Log structured message with performance tracking (using local variables)
                 if success:
                     structured_logger.info(
                         f"Tool '{name}' invoked successfully",
                         user_id=app_user_email,
                         resource_type="tool",
-                        resource_id=str(tool.id),
+                        resource_id=tool_id,
                         resource_action="invoke",
                         duration_ms=duration_ms,
-                        custom_fields={"tool_name": name, "integration_type": tool.integration_type, "arguments_count": len(arguments) if arguments else 0},
+                        custom_fields={"tool_name": name, "integration_type": tool_integration_type, "arguments_count": len(arguments) if arguments else 0},
                     )
                 else:
                     structured_logger.error(
@@ -1958,10 +2678,10 @@ class ToolService:
                         error=Exception(error_message) if error_message else None,
                         user_id=app_user_email,
                         resource_type="tool",
-                        resource_id=str(tool.id),
+                        resource_id=tool_id,
                         resource_action="invoke",
                         duration_ms=duration_ms,
-                        custom_fields={"tool_name": name, "integration_type": tool.integration_type, "error_message": error_message},
+                        custom_fields={"tool_name": name, "integration_type": tool_integration_type, "error_message": error_message},
                     )
 
                 # Track performance with threshold checking
@@ -2161,6 +2881,15 @@ class ToolService:
                 },
                 db=db,
             )
+
+            # Invalidate cache after successful update
+            cache = _get_registry_cache()
+            await cache.invalidate_tools()
+            # Also invalidate tags cache since tool tags may have changed
+            # First-Party
+            from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
+
+            await admin_stats_cache.invalidate_tags()
 
             return self._convert_tool_to_read(tool)
         except PermissionError as pe:
@@ -2427,6 +3156,9 @@ class ToolService:
         """
         Aggregate metrics for all tool invocations across all tools.
 
+        Uses in-memory caching (10s TTL) to reduce database load under high
+        request rates. Cache is invalidated when metrics are reset.
+
         Args:
             db: Database session
 
@@ -2457,6 +3189,14 @@ class ToolService:
             >>> result['failure_rate']
             0.2
         """
+        # Check cache first (if enabled)
+        # First-Party
+        from mcpgateway.cache.metrics_cache import is_cache_enabled, metrics_cache  # pylint: disable=import-outside-toplevel
+
+        if is_cache_enabled():
+            cached = metrics_cache.get("tools")
+            if cached is not None:
+                return cached
 
         # Query to get all aggregated metrics at once
         result = db.execute(
@@ -2476,7 +3216,7 @@ class ToolService:
         failed = result.failed or 0
         failure_rate = failed / total if total > 0 else 0.0
 
-        return {
+        metrics = {
             "total_executions": total,
             "successful_executions": successful,
             "failed_executions": failed,
@@ -2486,6 +3226,12 @@ class ToolService:
             "avg_response_time": result.avg_rt,
             "last_execution_time": result.last_time,
         }
+
+        # Cache the result (if enabled)
+        if is_cache_enabled():
+            metrics_cache.set("tools", metrics)
+
+        return metrics
 
     async def reset_metrics(self, db: Session, tool_id: Optional[int] = None) -> None:
         """
@@ -2511,6 +3257,13 @@ class ToolService:
         else:
             db.execute(delete(ToolMetric))
         db.commit()
+
+        # Invalidate metrics cache
+        # First-Party
+        from mcpgateway.cache.metrics_cache import metrics_cache  # pylint: disable=import-outside-toplevel
+
+        metrics_cache.invalidate("tools")
+        metrics_cache.invalidate_prefix("top_tools:")
 
     async def create_tool_from_a2a_agent(
         self,

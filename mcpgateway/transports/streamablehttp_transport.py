@@ -48,7 +48,6 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import JSONRPCMessage
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse
 from starlette.status import HTTP_401_UNAUTHORIZED
 from starlette.types import Receive, Scope, Send
 
@@ -61,6 +60,7 @@ from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.prompt_service import PromptService
 from mcpgateway.services.resource_service import ResourceService
 from mcpgateway.services.tool_service import ToolService
+from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.verify_credentials import verify_credentials
 
 # Initialize logging service first
@@ -320,9 +320,15 @@ async def get_db() -> AsyncGenerator[Session, Any]:
     """
     Asynchronous context manager for database sessions.
 
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
     Yields:
         A database session instance from SessionLocal.
         Ensures the session is closed after use.
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
 
     Examples:
         >>> # Test database context manager
@@ -337,6 +343,16 @@ async def get_db() -> AsyncGenerator[Session, Any]:
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
     finally:
         db.close()
 
@@ -978,7 +994,7 @@ async def streamable_http_auth(scope: Any, receive: Any, send: Any) -> bool:
             user_context_var.set({"email": proxy_user})
             return True  # Fall back to proxy authentication
 
-        response = JSONResponse(
+        response = ORJSONResponse(
             {"detail": "Authentication failed"},
             status_code=HTTP_401_UNAUTHORIZED,
             headers={"WWW-Authenticate": "Bearer"},

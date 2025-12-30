@@ -11,13 +11,13 @@ formats and handles streaming responses.
 """
 
 # Standard
-import json
 import time
 from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 import uuid
 
 # Third-Party
 import httpx
+import orjson
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -226,11 +226,19 @@ class LLMProxyService:
             Tuple of (url, headers, body).
         """
         api_key = self._get_api_key(provider)
-        base_url = provider.api_base or ""
-        api_version = provider.api_version or "2024-02-15-preview"
-        deployment = provider.config.get("deployment") or model.model_id
 
-        url = f"{base_url.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+        # Get Azure-specific config
+        deployment_name = provider.config.get("deployment_name") or provider.config.get("deployment") or model.model_id
+        resource_name = provider.config.get("resource_name", "")
+        api_version = provider.config.get("api_version") or provider.api_version or "2024-02-15-preview"
+
+        # Build base URL from resource name if not provided
+        if not provider.api_base and resource_name:
+            base_url = f"https://{resource_name}.openai.azure.com"
+        else:
+            base_url = provider.api_base or ""
+
+        url = f"{base_url.rstrip('/')}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
 
         headers = {
             "Content-Type": "application/json",
@@ -278,10 +286,13 @@ class LLMProxyService:
 
         url = f"{base_url.rstrip('/')}/v1/messages"
 
+        # Get Anthropic-specific config
+        anthropic_version = provider.config.get("anthropic_version") or provider.api_version or "2023-06-01"
+
         headers = {
             "Content-Type": "application/json",
             "x-api-key": api_key or "",
-            "anthropic-version": provider.api_version or "2023-06-01",
+            "anthropic-version": anthropic_version,
         }
 
         # Convert messages to Anthropic format
@@ -483,7 +494,7 @@ class LLMProxyService:
                             break
 
                         try:
-                            data = json.loads(data_str)
+                            data = orjson.loads(data_str)
 
                             # Transform based on provider
                             if provider.provider_type == LLMProviderType.ANTHROPIC:
@@ -501,7 +512,7 @@ class LLMProxyService:
                             if chunk:
                                 yield f"data: {chunk}\n\n"
 
-                        except json.JSONDecodeError:
+                        except orjson.JSONDecodeError:
                             continue
 
                     # Handle Ollama's newline-delimited JSON (native API only)
@@ -509,11 +520,11 @@ class LLMProxyService:
                         base_url = (provider.api_base or "").rstrip("/")
                         if not base_url.endswith("/v1"):
                             try:
-                                data = json.loads(line)
+                                data = orjson.loads(line)
                                 chunk = self._transform_ollama_stream_chunk(data, response_id, created, model.model_id)
                                 if chunk:
                                     yield f"data: {chunk}\n\n"
-                            except json.JSONDecodeError:
+                            except orjson.JSONDecodeError:
                                 continue
 
         except httpx.HTTPStatusError as e:
@@ -523,7 +534,7 @@ class LLMProxyService:
                     "type": "proxy_error",
                 }
             }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield f"data: {orjson.dumps(error_chunk).decode()}\n\n"
         except httpx.RequestError as e:
             error_chunk = {
                 "error": {
@@ -531,7 +542,7 @@ class LLMProxyService:
                     "type": "proxy_error",
                 }
             }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield f"data: {orjson.dumps(error_chunk).decode()}\n\n"
 
     def _transform_openai_response(self, data: Dict[str, Any]) -> ChatCompletionResponse:
         """Transform OpenAI response to standard format.
@@ -684,7 +695,7 @@ class LLMProxyService:
                         }
                     ],
                 }
-                return json.dumps(chunk)
+                return orjson.dumps(chunk).decode()
 
         elif event_type == "message_stop":
             chunk = {
@@ -694,7 +705,7 @@ class LLMProxyService:
                 "model": model_id,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
-            return json.dumps(chunk)
+            return orjson.dumps(chunk).decode()
 
         return None
 
@@ -742,4 +753,4 @@ class LLMProxyService:
                 ],
             }
 
-        return json.dumps(chunk)
+        return orjson.dumps(chunk).decode()

@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 # Third-Party
 from fastapi import HTTPException
+import orjson
 import pytest
 
 # First-Party
@@ -139,6 +140,10 @@ class MockPubSub:
         if False:  # Never yield anything
             yield {}
 
+    async def aclose(self):
+        """Async close for redis.asyncio compatibility."""
+        pass
+
     def close(self):
         pass
 
@@ -223,9 +228,7 @@ async def test_broadcast_redis_input(monkeypatch, registry: SessionRegistry):
     monkeypatch.setattr("mcpgateway.cache.session_registry.time.time", lambda: fixed_ts)
 
     msg = {"a": 1}
-    expected_msg_json = json.dumps(msg)
-
-    expected_payload = json.dumps({"type": "message", "message": expected_msg_json, "timestamp": fixed_ts})
+    expected_payload = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts})
 
     await registry.broadcast("B", msg)
 
@@ -234,9 +237,7 @@ async def test_broadcast_redis_input(monkeypatch, registry: SessionRegistry):
     mock_redis.publish.reset_mock()
 
     msg = ["a", "b", "c"]
-    expected_msg_json = json.dumps(msg)
-
-    expected_payload = json.dumps({"type": "message", "message": expected_msg_json, "timestamp": fixed_ts})
+    expected_payload = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts})
 
     await registry.broadcast("B", msg)
 
@@ -245,9 +246,7 @@ async def test_broadcast_redis_input(monkeypatch, registry: SessionRegistry):
     mock_redis.publish.reset_mock()
 
     msg = 123
-    expected_msg_json = json.dumps(str(msg))
-
-    expected_payload = json.dumps({"type": "message", "message": expected_msg_json, "timestamp": fixed_ts})
+    expected_payload = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts})
 
     await registry.broadcast("B", msg)
 
@@ -256,9 +255,7 @@ async def test_broadcast_redis_input(monkeypatch, registry: SessionRegistry):
     mock_redis.publish.reset_mock()
 
     msg = "hello\nworld"
-    expected_msg_json = json.dumps(str(msg))
-
-    expected_payload = json.dumps({"type": "message", "message": expected_msg_json, "timestamp": fixed_ts})
+    expected_payload = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts})
 
     await registry.broadcast("B", msg)
 
@@ -283,7 +280,7 @@ async def test_broadcast_database_input(monkeypatch, registry: SessionRegistry, 
     monkeypatch.setattr("mcpgateway.cache.session_registry.time.time", lambda: fixed_ts)
 
     msg = {"a": 1}
-    expected_msg_json = json.dumps(msg)
+    expected_msg_json = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts}).decode()
 
     await registry.broadcast("B", msg)
 
@@ -296,7 +293,7 @@ async def test_broadcast_database_input(monkeypatch, registry: SessionRegistry, 
     mock_db.add.reset_mock()
 
     msg = ["a", "b", "c"]
-    expected_msg_json = json.dumps(msg)
+    expected_msg_json = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts}).decode()
 
     await registry.broadcast("B", msg)
 
@@ -309,7 +306,7 @@ async def test_broadcast_database_input(monkeypatch, registry: SessionRegistry, 
     mock_db.add.reset_mock()
 
     msg = 123
-    expected_msg_json = json.dumps(str(msg))
+    expected_msg_json = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts}).decode()
 
     await registry.broadcast("B", msg)
 
@@ -322,7 +319,7 @@ async def test_broadcast_database_input(monkeypatch, registry: SessionRegistry, 
     mock_db.add.reset_mock()
 
     msg = "hello\nworld"
-    expected_msg_json = json.dumps(str(msg))
+    expected_msg_json = orjson.dumps({"type": "message", "message": msg, "timestamp": fixed_ts}).decode()
 
     await registry.broadcast("B", msg)
 
@@ -336,7 +333,7 @@ async def test_broadcast_database_input(monkeypatch, registry: SessionRegistry, 
     mock_db.commit = Mock(side_effect=Exception("db error"))
 
     msg = "hello\nworld"
-    expected_msg_json = json.dumps(str(msg))
+    expected_msg_json = json.dumps({"type": "message", "message": msg, "timestamp": fixed_ts})
 
     await registry.broadcast("B", msg)
 
@@ -957,14 +954,12 @@ async def test_redis_session_operations(monkeypatch):
     # Patch Redis imports before creating the registry
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    # Create a mock Redis class that returns our specific mock instance
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
-    # Patch the Redis class import
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    # Patch the get_redis_client function used by session_registry
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 
@@ -1005,13 +1000,12 @@ async def test_redis_error_handling(monkeypatch, caplog):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    # Create a mock Redis class that returns our specific mock instance
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    # Patch the get_redis_client function used by session_registry
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 
@@ -1026,14 +1020,6 @@ async def test_redis_error_handling(monkeypatch, caplog):
 
         finally:
             await registry.shutdown()
-
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass), patch("mcpgateway.cache.session_registry.SessionRegistry", "_backend", "redis"):
-        registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
-        await registry.initialize()
-
-        tr = FakeSSETransport("redis_error")
-
-        await registry.add_session("redis_error", tr)
 
         assert "Redis error adding session redis_error" in caplog.text
 
@@ -1231,7 +1217,7 @@ async def test_memory_cleanup_task():
 
 @pytest.mark.asyncio
 async def test_redis_shutdown(monkeypatch):
-    """shutdown() should swallow Redis / PubSub aclose() errors."""
+    """shutdown() should close PubSub but not the shared Redis client."""
 
     # Tell the registry that the Redis extras are present
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
@@ -1242,30 +1228,30 @@ async def test_redis_shutdown(monkeypatch):
 
     # ── fake Redis client ────────────────────────────────────────────────
     mock_redis = AsyncMock(name="MockRedis")
-    mock_redis.aclose = AsyncMock()
     # pubsub() is **not** awaited in prod code, so a plain Mock is fine
     mock_redis.pubsub = Mock(return_value=mock_pubsub)
 
-    # ── patch the Redis class the module imported ────────────────────────
-    with patch("mcpgateway.cache.session_registry.Redis") as MockRedis:
-        MockRedis.from_url.return_value = mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
+    # ── patch the get_redis_client function ────────────────────────
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(
             backend="redis",
             redis_url="redis://localhost:6379",
         )
         await registry.initialize()  # calls mock_redis.pubsub()
 
-        # must swallow both aclose() exceptions
         await registry.shutdown()
 
+        # Only PubSub should be closed, not the shared Redis client
         mock_pubsub.aclose.assert_awaited_once()
-        mock_redis.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_shutdown_with_redis_error(monkeypatch):
-    """shutdown() should swallow Redis / PubSub aclose() errors."""
+    """shutdown() should swallow PubSub aclose() errors."""
 
     # Tell the registry that the Redis extras are present
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
@@ -1276,21 +1262,22 @@ async def test_shutdown_with_redis_error(monkeypatch):
 
     # ── fake Redis client ────────────────────────────────────────────────
     mock_redis = AsyncMock(name="MockRedis")
-    mock_redis.aclose = AsyncMock(side_effect=Exception("Redis close error"))
     # pubsub() is **not** awaited in prod code, so a plain Mock is fine
     mock_redis.pubsub = Mock(return_value=mock_pubsub)
 
-    # ── patch the Redis class the module imported ────────────────────────
-    with patch("mcpgateway.cache.session_registry.Redis") as MockRedis:
-        MockRedis.from_url.return_value = mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
+    # ── patch the get_redis_client function ────────────────────────
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(
             backend="redis",
             redis_url="redis://localhost:6379",
         )
         await registry.initialize()  # calls mock_redis.pubsub()
 
-        # must swallow both aclose() exceptions
+        # must swallow PubSub aclose() exception
         await registry.shutdown()
 
 
@@ -1401,14 +1388,13 @@ async def test_redis_get_session_exists_in_redis(monkeypatch, caplog):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
     caplog.set_level(logging.INFO, logger="mcpgateway.cache.session_registry")
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 
@@ -1427,14 +1413,13 @@ async def test_redis_get_session_exception(monkeypatch, caplog):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
     caplog.set_level(logging.ERROR, logger="mcpgateway.cache.session_registry")
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 
@@ -1612,12 +1597,11 @@ async def test_redis_initialize_error(monkeypatch):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
 
         # This should raise the exception from pubsub.subscribe
@@ -1686,12 +1670,11 @@ async def test_refresh_redis_sessions(monkeypatch):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 
@@ -1721,14 +1704,13 @@ async def test_refresh_redis_sessions_error(monkeypatch, caplog):
 
     monkeypatch.setattr("mcpgateway.cache.session_registry.REDIS_AVAILABLE", True)
 
-    class MockRedisClass:
-        @classmethod
-        def from_url(cls, url):
-            return mock_redis
+    # Mock the shared Redis client factory to return our mock
+    async def mock_get_redis_client():
+        return mock_redis
 
     caplog.set_level(logging.ERROR, logger="mcpgateway.cache.session_registry")
 
-    with patch("mcpgateway.cache.session_registry.Redis", MockRedisClass):
+    with patch("mcpgateway.cache.session_registry.get_redis_client", mock_get_redis_client):
         registry = SessionRegistry(backend="redis", redis_url="redis://localhost:6379")
         await registry.initialize()
 

@@ -23,13 +23,13 @@ gateway-specific extensions for federation support.
 import base64
 from datetime import datetime, timezone
 from enum import Enum
-import json
 import logging
 import re
 from typing import Any, Dict, List, Literal, Optional, Self, Union
 from urllib.parse import urlparse
 
 # Third-Party
+import orjson
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field, field_serializer, field_validator, model_validator, ValidationInfo
 
 # First-Party
@@ -1787,7 +1787,7 @@ class ResourceRead(BaseModelWithConfigDict):
     created_at: datetime
     updated_at: datetime
     enabled: bool
-    metrics: ResourceMetrics
+    metrics: Optional[ResourceMetrics] = Field(None, description="Resource metrics (may be None in list operations)")
     tags: List[Dict[str, str]] = Field(default_factory=list, description="Tags for categorizing the resource")
 
     # Comprehensive metadata for audit tracking
@@ -2296,7 +2296,7 @@ class PromptRead(BaseModelWithConfigDict):
     # is_active: bool
     enabled: bool
     tags: List[Dict[str, str]] = Field(default_factory=list, description="Tags for categorizing the prompt")
-    metrics: PromptMetrics
+    metrics: Optional[PromptMetrics] = Field(None, description="Prompt metrics (may be None in list operations)")
 
     # Comprehensive metadata for audit tracking
     created_by: Optional[str] = Field(None, description="Username who created this entity")
@@ -3234,7 +3234,7 @@ class RPCRequest(BaseModel):
             return v
 
         # Check size limits (MCP recommends max 256KB for params)
-        param_size = len(json.dumps(v))
+        param_size = len(orjson.dumps(v))
         if param_size > settings.validation_max_rpc_param_size:
             raise ValueError(f"Parameters exceed maximum size of {settings.validation_max_rpc_param_size} bytes")
 
@@ -3324,8 +3324,8 @@ class AdminToolCreate(BaseModelWithConfigDict):
         if not v:
             return None
         try:
-            return json.loads(v)
-        except json.JSONDecodeError:
+            return orjson.loads(v)
+        except orjson.JSONDecodeError:
             raise ValueError("Invalid JSON")
 
 
@@ -3723,7 +3723,7 @@ class ServerRead(BaseModelWithConfigDict):
     associated_resources: List[str] = []
     associated_prompts: List[str] = []
     associated_a2a_agents: List[str] = []
-    metrics: ServerMetrics
+    metrics: Optional[ServerMetrics] = Field(None, description="Server metrics (may be None in list operations)")
     tags: List[Dict[str, str]] = Field(default_factory=list, description="Tags for categorizing the server")
 
     # Comprehensive metadata for audit tracking
@@ -4498,7 +4498,7 @@ class A2AAgentRead(BaseModelWithConfigDict):
     updated_at: datetime
     last_interaction: Optional[datetime]
     tags: List[Dict[str, str]] = Field(default_factory=list, description="Tags for categorizing the agent")
-    metrics: A2AAgentMetrics
+    metrics: Optional[A2AAgentMetrics] = Field(None, description="Agent metrics (may be None in list operations)")
     passthrough_headers: Optional[List[str]] = Field(default=None, description="List of headers allowed to be passed through from client to target")
     # Authorizations
     auth_type: Optional[str] = Field(None, description="auth_type: basic, bearer, headers, oauth, or None")

@@ -27,7 +27,7 @@ Environment variables:
 - RESOURCE_CACHE_TTL: Cache TTL in seconds (default: 3600)
 - TOOL_TIMEOUT: Tool invocation timeout (default: 60)
 - PROMPT_CACHE_SIZE: Max cached prompts (default: 100)
-- HEALTH_CHECK_INTERVAL: Gateway health check interval (default: 60)
+- HEALTH_CHECK_INTERVAL: Gateway health check interval (default: 300)
 
 Examples:
     >>> from mcpgateway.config import Settings
@@ -50,7 +50,7 @@ Examples:
 # Standard
 from functools import lru_cache
 from importlib.resources import files
-import json  # consider typjson for type safety loading from configuration data.
+import json  # Used only for indent=2 pretty-printing in print_schema()
 import logging
 import os
 from pathlib import Path
@@ -61,6 +61,7 @@ from typing import Annotated, Any, ClassVar, Dict, List, Literal, NotRequired, O
 # Third-Party
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+import orjson
 from pydantic import Field, field_validator, HttpUrl, model_validator, PositiveInt, SecretStr, ValidationInfo
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -70,7 +71,7 @@ if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
 logger = logging.getLogger(__name__)
@@ -99,13 +100,13 @@ def _normalize_env_list_vars() -> None:
         if s.startswith("["):
             # Already JSON-like, keep as is
             try:
-                json.loads(s)
+                orjson.loads(s)
                 continue
             except Exception:
                 pass  # nosec B110 - Intentionally continue with CSV parsing if JSON parsing fails
         # Convert CSV to JSON array
         items = [item.strip() for item in s.split(",") if item.strip()]
-        os.environ[key] = json.dumps(items)
+        os.environ[key] = orjson.dumps(items).decode()
 
 
 _normalize_env_list_vars()
@@ -489,10 +490,10 @@ class Settings(BaseSettings):
                 return []
             # Try JSON first
             try:
-                loaded = json.loads(v)
+                loaded = orjson.loads(v)
                 if isinstance(loaded, list):
                     return loaded
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 # Not a valid JSON array → fallback to comma-separated parsing
                 pass
             # Fallback to comma-split
@@ -795,8 +796,8 @@ class Settings(BaseSettings):
             if v[:1] in "\"'" and v[-1:] == v[:1]:  # strip 1 outer quote pair
                 v = v[1:-1]
             try:
-                parsed = set(json.loads(v))
-            except json.JSONDecodeError:
+                parsed = set(orjson.loads(v))
+            except orjson.JSONDecodeError:
                 parsed = {s.strip() for s in v.split(",") if s.strip()}
             return parsed
         return set(v)
@@ -866,7 +867,7 @@ class Settings(BaseSettings):
 
     # Structured Logging Configuration
     structured_logging_enabled: bool = Field(default=True, description="Enable structured JSON logging with database persistence")
-    structured_logging_database_enabled: bool = Field(default=True, description="Persist structured logs to database")
+    structured_logging_database_enabled: bool = Field(default=False, description="Persist structured logs to database (enables /api/logs/* endpoints, impacts performance)")
     structured_logging_external_enabled: bool = Field(default=False, description="Send logs to external systems")
 
     # Performance Tracking Configuration
@@ -877,8 +878,26 @@ class Settings(BaseSettings):
     performance_threshold_http_request_ms: float = Field(default=500.0, description="Alert threshold for HTTP requests (ms)")
     performance_degradation_multiplier: float = Field(default=1.5, description="Alert if performance degrades by this multiplier vs baseline")
 
+    # Audit Trail Configuration
+    # Audit trail logging is disabled by default for performance.
+    # When enabled, it logs all CRUD operations (create, read, update, delete) on resources.
+    # WARNING: This causes a database write on every API request and can cause significant load.
+    audit_trail_enabled: bool = Field(default=False, description="Enable audit trail logging to database for compliance")
+
     # Security Logging Configuration
-    security_logging_enabled: bool = Field(default=True, description="Enable security event logging")
+    # Security event logging is disabled by default for performance.
+    # When enabled, it logs authentication attempts, authorization failures, and security events.
+    # WARNING: "all" level logs every request and can cause significant database write load.
+    security_logging_enabled: bool = Field(default=False, description="Enable security event logging to database")
+    security_logging_level: Literal["all", "failures_only", "high_severity"] = Field(
+        default="failures_only",
+        description=(
+            "Security logging level: "
+            "'all' = log all events including successful auth (high DB load), "
+            "'failures_only' = log only authentication/authorization failures, "
+            "'high_severity' = log only high/critical severity events"
+        ),
+    )
     security_failed_auth_threshold: int = Field(default=5, description="Failed auth attempts before high severity alert")
     security_threat_score_alert: float = Field(default=0.7, description="Threat score threshold for alerts (0.0-1.0)")
     security_rate_limit_window_minutes: int = Field(default=5, description="Time window for rate limit checks (minutes)")
@@ -888,6 +907,43 @@ class Settings(BaseSettings):
     metrics_aggregation_backfill_hours: int = Field(default=6, ge=0, le=168, description="Hours of structured logs to backfill into performance metrics on startup")
     metrics_aggregation_window_minutes: int = Field(default=5, description="Time window for metrics aggregation (minutes)")
     metrics_aggregation_auto_start: bool = Field(default=False, description="Automatically run the log aggregation loop on application startup")
+
+    # Metrics Buffer Configuration (for batching tool/resource/prompt metrics writes)
+    metrics_buffer_enabled: bool = Field(default=True, description="Enable buffered metrics writes (reduces DB pressure under load)")
+    metrics_buffer_flush_interval: int = Field(default=60, ge=5, le=300, description="Seconds between automatic metrics buffer flushes")
+    metrics_buffer_max_size: int = Field(default=1000, ge=100, le=10000, description="Maximum buffered metrics before forced flush")
+
+    # Metrics Cache Configuration (for caching aggregate metrics queries)
+    metrics_cache_enabled: bool = Field(default=True, description="Enable in-memory caching for aggregate metrics queries")
+    metrics_cache_ttl_seconds: int = Field(default=10, ge=1, le=300, description="TTL for cached aggregate metrics in seconds")
+
+    # Auth Cache Configuration (reduces DB queries during authentication)
+    auth_cache_enabled: bool = Field(default=True, description="Enable Redis/in-memory caching for authentication data (user, team, revocation)")
+    auth_cache_user_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for cached user data")
+    auth_cache_revocation_ttl: int = Field(default=30, ge=5, le=120, description="TTL in seconds for token revocation cache (security-critical, keep short)")
+    auth_cache_team_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for team membership cache")
+    auth_cache_role_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for user role in team cache")
+    auth_cache_teams_enabled: bool = Field(default=True, description="Enable caching for get_user_teams() (default: true)")
+    auth_cache_teams_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for user teams list cache")
+    auth_cache_batch_queries: bool = Field(default=True, description="Batch auth DB queries into single call (reduces 3 queries to 1)")
+
+    # Registry Cache Configuration (reduces DB queries for list endpoints)
+    registry_cache_enabled: bool = Field(default=True, description="Enable caching for registry list endpoints (tools, prompts, resources, etc.)")
+    registry_cache_tools_ttl: int = Field(default=20, ge=5, le=300, description="TTL in seconds for tools list cache")
+    registry_cache_prompts_ttl: int = Field(default=15, ge=5, le=300, description="TTL in seconds for prompts list cache")
+    registry_cache_resources_ttl: int = Field(default=15, ge=5, le=300, description="TTL in seconds for resources list cache")
+    registry_cache_agents_ttl: int = Field(default=20, ge=5, le=300, description="TTL in seconds for agents list cache")
+    registry_cache_servers_ttl: int = Field(default=20, ge=5, le=300, description="TTL in seconds for servers list cache")
+    registry_cache_gateways_ttl: int = Field(default=20, ge=5, le=300, description="TTL in seconds for gateways list cache")
+    registry_cache_catalog_ttl: int = Field(default=300, ge=60, le=600, description="TTL in seconds for catalog servers list cache (external catalog, changes infrequently)")
+
+    # Admin Stats Cache Configuration (reduces dashboard query overhead)
+    admin_stats_cache_enabled: bool = Field(default=True, description="Enable caching for admin dashboard statistics")
+    admin_stats_cache_system_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for system stats cache")
+    admin_stats_cache_observability_ttl: int = Field(default=30, ge=10, le=120, description="TTL in seconds for observability stats cache")
+    admin_stats_cache_tags_ttl: int = Field(default=120, ge=30, le=600, description="TTL in seconds for tags listing cache")
+    admin_stats_cache_plugins_ttl: int = Field(default=120, ge=30, le=600, description="TTL in seconds for plugin stats cache")
+    admin_stats_cache_performance_ttl: int = Field(default=60, ge=15, le=300, description="TTL in seconds for performance aggregates cache")
 
     # Log Search Configuration
     log_search_max_results: int = Field(default=1000, description="Maximum results per log search query")
@@ -984,8 +1040,8 @@ class Settings(BaseSettings):
             if len(v) > 1 and v[0] in "\"'" and v[-1] == v[0]:
                 v = v[1:-1]
             try:
-                peers = json.loads(v)
-            except json.JSONDecodeError:
+                peers = orjson.loads(v)
+            except orjson.JSONDecodeError:
                 peers = [s.strip() for s in v.split(",") if s.strip()]
             return peers  # type: ignore[no-any-return]
 
@@ -1030,9 +1086,9 @@ class Settings(BaseSettings):
                 return []
             if s.startswith("["):
                 try:
-                    parsed = json.loads(s)
+                    parsed = orjson.loads(s)
                     return parsed if isinstance(parsed, list) else []
-                except json.JSONDecodeError:
+                except orjson.JSONDecodeError:
                     raise ValueError(f"Invalid JSON for SSO_ISSUERS: {v!r}")
             # Fallback to comma-separated parsing
             return [item.strip() for item in s.split(",") if item.strip()]
@@ -1065,10 +1121,17 @@ class Settings(BaseSettings):
     prompt_render_timeout: int = 10  # seconds
 
     # Health Checks
-    health_check_interval: int = 60  # seconds
-    health_check_timeout: int = 10  # seconds
-    unhealthy_threshold: int = 5  # after this many failures, mark as Offline
-    max_concurrent_health_checks: int = 20  # maximum concurrent health checks per worker
+    # Interval in seconds between health checks
+    health_check_interval: int = 300
+    # Timeout in seconds for each health check request
+    health_check_timeout: int = 5
+    # Per-check timeout (seconds) to bound total time of one gateway health check
+    # Env: GATEWAY_HEALTH_CHECK_TIMEOUT
+    gateway_health_check_timeout: float = 5.0
+    # Consecutive failures before marking gateway offline
+    unhealthy_threshold: int = 3
+    # Max concurrent health checks per worker
+    max_concurrent_health_checks: int = 10
 
     # Validation Gateway URL
     gateway_validation_timeout: int = 5  # seconds
@@ -1088,6 +1151,11 @@ class Settings(BaseSettings):
     db_max_retries: int = 3
     db_retry_interval_ms: int = 2000
 
+    # psycopg3-specific: Number of times a query must be executed before it's
+    # prepared server-side. Set to 0 to disable, 1 to prepare immediately.
+    # Default of 5 balances memory usage with query performance.
+    db_prepare_threshold: int = Field(default=5, ge=0, le=100, description="psycopg3 prepare_threshold for auto-prepared statements")
+
     # Cache
     cache_type: Literal["redis", "memory", "none", "database"] = "database"  # memory or redis or database
     redis_url: Optional[str] = "redis://localhost:6379/0"
@@ -1096,6 +1164,44 @@ class Settings(BaseSettings):
     message_ttl: int = 600
     redis_max_retries: int = 3
     redis_retry_interval_ms: int = 2000
+
+    # GlobalConfig In-Memory Cache (Issue #1715)
+    # Caches GlobalConfig (passthrough headers) to eliminate redundant DB queries
+    global_config_cache_ttl: int = Field(
+        default=60,
+        ge=5,
+        le=3600,
+        description="TTL in seconds for GlobalConfig in-memory cache (default: 60)",
+    )
+
+    # A2A Stats In-Memory Cache
+    # Caches A2A agent counts (total, active) to eliminate redundant COUNT queries
+    a2a_stats_cache_ttl: int = Field(
+        default=30,
+        ge=5,
+        le=3600,
+        description="TTL in seconds for A2A stats in-memory cache (default: 30)",
+    )
+
+    # Redis Parser Configuration (ADR-026)
+    # hiredis C parser provides up to 83x faster response parsing for large responses
+    redis_parser: Literal["auto", "hiredis", "python"] = Field(
+        default="auto",
+        description="Redis protocol parser: auto (use hiredis if available), hiredis (require hiredis), python (pure-Python)",
+    )
+
+    # Redis Connection Pool - Performance Optimized
+    redis_decode_responses: bool = Field(default=True, description="Return strings instead of bytes")
+    redis_max_connections: int = Field(default=50, description="Connection pool size per worker")
+    redis_socket_timeout: float = Field(default=2.0, description="Socket read/write timeout in seconds")
+    redis_socket_connect_timeout: float = Field(default=2.0, description="Connection timeout in seconds")
+    redis_retry_on_timeout: bool = Field(default=True, description="Retry commands on timeout")
+    redis_health_check_interval: int = Field(default=30, description="Seconds between connection health checks (0=disabled)")
+
+    # Redis Leader Election - Multi-Node Deployments
+    redis_leader_ttl: int = Field(default=15, description="Leader election TTL in seconds")
+    redis_leader_key: str = Field(default="gateway_service_leader", description="Leader key name")
+    redis_leader_heartbeat_interval: int = Field(default=5, description="Seconds between leader heartbeats")
 
     # streamable http transport
     use_stateful_sessions: bool = False  # Set to False to use stateless sessions without event store
@@ -1115,7 +1221,7 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # Observability (OpenTelemetry)
-    otel_enable_observability: bool = Field(default=True, description="Enable OpenTelemetry observability")
+    otel_enable_observability: bool = Field(default=False, description="Enable OpenTelemetry observability")
     otel_traces_exporter: str = Field(default="otlp", description="Traces exporter: otlp, jaeger, zipkin, console, none")
     otel_exporter_otlp_endpoint: Optional[str] = Field(default=None, description="OTLP endpoint (e.g., http://localhost:4317)")
     otel_exporter_otlp_protocol: str = Field(default="grpc", description="OTLP protocol: grpc or http")
@@ -1156,6 +1262,12 @@ Disallow: /
 
     # Cache control for well-known files (seconds)
     well_known_cache_max_age: int = 3600  # 1 hour default
+
+    # ===================================
+    # Performance / Startup Tuning
+    # ===================================
+
+    slug_refresh_batch_size: int = Field(default=1000, description="Batch size for gateway/tool slug refresh at startup")
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore")
 
     gateway_tool_name_separator: str = "-"
@@ -1200,8 +1312,8 @@ Disallow: /
             Dict[str, str]: Parsed custom well-known files mapping filename to content.
         """
         try:
-            return json.loads(self.well_known_custom_files) if self.well_known_custom_files else {}
-        except json.JSONDecodeError:
+            return orjson.loads(self.well_known_custom_files) if self.well_known_custom_files else {}
+        except orjson.JSONDecodeError:
             logger.error(f"Invalid JSON in WELL_KNOWN_CUSTOM_FILES: {self.well_known_custom_files}")
             return {}
 
@@ -1257,7 +1369,7 @@ Disallow: /
                 return []
             if s.startswith("["):
                 try:
-                    parsed = json.loads(s)
+                    parsed = orjson.loads(s)
                     return parsed if isinstance(parsed, list) else []
                 except Exception:
                     logger.warning("Invalid JSON list in env for list field; falling back to CSV parsing")
@@ -1631,10 +1743,10 @@ Disallow: /
         if default_value:
             try:
                 # Try JSON parsing first
-                self.default_passthrough_headers = json.loads(default_value)
+                self.default_passthrough_headers = orjson.loads(default_value)
                 if not isinstance(self.default_passthrough_headers, list):
                     raise ValueError("Must be a JSON array")
-            except (json.JSONDecodeError, ValueError):
+            except (orjson.JSONDecodeError, ValueError):
                 # Fallback to comma-separated parsing
                 self.default_passthrough_headers = [h.strip() for h in default_value.split(",") if h.strip()]
                 logger.info(f"Parsed comma-separated passthrough headers: {self.default_passthrough_headers}")

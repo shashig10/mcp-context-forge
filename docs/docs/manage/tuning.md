@@ -21,6 +21,26 @@
 | `DATABASE_URL`   | SQLite         | Move to managed PostgreSQL + connection pooling for anything beyond dev tests.      |
 | `HOST`/`PORT`    | `0.0.0.0:4444` | Expose a different port or bind only to `127.0.0.1` behind a reverse-proxy.         |
 
+### Redis Connection Pool Tuning
+
+When using `CACHE_TYPE=redis`, tune the connection pool for your workload:
+
+| Variable | Default | Tuning Guidance |
+| -------- | ------- | --------------- |
+| `REDIS_MAX_CONNECTIONS` | `50` | Pool size per worker. Formula: `(concurrent_requests / workers) × 1.5` |
+| `REDIS_SOCKET_TIMEOUT` | `2.0` | Lower (1.0s) for high-concurrency; Redis ops typically <100ms |
+| `REDIS_SOCKET_CONNECT_TIMEOUT` | `2.0` | Keep low to fail fast on network issues |
+| `REDIS_HEALTH_CHECK_INTERVAL` | `30` | Lower (15s) for production to detect stale connections faster |
+
+**High-concurrency production settings:**
+
+```bash
+REDIS_MAX_CONNECTIONS=100
+REDIS_SOCKET_TIMEOUT=1.0
+REDIS_SOCKET_CONNECT_TIMEOUT=1.0
+REDIS_HEALTH_CHECK_INTERVAL=15
+```
+
 > **Tip**  Any change here requires rebuilding or restarting the container if you pass the file with `--env-file`.
 
 ---
@@ -37,6 +57,156 @@
 | `max_requests(+_jitter)` | Self-healing        | Recycle workers to mitigate memory leaks.                         |
 
 Edit the file **before** building the image, then redeploy.
+
+---
+
+## 2b - Uvicorn Performance Extras
+
+MCP Gateway uses `uvicorn[standard]` which includes high-performance components that are automatically detected and used:
+
+| Package | Purpose | Platform | Improvement |
+|---------|---------|----------|-------------|
+| `uvloop` | Fast event loop (libuv-based, Cython) | Linux, macOS | 20-40% lower latency |
+| `httptools` | Fast HTTP parsing (C extension) | All platforms | 40-60% faster parsing |
+| `websockets` | Optimized WebSocket handling | All platforms | Better WS performance |
+| `watchfiles` | Fast file watching for `--reload` | All platforms | Faster dev cycle |
+
+### Automatic Detection
+
+When Gunicorn spawns Uvicorn workers, these components are automatically detected:
+
+```bash
+# Verify extras are installed
+pip list | grep -E "uvloop|httptools|websockets|watchfiles"
+
+# Expected output (Linux/macOS):
+# httptools    0.6.x
+# uvloop       0.21.x
+# websockets   15.x.x
+# watchfiles   1.x.x
+```
+
+### Platform Notes
+
+- **Linux/macOS**: Full performance benefits (uvloop + httptools)
+- **Windows**: httptools provides benefits; uvloop unavailable (graceful fallback to asyncio)
+
+### Performance Impact
+
+Combined improvements from uvloop and httptools:
+
+| Workload | Improvement |
+|----------|-------------|
+| Simple JSON endpoints | 15-25% faster |
+| High-concurrency requests | 20-30% higher throughput |
+| WebSocket connections | Lower latency, better handling |
+| Development `--reload` | Faster file change detection |
+
+> **Note**: These optimizations are transparent - no code or configuration changes needed.
+
+---
+
+## 2c - Granian (Alternative HTTP Server)
+
+MCP Gateway supports two HTTP servers:
+- **Gunicorn + Uvicorn** (default) - Battle-tested, mature, excellent stability
+- **Granian** (alternative) - Rust-based, native HTTP/2, lower memory
+
+### Usage
+
+```bash
+# Local development
+make serve                    # Gunicorn + Uvicorn (default)
+make serve-granian            # Granian (alternative)
+make serve-granian-http2      # Granian with HTTP/2 + TLS
+
+# Container with Gunicorn (default)
+make container-run
+make container-run-gunicorn-ssl
+
+# Container with Granian (alternative)
+make container-run-granian
+make container-run-granian-ssl
+
+# Docker Compose (default uses Gunicorn)
+docker compose up
+```
+
+### Switching HTTP Servers
+
+The `HTTP_SERVER` environment variable controls which server to use:
+
+```bash
+# Docker/Podman - use Gunicorn (default)
+docker run mcpgateway/mcpgateway
+
+# Docker/Podman - use Granian
+docker run -e HTTP_SERVER=granian mcpgateway/mcpgateway
+
+# Docker Compose - set in environment section
+environment:
+  - HTTP_SERVER=gunicorn  # default
+  # - HTTP_SERVER=granian # alternative
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRANIAN_WORKERS` | auto (CPU cores, max 16) | Worker processes |
+| `GRANIAN_RUNTIME_MODE` | auto (mt if >8 workers) | Runtime mode: mt (multi-threaded), st (single-threaded) |
+| `GRANIAN_RUNTIME_THREADS` | 1 | Runtime threads per worker |
+| `GRANIAN_BLOCKING_THREADS` | 1 | Blocking threads per worker |
+| `GRANIAN_HTTP` | auto | HTTP version: auto, 1, 2 |
+| `GRANIAN_LOOP` | uvloop | Event loop: uvloop, asyncio, rloop |
+| `GRANIAN_TASK_IMPL` | auto | Task implementation: asyncio (Python 3.12+), rust (older) |
+| `GRANIAN_HTTP1_PIPELINE_FLUSH` | true | Aggregate HTTP/1 flushes for pipelined responses |
+| `GRANIAN_HTTP1_BUFFER_SIZE` | 524288 | HTTP/1 buffer size (512KB) |
+| `GRANIAN_BACKLOG` | 2048 | Connection backlog for high concurrency |
+| `GRANIAN_BACKPRESSURE` | 512 | Max concurrent requests per worker |
+| `GRANIAN_RESPAWN_FAILED` | true | Auto-restart failed workers |
+| `GRANIAN_DEV_MODE` | false | Enable hot reload |
+| `DISABLE_ACCESS_LOG` | true | Disable access logging for performance |
+
+**Performance tuning profiles:**
+
+```bash
+# High-throughput (fewer workers, more threads per worker)
+GRANIAN_WORKERS=4 GRANIAN_RUNTIME_THREADS=4 make serve
+
+# High-concurrency (more workers, max backpressure)
+GRANIAN_WORKERS=16 GRANIAN_BACKPRESSURE=1024 GRANIAN_BACKLOG=4096 make serve
+
+# Memory-constrained (fewer workers)
+GRANIAN_WORKERS=2 make serve
+
+# Force HTTP/1 only (avoids HTTP/2 overhead)
+GRANIAN_HTTP=1 make serve
+```
+
+**Notes:**
+- On Python 3.12+, the Rust task implementation is unavailable; asyncio is used automatically
+- `uvloop` provides best performance on Linux/macOS
+- Increase `GRANIAN_BACKLOG` and `GRANIAN_BACKPRESSURE` for high-concurrency workloads
+
+### When to Use Granian
+
+| Use Granian when... | Use Gunicorn when... |
+|---------------------|----------------------|
+| You want native HTTP/2 | Maximum stability needed |
+| Optimizing for memory | Familiar with Gunicorn |
+| Simplest deployment | Need gevent/eventlet workers |
+| Benchmarks show gains | Behind HTTP/2 proxy already |
+
+### Performance Comparison
+
+| Metric | Gunicorn+Uvicorn | Granian |
+|--------|------------------|---------|
+| Simple JSON | Baseline | +20-50% (varies) |
+| Memory/worker | ~80MB | ~40MB |
+| HTTP/2 | Via proxy | Native |
+
+> **Note**: Always benchmark with your specific workload before switching servers.
 
 ---
 

@@ -27,11 +27,31 @@ from starlette.responses import Response
 
 # First-Party
 from mcpgateway.auth import get_current_user
+from mcpgateway.config import settings
 from mcpgateway.db import SessionLocal
 from mcpgateway.services.security_logger import get_security_logger
 
 logger = logging.getLogger(__name__)
 security_logger = get_security_logger()
+
+
+def _should_log_auth_success() -> bool:
+    """Check if successful authentication should be logged based on settings.
+
+    Returns:
+        True if security_logging_level is "all", False otherwise.
+    """
+    return settings.security_logging_level == "all"
+
+
+def _should_log_auth_failure() -> bool:
+    """Check if failed authentication should be logged based on settings.
+
+    Returns:
+        True if security_logging_level is "all" or "failures_only", False for "high_severity".
+    """
+    # Log failures for "all" and "failures_only" levels, not for "high_severity"
+    return settings.security_logging_level in ("all", "failures_only")
 
 
 class AuthContextMiddleware(BaseHTTPMiddleware):
@@ -85,53 +105,52 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         try:
             db = SessionLocal()
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-            user = await get_current_user(credentials, db)
+            # get_current_user now uses fresh DB sessions internally, no session needed here
+            user = await get_current_user(credentials, request=request)
 
-            # Eagerly access user attributes before session closes to prevent DetachedInstanceError
-            # This forces SQLAlchemy to load the data while the session is still active
             # Note: EmailUser uses 'email' as primary key, not 'id'
+            # User is already detached (created with fresh session that was closed)
             user_email = user.email
             user_id = user_email  # For EmailUser, email IS the ID
-
-            # Expunge the user from the session so it can be used after session closes
-            # This makes the object detached but with all attributes already loaded
-            db.expunge(user)
 
             # Store user in request state for downstream use
             request.state.user = user
             logger.info(f"✓ Authenticated user: {user_email if user_email else user_id}")
 
-            # Log successful authentication
-            security_logger.log_authentication_attempt(
-                user_id=user_id,
-                user_email=user_email,
-                auth_method="bearer_token",
-                success=True,
-                client_ip=request.client.host if request.client else "unknown",
-                user_agent=request.headers.get("user-agent"),
-                db=db,
-            )
+            # Log successful authentication (only if logging level is "all")
+            if _should_log_auth_success():
+                security_logger.log_authentication_attempt(
+                    user_id=user_id,
+                    user_email=user_email,
+                    auth_method="bearer_token",
+                    success=True,
+                    client_ip=request.client.host if request.client else "unknown",
+                    user_agent=request.headers.get("user-agent"),
+                    db=db,
+                )
 
         except Exception as e:
             # Silently fail - let route handlers enforce auth if needed
             logger.info(f"✗ Auth context extraction failed (continuing as anonymous): {e}")
 
-            # Log failed authentication attempt
-            security_logger.log_authentication_attempt(
-                user_id="unknown",
-                user_email=None,
-                auth_method="bearer_token",
-                success=False,
-                client_ip=request.client.host if request.client else "unknown",
-                user_agent=request.headers.get("user-agent"),
-                failure_reason=str(e),
-                db=db if db else None,
-            )
+            # Log failed authentication attempt (based on logging level)
+            if _should_log_auth_failure():
+                security_logger.log_authentication_attempt(
+                    user_id="unknown",
+                    user_email=None,
+                    auth_method="bearer_token",
+                    success=False,
+                    client_ip=request.client.host if request.client else "unknown",
+                    user_agent=request.headers.get("user-agent"),
+                    failure_reason=str(e),
+                    db=db if db else None,
+                )
 
         finally:
             # Always close database session
             if db:
                 try:
+                    db.commit()  # End transaction cleanly (security_logger handles its own commits)
                     db.close()
                 except Exception as close_error:
                     logger.debug(f"Failed to close database session: {close_error}")

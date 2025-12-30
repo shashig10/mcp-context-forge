@@ -323,8 +323,8 @@
           "properties": {
             "GUNICORN_WORKERS": {
               "type": "string",
-              "description": "Number of Gunicorn worker processes",
-              "default": "2"
+              "description": "Number of Gunicorn worker processes (auto = 2*CPU+1, capped at 16)",
+              "default": "auto"
             },
             "GUNICORN_TIMEOUT": {
               "type": "string",
@@ -334,7 +334,7 @@
             "GUNICORN_MAX_REQUESTS": {
               "type": "string",
               "description": "Max requests per worker before restart",
-              "default": "10000"
+              "default": "100000"
             },
             "GUNICORN_MAX_REQUESTS_JITTER": {
               "type": "string",
@@ -345,6 +345,18 @@
               "type": "string",
               "enum": ["true", "false"],
               "description": "Preload app code before forking workers",
+              "default": "true"
+            },
+            "GUNICORN_DEV_MODE": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Developer mode with hot reload (not for production)",
+              "default": "false"
+            },
+            "DISABLE_ACCESS_LOG": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Disable access logging for performance",
               "default": "true"
             },
             "APP_NAME": {
@@ -417,6 +429,53 @@
               "type": "string",
               "description": "Redis retry interval in milliseconds",
               "default": "2000"
+            },
+            "REDIS_MAX_CONNECTIONS": {
+              "type": "string",
+              "description": "Redis connection pool size per worker",
+              "default": "50"
+            },
+            "REDIS_SOCKET_TIMEOUT": {
+              "type": "string",
+              "description": "Redis socket read/write timeout in seconds",
+              "default": "2.0"
+            },
+            "REDIS_SOCKET_CONNECT_TIMEOUT": {
+              "type": "string",
+              "description": "Redis connection timeout in seconds",
+              "default": "2.0"
+            },
+            "REDIS_RETRY_ON_TIMEOUT": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Retry Redis commands on timeout",
+              "default": "true"
+            },
+            "REDIS_HEALTH_CHECK_INTERVAL": {
+              "type": "string",
+              "description": "Redis health check interval in seconds (0=disabled)",
+              "default": "30"
+            },
+            "REDIS_DECODE_RESPONSES": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Return strings instead of bytes from Redis",
+              "default": "true"
+            },
+            "REDIS_LEADER_TTL": {
+              "type": "string",
+              "description": "Redis leader election TTL in seconds",
+              "default": "15"
+            },
+            "REDIS_LEADER_KEY": {
+              "type": "string",
+              "description": "Redis leader election key name",
+              "default": "gateway_service_leader"
+            },
+            "REDIS_LEADER_HEARTBEAT_INTERVAL": {
+              "type": "string",
+              "description": "Redis leader heartbeat interval in seconds",
+              "default": "5"
             },
             "DB_MAX_RETRIES": {
               "type": "string",
@@ -676,6 +735,11 @@
               "type": "string",
               "description": "Health check timeout in seconds",
               "default": "10"
+            },
+            "GATEWAY_HEALTH_CHECK_TIMEOUT": {
+              "type": "string",
+              "description": "Per-check timeout to bound total time of one gateway health check (seconds)",
+              "default": "5.0"
             },
             "UNHEALTHY_THRESHOLD": {
               "type": "string",
@@ -1046,6 +1110,143 @@
               "type": "boolean",
               "description": "Flag to indicate if backup has been completed to prevent re-running",
               "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "pgbouncer": {
+      "type": "object",
+      "description": "PgBouncer connection pooler configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable PgBouncer connection pooling",
+          "default": false
+        },
+        "image": {
+          "type": "object",
+          "description": "PgBouncer image configuration",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Image repository",
+              "default": "edoburu/pgbouncer"
+            },
+            "tag": {
+              "type": "string",
+              "description": "Image tag",
+              "default": "latest"
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"],
+              "description": "Image pull policy",
+              "default": "IfNotPresent"
+            }
+          },
+          "additionalProperties": false
+        },
+        "service": {
+          "type": "object",
+          "description": "PgBouncer service configuration",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer"],
+              "description": "Service type",
+              "default": "ClusterIP"
+            },
+            "port": {
+              "type": "integer",
+              "description": "Service port",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 6432
+            }
+          },
+          "additionalProperties": false
+        },
+        "pool": {
+          "type": "object",
+          "description": "Pool configuration",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["transaction", "session", "statement"],
+              "description": "Pool mode",
+              "default": "transaction"
+            },
+            "maxClientConn": {
+              "type": "integer",
+              "description": "Max client connections",
+              "default": 3000
+            },
+            "defaultPoolSize": {
+              "type": "integer",
+              "description": "Default pool size",
+              "default": 120
+            },
+            "minPoolSize": {
+              "type": "integer",
+              "description": "Minimum pool size",
+              "default": 10
+            },
+            "reservePoolSize": {
+              "type": "integer",
+              "description": "Reserve pool size",
+              "default": 25
+            },
+            "reservePoolTimeout": {
+              "type": "integer",
+              "description": "Reserve pool timeout in seconds",
+              "default": 5
+            },
+            "maxDbConnections": {
+              "type": "integer",
+              "description": "Max database connections",
+              "default": 200
+            },
+            "maxUserConnections": {
+              "type": "integer",
+              "description": "Max user connections",
+              "default": 200
+            },
+            "serverLifetime": {
+              "type": "integer",
+              "description": "Server lifetime in seconds",
+              "default": 3600
+            },
+            "serverIdleTimeout": {
+              "type": "integer",
+              "description": "Server idle timeout in seconds",
+              "default": 600
+            }
+          },
+          "additionalProperties": false
+        },
+        "authType": {
+          "type": "string",
+          "description": "Authentication type",
+          "default": "scram-sha-256"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources",
+          "description": "Resource limits and requests"
+        },
+        "probes": {
+          "type": "object",
+          "description": "PgBouncer health probes",
+          "properties": {
+            "readiness": {
+              "$ref": "#/$defs/probe",
+              "description": "Readiness probe"
+            },
+            "liveness": {
+              "$ref": "#/$defs/probe",
+              "description": "Liveness probe"
             }
           },
           "additionalProperties": false

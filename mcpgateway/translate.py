@@ -118,7 +118,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import suppress
-import json
 import logging
 import os
 import shlex
@@ -131,8 +130,14 @@ import uuid
 # Third-Party
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
+from mcp.server import Server as MCPServer
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+import orjson
 from sse_starlette.sse import EventSourceResponse
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 import uvicorn
 
 try:
@@ -141,17 +146,10 @@ try:
 except ImportError:
     httpx = None  # type: ignore[assignment]
 
-# Third-Party
-# Third-Party - for streamable HTTP support
-from mcp.server import Server as MCPServer
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.types import Receive, Scope, Send
-
 # First-Party
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.translate_header_utils import extract_env_vars_from_headers, parse_header_mappings
+from mcpgateway.utils.orjson_response import ORJSONResponse
 
 # Initialize logging service first
 logging_service = LoggingService()
@@ -836,7 +834,7 @@ def _build_fastapi(
 
         payload = await raw.body()
         try:
-            json.loads(payload)  # validate
+            orjson.loads(payload)  # validate
         except Exception as exc:  # noqa: BLE001
             return PlainTextResponse(
                 f"Invalid JSON payload: {exc}",
@@ -1624,7 +1622,7 @@ async def _run_streamable_http_to_stdio(
                 if CONTENT_TYPE == "application/x-www-form-urlencoded":
                     # If text is JSON, parse and encode as form
                     try:
-                        payload = json.loads(text)
+                        payload = orjson.loads(text)
                         body = urlencode(payload)
                     except Exception:
                         body = text
@@ -1932,7 +1930,7 @@ async def _run_multi_protocol_server(  # pylint: disable=too-many-positional-arg
 
             payload = await raw.body()
             try:
-                json.loads(payload)
+                orjson.loads(payload)
             except Exception as exc:
                 return PlainTextResponse(
                     f"Invalid JSON payload: {exc}",
@@ -2005,7 +2003,7 @@ async def _run_multi_protocol_server(  # pylint: disable=too-many-positional-arg
             # Read and validate JSON
             body = await request.body()
             try:
-                obj = json.loads(body)
+                obj = orjson.loads(body)
             except Exception as exc:
                 return PlainTextResponse(f"Invalid JSON payload: {exc}", status_code=status.HTTP_400_BAD_REQUEST)
 
@@ -2034,8 +2032,8 @@ async def _run_multi_protocol_server(  # pylint: disable=too-many-positional-arg
 
                         # stdio stdout lines may contain JSON objects or arrays
                         try:
-                            parsed = json.loads(msg)
-                        except (json.JSONDecodeError, ValueError):
+                            parsed = orjson.loads(msg)
+                        except (orjson.JSONDecodeError, ValueError):
                             # not JSON -> skip
                             continue
 
@@ -2043,7 +2041,7 @@ async def _run_multi_protocol_server(  # pylint: disable=too-many-positional-arg
                         for candidate in candidates:
                             if isinstance(candidate, dict) and candidate.get("id") == obj.get("id"):
                                 # return the matched response as JSON
-                                return JSONResponse(candidate)
+                                return ORJSONResponse(candidate)
 
                     # timeout -> accept and return 202
                     return PlainTextResponse("accepted (no response yet)", status_code=status.HTTP_202_ACCEPTED)
@@ -2321,7 +2319,8 @@ def main(argv: Optional[Sequence[str]] | None = None) -> None:
     args = _parse_args(argv or sys.argv[1:])
     logging.basicConfig(
         level=getattr(logging, args.logLevel.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
     # Parse header mappings if dynamic environment injection is enabled

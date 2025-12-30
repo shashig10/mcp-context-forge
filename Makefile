@@ -91,12 +91,12 @@ os-deps: $(OS_DEPS_SCRIPT)
 # -----------------------------------------------------------------------------
 # 🔧 HELPER SCRIPTS
 # -----------------------------------------------------------------------------
-# Helper to ensure a Python package is installed in venv
+# Helper to ensure a Python package is installed in venv (uses uv to avoid pip corruption)
 define ensure_pip_package
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip show $(1) >/dev/null 2>&1 || \
-		python3 -m pip install -q $(1)"
+		uv pip show $(1) >/dev/null 2>&1 || \
+		uv pip install -q $(1)"
 endef
 
 # =============================================================================
@@ -201,15 +201,24 @@ check-env-dev:
 # help: stop-serve           - Stop gunicorn production server (port 4444)
 # help: run                  - Execute helper script ./run.sh
 
-.PHONY: serve serve-ssl dev stop stop-dev stop-serve run certs certs-jwt certs-jwt-ecdsa certs-all \
-        certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check
+.PHONY: serve serve-ssl serve-granian serve-granian-ssl serve-granian-http2 dev stop stop-dev stop-serve run \
+        certs certs-jwt certs-jwt-ecdsa certs-all certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check
 
 ## --- Primary servers ---------------------------------------------------------
-serve:
+serve:                           ## Run production server with Gunicorn + Uvicorn (default)
 	./run-gunicorn.sh
 
-serve-ssl: certs
+serve-ssl: certs                 ## Run Gunicorn with TLS enabled
 	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-gunicorn.sh
+
+serve-granian:                   ## Run production server with Granian (Rust-based, alternative)
+	./run-granian.sh
+
+serve-granian-ssl: certs         ## Run Granian with TLS enabled
+	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-granian.sh
+
+serve-granian-http2: certs       ## Run Granian with HTTP/2 and TLS
+	SSL=true GRANIAN_HTTP=2 CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-granian.sh
 
 dev:
 	@$(VENV_DIR)/bin/uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 --reload --reload-exclude='public/'
@@ -222,6 +231,7 @@ dev-echo:                        ## Run dev server with SQL query logging enable
 stop:                            ## Stop all mcpgateway server processes
 	@echo "Stopping all mcpgateway processes..."
 	@if [ -f /tmp/mcpgateway-gunicorn.lock ]; then kill -9 $$(cat /tmp/mcpgateway-gunicorn.lock) 2>/dev/null || true; rm -f /tmp/mcpgateway-gunicorn.lock; fi
+	@if [ -f /tmp/mcpgateway-granian.lock ]; then kill -9 $$(cat /tmp/mcpgateway-granian.lock) 2>/dev/null || true; rm -f /tmp/mcpgateway-granian.lock; fi
 	@lsof -ti:8000 2>/dev/null | xargs -r kill -9 || true
 	@lsof -ti:4444 2>/dev/null | xargs -r kill -9 || true
 	@echo "Done."
@@ -498,7 +508,7 @@ clean:
 # help: query-log-analyze    - Analyze query log for N+1 patterns and slow queries
 # help: query-log-clear      - Clear database query log files
 
-.PHONY: smoketest test test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check test-db-perf test-db-perf-verbose dev-query-log query-log-tail query-log-analyze query-log-clear load-test load-test-ui load-test-light load-test-heavy load-test-sustained load-test-stress load-test-report load-test-compose load-test-timeserver load-test-fasttime load-test-1000
+.PHONY: smoketest test test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check test-db-perf test-db-perf-verbose dev-query-log query-log-tail query-log-analyze query-log-clear load-test load-test-ui load-test-light load-test-heavy load-test-sustained load-test-stress load-test-report load-test-compose load-test-timeserver load-test-fasttime load-test-1000 load-test-summary load-test-baseline load-test-baseline-ui load-test-baseline-stress load-test-agentgateway-mcp-server-time
 
 ## --- Automated checks --------------------------------------------------------
 smoketest:
@@ -564,7 +574,7 @@ pytest-examples:
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@test -f test_readme.py || { echo "⚠️  test_readme.py not found - skipping"; exit 0; }
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pytest pytest-examples && \
+		uv pip install -q pytest pytest-examples && \
 		pytest -v test_readme.py"
 
 test-curl:
@@ -753,12 +763,13 @@ generate-report:                           ## Display most recent load test repo
 # help: load-test-timeserver  - Load test fast_time_server (5 users, 30s)
 # help: load-test-fasttime    - Load test fast_time MCP tools (50 users, 60s)
 # help: load-test-1000        - High-load test (1000 users, 120s)
+# help: load-test-summary     - Parse CSV reports and show summary statistics
 
 # Default load test configuration
-LOADTEST_HOST ?= http://localhost:8000
-LOADTEST_USERS ?= 50
-LOADTEST_SPAWN_RATE ?= 10
-LOADTEST_RUN_TIME ?= 60s
+LOADTEST_HOST ?= http://localhost:8080
+LOADTEST_USERS ?= 1000
+LOADTEST_SPAWN_RATE ?= 100
+LOADTEST_RUN_TIME ?= 5m
 LOADTEST_LOCUSTFILE := tests/loadtest/locustfile.py
 LOADTEST_HTML_REPORT := reports/locust_report.html
 LOADTEST_CSV_PREFIX := reports/locust
@@ -794,8 +805,9 @@ load-test-ui:                              ## Start Locust web UI at http://loca
 	@echo "🔥 Starting Locust Web UI..."
 	@echo "   🌐 Open http://localhost:8089 in your browser"
 	@echo "   🎯 Default host: $(LOADTEST_HOST)"
+	@echo "   👥 Default users: $(LOADTEST_USERS), spawn rate: $(LOADTEST_SPAWN_RATE)/s"
+	@echo "   ⏱️  Default run time: $(LOADTEST_RUN_TIME)"
 	@echo ""
-	@echo "   💡 Configure users, spawn rate, and duration in the UI"
 	@echo "   💡 Use 'User classes' dropdown to select FastTimeUser, etc."
 	@echo "   💡 Start server first with 'make dev' or 'docker compose up'"
 	@echo ""
@@ -803,6 +815,9 @@ load-test-ui:                              ## Start Locust web UI at http://loca
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		locust -f $(LOADTEST_LOCUSTFILE) \
 			--host=$(LOADTEST_HOST) \
+			--users=$(LOADTEST_USERS) \
+			--spawn-rate=$(LOADTEST_SPAWN_RATE) \
+			--run-time=$(LOADTEST_RUN_TIME) \
 			--class-picker"
 
 load-test-light:                           ## Light load test (10 users, 30s)
@@ -928,6 +943,143 @@ load-test-1000:                            ## High-load test (1000 users, 120s) 
 		echo "❌ Cancelled"; \
 	fi
 
+load-test-summary:                         ## Parse CSV reports and show summary statistics
+	@if [ -f "$(LOADTEST_CSV_PREFIX)_stats.csv" ]; then \
+		echo ""; \
+		echo "===================================================================================================="; \
+		echo "LOAD TEST SUMMARY (from $(LOADTEST_CSV_PREFIX)_stats.csv)"; \
+		echo "===================================================================================================="; \
+		echo ""; \
+		python3 -c " \
+import csv; \
+import sys; \
+with open('$(LOADTEST_CSV_PREFIX)_stats.csv') as f: \
+    reader = list(csv.DictReader(f)); \
+    if not reader: \
+        print('No data found'); \
+        sys.exit(0); \
+    agg = [r for r in reader if r.get('Name') == 'Aggregated']; \
+    if agg: \
+        a = agg[0]; \
+        print('OVERALL METRICS'); \
+        print('-' * 100); \
+        print(f\"  Total Requests:     {int(float(a.get('Request Count', 0))):,}\"); \
+        print(f\"  Total Failures:     {int(float(a.get('Failure Count', 0))):,}\"); \
+        print(f\"  Requests/sec:       {float(a.get('Requests/s', 0)):.2f}\"); \
+        print(); \
+        print('  Response Times (ms):'); \
+        print(f\"    Average:          {float(a.get('Average Response Time', 0)):.2f}\"); \
+        print(f\"    Min:              {float(a.get('Min Response Time', 0)):.2f}\"); \
+        print(f\"    Max:              {float(a.get('Max Response Time', 0)):.2f}\"); \
+        print(f\"    Median (p50):     {float(a.get('50%', 0)):.2f}\"); \
+        print(f\"    p90:              {float(a.get('90%', 0)):.2f}\"); \
+        print(f\"    p95:              {float(a.get('95%', 0)):.2f}\"); \
+        print(f\"    p99:              {float(a.get('99%', 0)):.2f}\"); \
+    print(); \
+    print('ENDPOINT BREAKDOWN (Top 15)'); \
+    print('-' * 100); \
+    print(f\"{'Endpoint':<40} {'Reqs':>8} {'Fails':>7} {'Avg':>8} {'Min':>8} {'Max':>8} {'p95':>8}\"); \
+    print('-' * 100); \
+    endpoints = [r for r in reader if r.get('Name') != 'Aggregated'][:15]; \
+    for e in endpoints: \
+        name = e.get('Name', '')[:38] + '..' if len(e.get('Name', '')) > 40 else e.get('Name', ''); \
+        print(f\"{name:<40} {int(float(e.get('Request Count', 0))):>8,} {int(float(e.get('Failure Count', 0))):>7,} {float(e.get('Average Response Time', 0)):>8.1f} {float(e.get('Min Response Time', 0)):>8.1f} {float(e.get('Max Response Time', 0)):>8.1f} {float(e.get('95%', 0)):>8.1f}\"); \
+"; \
+		echo ""; \
+		echo "===================================================================================================="; \
+		echo ""; \
+		echo "📊 Full reports:"; \
+		echo "   HTML: $(LOADTEST_HTML_REPORT)"; \
+		echo "   CSV:  $(LOADTEST_CSV_PREFIX)_stats.csv"; \
+	else \
+		echo "❌ No CSV report found at $(LOADTEST_CSV_PREFIX)_stats.csv"; \
+		echo "   Run 'make load-test' first to generate reports."; \
+	fi
+
+# --- Baseline Load Tests (individual components without gateway) ---
+# help: load-test-baseline     - Baseline test: Fast Time Server REST API (1000 users, 3min)
+# help: load-test-baseline-ui  - Baseline test with Locust Web UI
+# help: load-test-baseline-stress - Baseline stress test (2000 users, 3min)
+
+BASELINE_HOST ?= http://localhost:8888
+
+load-test-baseline:                        ## Baseline test: Fast Time Server REST API (1000 users, 3min)
+	@echo "📊 Running BASELINE load test (Fast Time Server REST API)..."
+	@echo "   Host: $(BASELINE_HOST)"
+	@echo "   Users: 1000, Duration: 3 minutes"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@echo "   📝 This tests the MCP server directly WITHOUT the gateway"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=1000 \
+			--spawn-rate=100 \
+			--run-time=180s \
+			--headless \
+			--csv=baseline \
+			--html=baseline_report.html'
+	@echo ""
+	@echo "📊 Baseline report: tests/loadtest/baseline_report.html"
+
+load-test-baseline-ui:                     ## Baseline test with Locust Web UI (class picker enabled)
+	@echo "📊 Starting BASELINE load test Web UI..."
+	@echo "   🌐 Open http://localhost:8089 in your browser"
+	@echo "   🎯 Host: $(BASELINE_HOST)"
+	@echo "   👥 Defaults: 1000 users, 100 spawn/s, 3 min"
+	@echo "   🎛️  Class picker enabled - select which tests to run"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=1000 \
+			--spawn-rate=100 \
+			--run-time=180s \
+			--class-picker'
+
+load-test-baseline-stress:                 ## Baseline stress test (2000 users, 3min)
+	@echo "📊 Running BASELINE STRESS test..."
+	@echo "   Host: $(BASELINE_HOST)"
+	@echo "   Users: 2000, Duration: 3 minutes"
+	@echo "   ⚠️  This will generate high load on the MCP server"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=2000 \
+			--spawn-rate=200 \
+			--run-time=180s \
+			--headless \
+			--csv=baseline_stress \
+			--html=baseline_stress_report.html'
+
+# --- AgentGateway MCP Server Time Load Test ---
+# help: load-test-agentgateway-mcp-server-time - Load test external MCP server at localhost:3000
+
+AGENTGATEWAY_MCP_HOST ?= http://localhost:3000
+
+load-test-agentgateway-mcp-server-time:    ## Load test external MCP server (localhost-get-system-time)
+	@echo "⏰ Running AgentGateway MCP Server Time load test..."
+	@echo "   🌐 Open http://localhost:8089 in your browser"
+	@echo "   🎯 Host: $(AGENTGATEWAY_MCP_HOST)"
+	@echo "   👥 Defaults: 50 users, 10 spawn/s, 60s"
+	@echo "   🔧 Tool: localhost-get-system-time"
+	@echo "   🎛️  Class picker enabled - select which tests to run"
+	@echo ""
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_agentgateway_mcp_server_time.py \
+			--host=$(AGENTGATEWAY_MCP_HOST) \
+			--users=50 \
+			--spawn-rate=10 \
+			--run-time=60s \
+			--class-picker'
+
 # =============================================================================
 # 🧬 MUTATION TESTING
 # =============================================================================
@@ -946,7 +1098,7 @@ mutmut-install:
 	@echo "📥 Installing mutmut..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q mutmut==3.3.1"
+		uv pip install -q mutmut==3.3.1"
 
 mutmut-run: mutmut-install
 	@echo "🧬 Running mutation testing (sample mode - 20 mutants)..."
@@ -1013,7 +1165,7 @@ mutmut-clean:
 .PHONY: pip-licenses scc scc-report
 
 pip-licenses:
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m uv pip install pip-licenses"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q pip-licenses"
 	@mkdir -p $(dir $(LICENSES_MD))
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		pip-licenses --format=markdown --with-authors --with-urls > $(LICENSES_MD)"
@@ -1064,7 +1216,7 @@ docs: images sbom
 	@echo "📚  Generating documentation with handsdown..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q handsdown && \
+		uv pip install -q handsdown && \
 		python3 -m handsdown --external https://github.com/IBM/mcp-context-forge/ \
 		         -o $(DOCS_DIR)/docs \
 		         -n app --name '$(PROJECT_NAME)' --cleanup"
@@ -1078,7 +1230,7 @@ images:
 	@mkdir -p $(DOCS_DIR)/docs/design/images
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q code2flow && \
+		uv pip install -q code2flow && \
 		$(VENV_DIR)/bin/code2flow mcpgateway/ --output $(DOCS_DIR)/docs/design/images/code2flow.dot || true"
 	@command -v dot >/dev/null 2>&1 || { \
 		echo "⚠️  Graphviz (dot) not installed - skipping diagram generation"; \
@@ -1086,12 +1238,12 @@ images:
 	} && \
 	dot -Tsvg -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=14 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=14 -Efontcolor=black $(DOCS_DIR)/docs/design/images/code2flow.dot -o $(DOCS_DIR)/docs/design/images/code2flow.svg || true
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q snakefood3 && \
+		uv pip install -q snakefood3 && \
 		python3 -m snakefood3 . mcpgateway > snakefood.dot"
 	@command -v dot >/dev/null 2>&1 && \
 	dot -Tpng -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=12 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=10 -Efontcolor=black snakefood.dot -o $(DOCS_DIR)/docs/design/images/snakefood.png || true
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pylint && \
+		uv pip install -q pylint && \
 		$(VENV_DIR)/bin/pyreverse --colorized mcpgateway || true"
 	@command -v dot >/dev/null 2>&1 && \
 	dot -Tsvg -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=14 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=14 -Efontcolor=black packages.dot -o $(DOCS_DIR)/docs/design/images/packages.svg || true && \
@@ -1335,6 +1487,7 @@ pylint: uv                             ## 🐛  pylint checks
 	@echo "🐛 pylint $(TARGET) (parallel)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		PYLINTHOME=\"$(CURDIR)/.pylint-cache\" UV_CACHE_DIR=\"$(CURDIR)/.uv-cache\" \
 		uv run --active pylint -j 0 --fail-on E --fail-under 10 $(TARGET)"
 
 markdownlint:					    ## 📖  Markdown linting
@@ -1429,7 +1582,7 @@ wily:                               ## 📈  Maintainability report
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@git stash --quiet
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q wily && \
+		uv pip install -q wily && \
 		python3 -m wily build -n 10 . > /dev/null || true && \
 		python3 -m wily report . || true"
 	@git stash pop --quiet
@@ -1444,14 +1597,14 @@ depend:                             ## 📦  List dependencies
 	@echo "📦  List dependencies"
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pdm && \
+		uv pip install -q pdm && \
 		python3 -m pdm list --freeze"
 
 snakeviz:                           ## 🐍  Interactive profile visualiser
 	@echo "🐍  Interactive profile visualiser..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q snakeviz && \
+		uv pip install -q snakeviz && \
 		python3 -m cProfile -o mcp.prof mcpgateway/main.py && \
 		python3 -m snakeviz mcp.prof --server"
 
@@ -1459,7 +1612,7 @@ pstats:                             ## 📊  Static call-graph image
 	@echo "📊  Static call-graph image"
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q gprof2dot && \
+		uv pip install -q gprof2dot && \
 		python3 -m cProfile -o mcp.pstats mcpgateway/main.py && \
 		$(VENV_DIR)/bin/gprof2dot -w -e 3 -n 3 -s -f pstats mcp.pstats | \
 		dot -Tpng -o $(DOCS_DIR)/pstats.png"
@@ -1471,7 +1624,7 @@ tox:                                ## 🧪  Multi-Python tox matrix (uv)
 	@echo "🧪  Running tox with uv across Python 3.11, 3.12, 3.13..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q tox tox-uv && \
+		uv pip install -q tox tox-uv && \
 		python3 -m tox -p auto $(TOXARGS)"
 
 sbom:								## 🛡️  Generate SBOM & security report
@@ -1479,7 +1632,7 @@ sbom:								## 🛡️  Generate SBOM & security report
 	@rm -Rf "$(VENV_DIR).sbom"
 	@python3 -m venv "$(VENV_DIR).sbom"
 	@/bin/bash -c "source $(VENV_DIR).sbom/bin/activate && python3 -m pip install --upgrade pip setuptools pdm uv && python3 -m uv pip install .[dev]"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m uv pip install cyclonedx-bom sbom2doc"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q cyclonedx-bom sbom2doc"
 	@echo "🔍  Generating SBOM from environment..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		python3 -m cyclonedx_py environment \
@@ -1619,7 +1772,7 @@ install-watchdog:						## 📦 Install watchdog for file watching
 	@echo "📦 Installing watchdog for file watching..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q watchdog"
+		uv pip install -q watchdog"
 
 # Watch mode - lint on file changes
 lint-watch: install-watchdog			## 👁️ Watch for changes and auto-lint
@@ -1846,7 +1999,7 @@ lint-parallel:							## 🚀 Run linters in parallel
 	@echo "🚀 Running linters in parallel on $(TARGET)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pytest-xdist"
+		uv pip install -q pytest-xdist"
 	@# Run fast linters in parallel
 	@$(MAKE) --no-print-directory ruff-check TARGET="$(TARGET)" & \
 	$(MAKE) --no-print-directory black-check TARGET="$(TARGET)" & \
@@ -1891,7 +2044,7 @@ lint-complexity:						## 📈 Analyze code complexity
 	@echo "📈 Analyzing code complexity for $(TARGET)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q radon && \
+		uv pip install -q radon && \
 		echo '📊 Cyclomatic Complexity:' && \
 		$(VENV_DIR)/bin/radon cc $(TARGET) -s && \
 		echo '' && \
@@ -1954,7 +2107,7 @@ yamllint:                         ## 📑 YAML linting
 	$(call ensure_pip_package,yamllint)
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q yamllint 2>/dev/null || true"
+		uv pip install -q yamllint 2>/dev/null || true"
 	@$(VENV_DIR)/bin/yamllint -c .yamllint .
 
 jsonlint:                         ## 📑 JSON validation (jq)
@@ -1974,7 +2127,7 @@ tomllint:                         ## 📑 TOML validation (tomlcheck)
 	@echo '📑  tomllint (tomlcheck) ...'
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q tomlcheck 2>/dev/null || true"
+		uv pip install -q tomlcheck 2>/dev/null || true"
 	@find . -type f -name '*.toml' -print0 \
 	  | xargs -0 -I{} $(VENV_DIR)/bin/tomlcheck "{}"
 
@@ -2010,8 +2163,7 @@ install-web-linters:
 
 nodejsscan:
 	@echo "🔒 Running nodejsscan for JavaScript security vulnerabilities..."
-	$(call ensure_pip_package,nodejsscan)
-	@$(VENV_DIR)/bin/nodejsscan --directory ./mcpgateway/static --directory ./mcpgateway/templates || true
+	@uvx nodejsscan --directory ./mcpgateway/static --directory ./mcpgateway/templates || true
 
 lint-web: install-web-linters nodejsscan
 	@echo "🔍 Linting HTML files..."
@@ -2650,6 +2802,85 @@ container-run-ssl-jwt: certs certs-jwt container-check-image
 	@echo "✅ Container started with TLS + JWT asymmetric authentication"
 	@echo "🔐 JWT Algorithm: RS256"
 	@echo "📁 Keys mounted: /app/certs/jwt/{private,public}.pem"
+
+# HTTP Server selection targets
+container-run-granian: container-check-image  ## Run container with Granian (Rust-based HTTP server)
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Granian..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--env-file=.env \
+		-e HTTP_SERVER=granian \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl --fail http://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Granian"
+
+container-run-gunicorn: container-check-image  ## Run container with Gunicorn + Uvicorn
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Gunicorn..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--env-file=.env \
+		-e HTTP_SERVER=gunicorn \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl --fail http://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Gunicorn"
+
+container-run-granian-ssl: certs container-check-image  ## Run container with Granian + TLS
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Granian (TLS)..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--user $(shell id -u):$(shell id -g) \
+		--env-file=.env \
+		-e HTTP_SERVER=granian \
+		-e SSL=true \
+		-e CERT_FILE=certs/cert.pem \
+		-e KEY_FILE=certs/key.pem \
+		-v $(PWD)/certs:/app/certs:ro$(if $(filter podman,$(CONTAINER_RUNTIME)),$(COMMA)Z,) \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl -k --fail https://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Granian + TLS"
+
+container-run-gunicorn-ssl: certs container-check-image  ## Run container with Gunicorn + TLS
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Gunicorn (TLS)..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--user $(shell id -u):$(shell id -g) \
+		--env-file=.env \
+		-e HTTP_SERVER=gunicorn \
+		-e SSL=true \
+		-e CERT_FILE=certs/cert.pem \
+		-e KEY_FILE=certs/key.pem \
+		-v $(PWD)/certs:/app/certs:ro$(if $(filter podman,$(CONTAINER_RUNTIME)),$(COMMA)Z,) \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl -k --fail https://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Gunicorn + TLS"
 
 container-push: container-check-image
 	@echo "📤 Preparing to push image..."
@@ -4122,7 +4353,7 @@ shell-linters-install:     ## 🔧  Install shellcheck, shfmt, bashate
 	if ! $(VENV_DIR)/bin/bashate -h >/dev/null 2>&1 ; then \
 	  echo "🛠  Installing bashate (into venv)..." ; \
 	  test -d "$(VENV_DIR)" || $(MAKE) venv ; \
-	  /bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m pip install --quiet bashate" ; \
+	  /bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q bashate" ; \
 	fi
 	@echo "✅  Shell linters ready."
 
@@ -4491,43 +4722,42 @@ dodgy:                              ## 🔐 Suspicious code patterns
 	@echo "🔐  dodgy - scanning for hardcoded secrets..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dodgy && \
+		uv pip install -q dodgy && \
 		$(VENV_DIR)/bin/dodgy $(TARGET) || true"
 
 dlint:                              ## 📏 Python best practices
 	@echo "📏  dlint - checking Python best practices..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dlint && \
+		uv pip install -q dlint && \
 		$(VENV_DIR)/bin/python -m flake8 --select=DUO mcpgateway"
 
 pyupgrade:                          ## ⬆️  Upgrade Python syntax
 	@echo "⬆️  pyupgrade - checking for syntax upgrade opportunities..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pyupgrade && \
+		uv pip install -q pyupgrade && \
 		find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus --diff {} + || true"
 	@echo "💡  To apply changes, run: find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus {} +"
 
-interrogate:                        ## 📝 Docstring coverage
+interrogate: uv                     ## 📝 Docstring coverage
 	@echo "📝  interrogate - checking docstring coverage..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q interrogate && \
-		$(VENV_DIR)/bin/interrogate -vv mcpgateway || true"
+		uv run --active interrogate -vv mcpgateway || true"
 
 prospector:                         ## 🔬 Comprehensive code analysis
 	@echo "🔬  prospector - running comprehensive analysis..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q prospector[with_everything] && \
+		uv pip install -q prospector[with_everything] && \
 		$(VENV_DIR)/bin/prospector mcpgateway || true"
 
 pip-audit:                          ## 🔒 Audit Python dependencies for CVEs
 	@echo "🔒  pip-audit vulnerability scan..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install --quiet --upgrade pip-audit && \
+		uv pip install -q pip-audit && \
 		pip-audit --strict || true"
 
 
@@ -4731,12 +4961,12 @@ security-report:                    ## 📊 Generate comprehensive security repo
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## Code Security Patterns (semgrep)" >> $(DOCS_DIR)/docs/security/report.md
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q semgrep && \
+		uv pip install -q semgrep && \
 		$(VENV_DIR)/bin/semgrep --config=auto $(TARGET) --quiet || true" >> $(DOCS_DIR)/docs/security/report.md 2>&1
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## Suspicious Code Patterns (dodgy)" >> $(DOCS_DIR)/docs/security/report.md
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dodgy && \
+		uv pip install -q dodgy && \
 		$(VENV_DIR)/bin/dodgy $(TARGET) || true" >> $(DOCS_DIR)/docs/security/report.md 2>&1
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## DevSkim Security Anti-patterns" >> $(DOCS_DIR)/docs/security/report.md
@@ -4752,7 +4982,7 @@ security-fix:                       ## 🔧 Auto-fix security issues where possi
 	@echo "🔧 Attempting to auto-fix security issues..."
 	@echo "➤ Upgrading Python syntax with pyupgrade..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pyupgrade && \
+		uv pip install -q pyupgrade && \
 		find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus {} +"
 	@echo "➤ Updating dependencies to latest secure versions..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \

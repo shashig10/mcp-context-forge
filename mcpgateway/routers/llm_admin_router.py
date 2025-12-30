@@ -500,11 +500,9 @@ async def admin_test_api(
     # Standard
     import time
 
-    # Third-Party
-    from fastapi.responses import JSONResponse
-
     # First-Party
     from mcpgateway.services.llm_proxy_service import LLMProxyService
+    from mcpgateway.utils.orjson_response import ORJSONResponse
 
     db = current_user_ctx["db"]
     body = await request.json()
@@ -524,7 +522,7 @@ async def admin_test_api(
 
             model_list = [{"id": m.model_id, "owned_by": m.provider_name} for m in models]
 
-            return JSONResponse(
+            return ORJSONResponse(
                 content={
                     "success": True,
                     "test_type": "models",
@@ -563,7 +561,7 @@ async def admin_test_api(
             if response.choices and len(response.choices) > 0:
                 assistant_message = response.choices[0].message.content or ""
 
-            return JSONResponse(
+            return ORJSONResponse(
                 content={
                     "success": True,
                     "test_type": "chat",
@@ -590,7 +588,7 @@ async def admin_test_api(
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         logger.error(f"Admin test failed: {e}")
-        return JSONResponse(
+        return ORJSONResponse(
             content={
                 "success": False,
                 "error": str(e),
@@ -621,6 +619,28 @@ async def get_provider_defaults(
         Dictionary of provider type to default config.
     """
     return LLMProviderType.get_provider_defaults()
+
+
+@llm_admin_router.get("/provider-configs")
+@require_permission("admin.system_config")
+async def get_provider_configs(
+    request: Request,
+    current_user_ctx: dict = Depends(get_current_user_with_permissions),
+):
+    """Get provider-specific configuration definitions for UI rendering.
+
+    Args:
+        request: FastAPI request object.
+        current_user_ctx: Authenticated user context.
+
+    Returns:
+        Dictionary of provider configurations with field definitions.
+    """
+    # First-Party
+    from mcpgateway.llm_provider_configs import get_all_provider_configs
+
+    configs = get_all_provider_configs()
+    return {provider_type: config.model_dump() for provider_type, config in configs.items()}
 
 
 @llm_admin_router.post("/providers/{provider_id}/fetch-models")

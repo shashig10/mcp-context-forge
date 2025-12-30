@@ -313,7 +313,7 @@ class TestCacheMetrics:
 
     @pytest.mark.asyncio
     async def test_get_cache_metrics_with_redis(self):
-        """Test cache metrics with Redis connection."""
+        """Test cache metrics with Redis connection via shared factory."""
         service = PerformanceService()
 
         # Create a proper async mock for the Redis client
@@ -326,18 +326,12 @@ class TestCacheMetrics:
             "keyspace_hits": 1000,
             "keyspace_misses": 100,
         })
-        mock_client.close = AsyncMock()
 
-        # Create a mock for the Redis class
-        mock_redis_class = MagicMock()
-        mock_redis_class.from_url.return_value = mock_client
-
-        # Create a mock module for aioredis
-        mock_aioredis = MagicMock()
-        mock_aioredis.Redis = mock_redis_class
+        async def mock_get_redis_client():
+            return mock_client
 
         with patch('mcpgateway.services.performance_service.REDIS_AVAILABLE', True):
-            with patch('mcpgateway.services.performance_service.aioredis', mock_aioredis):
+            with patch('mcpgateway.services.performance_service.get_redis_client', mock_get_redis_client):
                 with patch('mcpgateway.services.performance_service.settings') as mock_settings:
                     mock_settings.redis_url = "redis://localhost:6379"
                     mock_settings.cache_type = "redis"
@@ -499,23 +493,25 @@ class TestSnapshotOperations:
 class TestHistoryOperations:
     """Tests for historical data retrieval."""
 
-    def test_get_history_empty(self, test_db):
+    @pytest.mark.asyncio
+    async def test_get_history_empty(self, test_db):
         """Test getting history when no data exists."""
         service = PerformanceService()
-        result = service.get_history(test_db)
+        result = await service.get_history(test_db)
 
         assert isinstance(result, PerformanceHistoryResponse)
         assert result.aggregates == []
         assert result.period_type == "hourly"
 
-    def test_get_history_with_filters(self, test_db):
+    @pytest.mark.asyncio
+    async def test_get_history_with_filters(self, test_db):
         """Test getting history with filters."""
         service = PerformanceService()
 
         start_time = datetime.now(timezone.utc) - timedelta(hours=24)
         end_time = datetime.now(timezone.utc)
 
-        result = service.get_history(
+        result = await service.get_history(
             test_db,
             period_type="hourly",
             start_time=start_time,

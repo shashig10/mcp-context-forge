@@ -1142,12 +1142,32 @@ pip install -e ".[dev]"
 
 You can configure the gateway with SQLite, PostgreSQL (or any other compatible database) in .env.
 
-When using PostgreSQL, you need to install `psycopg2` driver.
+When using PostgreSQL, you need to install the `psycopg` (psycopg3) driver.
+
+**System Dependencies**: The PostgreSQL adapter requires the `libpq` development headers to compile:
 
 ```bash
-uv pip install psycopg2-binary   # dev convenience
+# Debian/Ubuntu
+sudo apt-get install libpq-dev
+
+# RHEL/CentOS/Fedora
+sudo dnf install postgresql-devel
+
+# macOS (Homebrew)
+brew install libpq
+```
+
+Then install the Python package:
+
+```bash
+uv pip install 'psycopg[binary]'   # dev convenience (pre-built wheels)
 # or
-uv pip install psycopg2          # production build
+uv pip install 'psycopg[c]'        # production build (requires compiler)
+```
+
+Connection URL format (must use `+psycopg` for psycopg3):
+```bash
+DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/mcp
 ```
 
 #### Quick Postgres container
@@ -1874,7 +1894,7 @@ MCP Gateway includes **vendor-agnostic OpenTelemetry support** for distributed t
 
 | Setting                         | Description                                    | Default               | Options                                    |
 | ------------------------------- | ---------------------------------------------- | --------------------- | ------------------------------------------ |
-| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `true`                | `true`, `false`                           |
+| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `false`               | `true`, `false`                           |
 | `OTEL_SERVICE_NAME`             | Service identifier in traces                   | `mcp-gateway`         | string                                     |
 | `OTEL_SERVICE_VERSION`          | Service version in traces                      | `0.9.0`               | string                                     |
 | `OTEL_DEPLOYMENT_ENVIRONMENT`   | Environment tag (dev/staging/prod)            | `development`         | string                                     |
@@ -2059,6 +2079,7 @@ ENABLE_METRICS=false
 | ----------------------- | ----------------------------------------- | ------- | ------- |
 | `HEALTH_CHECK_INTERVAL` | Health poll interval (secs)               | `60`    | int > 0 |
 | `HEALTH_CHECK_TIMEOUT`  | Health request timeout (secs)             | `10`    | int > 0 |
+| `GATEWAY_HEALTH_CHECK_TIMEOUT` | Per-check timeout for gateway health check (secs) | `5.0` | float > 0 |
 | `UNHEALTHY_THRESHOLD`   | Fail-count before peer deactivation,      | `3`     | int > 0 |
 |                         | Set to -1 if deactivation is not needed.  |         |         |
 | `GATEWAY_VALIDATION_TIMEOUT` | Gateway URL validation timeout (secs) | `5`     | int > 0 |
@@ -2088,6 +2109,15 @@ ENABLE_METRICS=false
 | `MESSAGE_TTL`             | Message retention (secs)   | `600`    | int > 0                  |
 | `REDIS_MAX_RETRIES`       | Max Retry Attempts         | `3`      | int > 0                  |
 | `REDIS_RETRY_INTERVAL_MS` | Retry Interval (ms)        | `2000`   | int > 0                  |
+| `REDIS_MAX_CONNECTIONS`   | Connection pool size       | `50`     | int > 0                  |
+| `REDIS_SOCKET_TIMEOUT`    | Socket timeout (secs)      | `2.0`    | float > 0                |
+| `REDIS_SOCKET_CONNECT_TIMEOUT` | Connect timeout (secs) | `2.0`   | float > 0                |
+| `REDIS_RETRY_ON_TIMEOUT`  | Retry on timeout           | `true`   | bool                     |
+| `REDIS_HEALTH_CHECK_INTERVAL` | Health check (secs)    | `30`     | int >= 0                 |
+| `REDIS_DECODE_RESPONSES`  | Return strings vs bytes    | `true`   | bool                     |
+| `REDIS_LEADER_TTL`        | Leader election TTL (secs) | `15`     | int > 0                  |
+| `REDIS_LEADER_KEY`        | Leader key name            | `gateway_service_leader` | string |
+| `REDIS_LEADER_HEARTBEAT_INTERVAL` | Heartbeat (secs)   | `5`      | int > 0                  |
 
 > 🧠 `none` disables caching entirely. Use `memory` for dev, `database` for local persistence, or `redis` for distributed caching across multiple instances.
 
@@ -2142,6 +2172,7 @@ MCP Gateway uses Alembic for database migrations. Common commands:
 | `ENABLE_HEADER_PASSTHROUGH`   | Enable HTTP header passthrough feature (⚠️ Security implications) | `false` | bool |
 | `ENABLE_OVERWRITE_BASE_HEADERS` | Enable overwriting of base headers (⚠️ Advanced usage) | `false` | bool |
 | `DEFAULT_PASSTHROUGH_HEADERS` | Default headers to pass through (JSON array)    | `["X-Tenant-Id", "X-Trace-Id"]` | JSON array |
+| `GLOBAL_CONFIG_CACHE_TTL`     | In-memory cache TTL for GlobalConfig (seconds). Reduces DB queries under load. | `60` | int (5-3600) |
 
 > ⚠️ **Security Warning**: Header passthrough is disabled by default for security. Only enable if you understand the implications and have reviewed which headers should be passed through to backing MCP servers. Authorization headers are not included in defaults.
 
@@ -2413,8 +2444,16 @@ curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
          }' \
      http://localhost:4444/tools
 
-# List tools
+# List tools (returns first 50 by default)
 curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/tools
+
+# List tools with filtering and pagination
+curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
+     "http://localhost:4444/tools?gateway_id=<id>&limit=100&include_pagination=true"
+
+# Get ALL tools (no pagination limit)
+curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
+     "http://localhost:4444/tools?limit=0"
 
 # Get tool by ID
 curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/tools/1

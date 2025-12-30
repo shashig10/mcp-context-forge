@@ -17,18 +17,19 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
-import json
 import logging
 import secrets
 from typing import Any, Dict, Optional
 
 # Third-Party
 import aiohttp
+import orjson
 from requests_oauthlib import OAuth2Session
 
 # First-Party
 from mcpgateway.config import get_settings
 from mcpgateway.services.encryption_service import get_encryption_service
+from mcpgateway.utils.redis_client import get_redis_client as _get_shared_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +42,15 @@ _state_lock = asyncio.Lock()
 # State TTL in seconds (5 minutes)
 STATE_TTL_SECONDS = 300
 
-# Redis client for distributed state storage (initialized lazily)
+# Redis client for distributed state storage (uses shared factory)
 _redis_client: Optional[Any] = None
 _REDIS_INITIALIZED = False
 
 
 async def _get_redis_client():
-    """Get or create Redis client for distributed state storage.
+    """Get shared Redis client for distributed state storage.
+
+    Uses the centralized Redis client factory for consistent configuration.
 
     Returns:
         Redis client instance or None if unavailable
@@ -60,15 +63,11 @@ async def _get_redis_client():
     settings = get_settings()
     if settings.cache_type == "redis" and settings.redis_url:
         try:
-            # Third-Party
-            import redis.asyncio as aioredis  # pylint: disable=import-outside-toplevel
-
-            _redis_client = await aioredis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
-            # Test connection
-            await _redis_client.ping()
-            logger.info("Connected to Redis for OAuth state storage")
+            _redis_client = await _get_shared_redis_client()
+            if _redis_client:
+                logger.info("OAuth manager connected to shared Redis client")
         except Exception as e:
-            logger.warning(f"Failed to connect to Redis, falling back to in-memory storage: {e}")
+            logger.warning(f"Failed to get Redis client, falling back to in-memory storage: {e}")
             _redis_client = None
     else:
         _redis_client = None
@@ -563,7 +562,7 @@ class OAuthManager:
 
             # Parse state data
             state_json = state_bytes.decode()
-            state_payload = json.loads(state_json)
+            state_payload = orjson.loads(state_json)
             app_user_email = state_payload.get("app_user_email")
             state_gateway_id = state_payload.get("gateway_id")
 
@@ -626,9 +625,8 @@ class OAuthManager:
         # Include user email in state for secure user association
         state_data = {"gateway_id": gateway_id, "app_user_email": app_user_email, "nonce": secrets.token_urlsafe(16), "timestamp": datetime.now(timezone.utc).isoformat()}
 
-        # Encode state as JSON
-        state_json = json.dumps(state_data, separators=(",", ":"))
-        state_bytes = state_json.encode()
+        # Encode state as JSON (orjson produces compact output by default)
+        state_bytes = orjson.dumps(state_data)
 
         # Create HMAC signature
         secret_key = self.settings.auth_encryption_secret.get_secret_value().encode() if self.settings.auth_encryption_secret else b"default-secret-key"
@@ -659,7 +657,7 @@ class OAuthManager:
                     state_key = f"oauth:state:{gateway_id}:{state}"
                     state_data = {"state": state, "gateway_id": gateway_id, "code_verifier": code_verifier, "expires_at": expires_at.isoformat(), "used": False}
                     # Store in Redis with TTL
-                    await redis.setex(state_key, STATE_TTL_SECONDS, json.dumps(state_data))
+                    await redis.setex(state_key, STATE_TTL_SECONDS, orjson.dumps(state_data))
                     logger.debug(f"Stored OAuth state in Redis for gateway {gateway_id}")
                     return
                 except Exception as e:
@@ -727,7 +725,7 @@ class OAuthManager:
                         logger.warning(f"State not found in Redis for gateway {gateway_id}")
                         return False
 
-                    state_data = json.loads(state_json)
+                    state_data = orjson.loads(state_json)
 
                     # Parse expires_at as timezone-aware datetime. If the stored value
                     # is naive, assume UTC for compatibility.
@@ -851,7 +849,7 @@ class OAuthManager:
                     if not state_json:
                         return None
 
-                    state_data = json.loads(state_json)
+                    state_data = orjson.loads(state_json)
 
                     # Check expiration
                     try:

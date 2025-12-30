@@ -51,8 +51,7 @@ Examples:
 # Standard
 import asyncio
 from asyncio import Task
-from datetime import datetime, timezone
-import json
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 import traceback
@@ -62,6 +61,7 @@ import uuid
 
 # Third-Party
 from fastapi import HTTPException, status
+import orjson
 
 # First-Party
 from mcpgateway import __version__
@@ -72,6 +72,7 @@ from mcpgateway.services import PromptService, ResourceService, ToolService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.transports import SSETransport
 from mcpgateway.utils.create_jwt_token import create_jwt_token
+from mcpgateway.utils.redis_client import get_redis_client
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.validation.jsonrpc import JSONRPCError
 
@@ -197,8 +198,9 @@ class SessionBackend:
             if not redis_url:
                 raise ValueError("Redis backend requires redis_url")
 
-            self._redis = Redis.from_url(redis_url)
-            self._pubsub = self._redis.pubsub()
+            # Redis client is set in initialize() via the shared factory
+            self._redis: Optional[Redis] = None
+            self._pubsub = None
 
         elif self._backend == "database":
             if not SQLALCHEMY_AVAILABLE:
@@ -326,7 +328,12 @@ class SessionRegistry(SessionBackend):
             logger.info("Database cleanup task started")
 
         elif self._backend == "redis":
-            await self._pubsub.subscribe("mcp_session_events")
+            # Get shared Redis client from factory
+            self._redis = await get_redis_client()
+            if self._redis:
+                self._pubsub = self._redis.pubsub()
+                await self._pubsub.subscribe("mcp_session_events")
+                logger.info("Session registry connected to shared Redis client")
 
         elif self._backend == "none":
             # Nothing to initialize for none backend
@@ -363,17 +370,15 @@ class SessionRegistry(SessionBackend):
             except asyncio.CancelledError:
                 pass
 
-        # Close Redis connections
-        if self._backend == "redis":
+        # Close Redis pubsub (but not the shared client)
+        if self._backend == "redis" and getattr(self, "_pubsub", None):
             try:
                 await self._pubsub.aclose()
-                await self._redis.aclose()
             except Exception as e:
-                logger.error(f"Error closing Redis connection: {e}")
-                # Error example:
-                # >>> import logging
-                # >>> logger = logging.getLogger(__name__)
-                # >>> logger.error(f"Error closing Redis connection: Connection lost")  # doctest: +SKIP
+                logger.error(f"Error closing Redis pubsub: {e}")
+            # Don't close self._redis - it's the shared client managed by redis_client.py
+            self._redis = None
+            self._pubsub = None
 
     async def add_session(self, session_id: str, transport: SSETransport) -> None:
         """Add a session to the registry.
@@ -420,10 +425,13 @@ class SessionRegistry(SessionBackend):
 
         if self._backend == "redis":
             # Store session marker in Redis
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, skipping distributed session tracking for {session_id}")
+                return
             try:
                 await self._redis.setex(f"mcp:session:{session_id}", self._session_ttl, "1")
                 # Publish event to notify other workers
-                await self._redis.publish("mcp_session_events", json.dumps({"type": "add", "session_id": session_id, "timestamp": time.time()}))
+                await self._redis.publish("mcp_session_events", orjson.dumps({"type": "add", "session_id": session_id, "timestamp": time.time()}))
             except Exception as e:
                 logger.error(f"Redis error adding session {session_id}: {e}")
 
@@ -515,6 +523,8 @@ class SessionRegistry(SessionBackend):
 
         # If not in local cache, check if it exists in shared backend
         if self._backend == "redis":
+            if not self._redis:
+                return None
             try:
                 exists = await self._redis.exists(f"mcp:session:{session_id}")
                 session_exists = bool(exists)
@@ -616,10 +626,12 @@ class SessionRegistry(SessionBackend):
 
         # Remove from shared backend
         if self._backend == "redis":
+            if not self._redis:
+                return
             try:
                 await self._redis.delete(f"mcp:session:{session_id}")
                 # Notify other workers
-                await self._redis.publish("mcp_session_events", json.dumps({"type": "remove", "session_id": session_id, "timestamp": time.time()}))
+                await self._redis.publish("mcp_session_events", orjson.dumps({"type": "remove", "session_id": session_id, "timestamp": time.time()}))
             except Exception as e:
                 logger.error(f"Redis error removing session {session_id}: {e}")
 
@@ -690,37 +702,47 @@ class SessionRegistry(SessionBackend):
             True
             >>> reg._session_message['session_id']
             'session-789'
-            >>> json.loads(reg._session_message['message']) == message
+            >>> orjson.loads(reg._session_message['message'])['message'] == message
             True
         """
         # Skip for none backend only
         if self._backend == "none":
             return
 
-        if self._backend == "memory":
-            if isinstance(message, (dict, list)):
-                msg_json = json.dumps(message)
-            else:
-                msg_json = json.dumps(str(message))
+        def _build_payload(msg: Any) -> str:
+            """Build a JSON payload for message broadcasting.
 
-            self._session_message: Dict[str, Any] | None = {"session_id": session_id, "message": msg_json}
+            Args:
+                msg: Message to wrap in payload envelope.
+
+            Returns:
+                JSON-encoded string containing type, message, and timestamp.
+            """
+            payload = {"type": "message", "message": msg, "timestamp": time.time()}
+            return orjson.dumps(payload).decode()
+
+        if self._backend == "memory":
+            payload_json = _build_payload(message)
+            self._session_message: Dict[str, Any] | None = {"session_id": session_id, "message": payload_json}
 
         elif self._backend == "redis":
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, cannot broadcast to {session_id}")
+                return
             try:
-                if isinstance(message, (dict, list)):
-                    msg_json = json.dumps(message)
-                else:
-                    msg_json = json.dumps(str(message))
-
-                await self._redis.publish(session_id, json.dumps({"type": "message", "message": msg_json, "timestamp": time.time()}))
+                broadcast_payload = {
+                    "type": "message",
+                    "message": message,  # Keep as original type, not pre-encoded
+                    "timestamp": time.time(),
+                }
+                # Single encode
+                payload_json = orjson.dumps(broadcast_payload)
+                await self._redis.publish(session_id, payload_json)  # Single encode
             except Exception as e:
                 logger.error(f"Redis error during broadcast: {e}")
         elif self._backend == "database":
             try:
-                if isinstance(message, (dict, list)):
-                    msg_json = json.dumps(message)
-                else:
-                    msg_json = json.dumps(str(message))
+                msg_json = _build_payload(message)
 
                 def _db_add() -> None:
                     """Store message in the database for inter-process communication.
@@ -839,13 +861,19 @@ class SessionRegistry(SessionBackend):
             pass
 
         elif self._backend == "memory":
-            # if self._session_message:
             transport = self.get_session_sync(session_id)
             if transport and self._session_message:
-                message = json.loads(str(self._session_message.get("message")))
+                data = orjson.loads(self._session_message.get("message"))
+                if isinstance(data, dict) and "message" in data:
+                    message = data["message"]
+                else:
+                    message = data
                 await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
 
         elif self._backend == "redis":
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, cannot respond to {session_id}")
+                return
             pubsub = self._redis.pubsub()
             await pubsub.subscribe(session_id)
 
@@ -853,10 +881,8 @@ class SessionRegistry(SessionBackend):
                 async for msg in pubsub.listen():
                     if msg["type"] != "message":
                         continue
-                    data = json.loads(msg["data"])
+                    data = orjson.loads(msg["data"])
                     message = data.get("message", {})
-                    if isinstance(message, str):
-                        message = json.loads(message)
                     transport = self.get_session_sync(session_id)
                     if transport:
                         await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
@@ -864,7 +890,10 @@ class SessionRegistry(SessionBackend):
                 logger.info(f"PubSub listener for session {session_id} cancelled")
             finally:
                 await pubsub.unsubscribe(session_id)
-                await pubsub.close()
+                try:
+                    await pubsub.aclose()
+                except AttributeError:
+                    await pubsub.close()
                 logger.info(f"Cleaned up pubsub for session {session_id}")
 
         elif self._backend == "database":
@@ -997,7 +1026,11 @@ class SessionRegistry(SessionBackend):
                     record = await asyncio.to_thread(_db_read, session_id)
 
                     if record:
-                        message = json.loads(record.message)
+                        data = orjson.loads(record.message)
+                        if isinstance(data, dict) and "message" in data:
+                            message = data["message"]
+                        else:
+                            message = data
                         transport = self.get_session_sync(session_id)
                         if transport:
                             logger.info("Ready to respond")
@@ -1020,6 +1053,8 @@ class SessionRegistry(SessionBackend):
         It checks all local sessions, refreshes TTLs for connected sessions, and
         removes disconnected ones.
         """
+        if not self._redis:
+            return
         try:
             # Check all local sessions
             local_transports = {}
@@ -1079,7 +1114,8 @@ class SessionRegistry(SessionBackend):
                     db_session = next(get_db())
                     try:
                         # Delete sessions that haven't been accessed for TTL seconds
-                        expiry_time = func.now() - func.make_interval(seconds=self._session_ttl)  # pylint: disable=not-callable
+                        # Use Python datetime for database-agnostic expiry calculation
+                        expiry_time = datetime.now(timezone.utc) - timedelta(seconds=self._session_ttl)
                         result = db_session.query(SessionRecord).filter(SessionRecord.last_accessed < expiry_time).delete()
                         db_session.commit()
                         return result

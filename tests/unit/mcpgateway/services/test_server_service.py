@@ -450,7 +450,7 @@ class TestServerService:
         # test_db.execute.assert_called_once()
         test_db.execute.call_count = 2
         assert result == [server_read]
-        server_service._convert_server_to_read.assert_called_once_with(mock_server)
+        server_service._convert_server_to_read.assert_called_once_with(mock_server, include_metrics=False)
 
     @pytest.mark.asyncio
     async def test_get_server(self, server_service, mock_server, test_db):
@@ -747,7 +747,8 @@ class TestServerService:
         result = await server_service.toggle_server_status(test_db, 1, activate=False)
 
         test_db.get.assert_called_once_with(DbServer, 1)
-        test_db.commit.assert_called_once()
+        # commit called twice: once for status change, once in _get_team_name to release transaction
+        assert test_db.commit.call_count == 2
         test_db.refresh.assert_called_once()
         server_service._notify_server_deactivated.assert_called_once()
         assert result.enabled is False

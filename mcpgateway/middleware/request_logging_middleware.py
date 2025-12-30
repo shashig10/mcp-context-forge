@@ -26,7 +26,6 @@ from starlette.responses import Response
 
 # First-Party
 from mcpgateway.auth import get_current_user
-from mcpgateway.db import SessionLocal
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.utils.correlation_id import get_correlation_id
@@ -116,7 +115,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     masking sensitive information like passwords, tokens, and authorization headers.
     """
 
-    def __init__(self, app, enable_gateway_logging: bool = True, log_detailed_requests: bool = False, log_level: str = "DEBUG", max_body_size: int = 4096):
+    def __init__(
+        self,
+        app,
+        enable_gateway_logging: bool = True,
+        log_detailed_requests: bool = False,
+        log_level: str = "DEBUG",
+        max_body_size: int = 4096,
+        log_request_start: bool = False,
+    ):
         """Initialize the request logging middleware.
 
         Args:
@@ -125,12 +132,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             log_detailed_requests: Whether to enable detailed request/response payload logging
             log_level: The log level for requests (not used, logs at INFO)
             max_body_size: Maximum request body size to log in bytes
+            log_request_start: Whether to log "request started" events (default: False for performance)
+                              When False, only logs on request completion which halves logging overhead.
         """
         super().__init__(app)
         self.enable_gateway_logging = enable_gateway_logging
         self.log_detailed_requests = log_detailed_requests
         self.log_level = log_level.upper()
         self.max_body_size = max_body_size  # Expected to be in bytes
+        self.log_request_start = log_request_start
 
     async def _resolve_user_identity(self, request: Request):
         """Best-effort extraction of user identity for request logs.
@@ -160,22 +170,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         if not token:
             return (None, None)
 
-        db = None
         try:
-            db = SessionLocal()
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-            user = await get_current_user(credentials, db)
+            # get_current_user now uses fresh DB sessions internally
+            user = await get_current_user(credentials)
             raw_user_id = getattr(user, "id", None)
             user_email = getattr(user, "email", None)
             return (str(raw_user_id) if raw_user_id is not None else None, user_email)
         except Exception:
             return (None, None)
-        finally:
-            if db:
-                try:
-                    db.close()
-                except Exception:  # nosec B110 - Silently handle db.close() failures during cleanup
-                    pass
 
     async def dispatch(self, request: Request, call_next: Callable):
         """Process incoming request and log details with sensitive data masked.
@@ -205,8 +208,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         skip_paths = ["/health", "/healthz", "/static", "/favicon.ico"]
         should_log_boundary = self.enable_gateway_logging and not any(path.startswith(skip_path) for skip_path in skip_paths)
 
-        # Log gateway request started
-        if should_log_boundary:
+        # Log gateway request started (optional - disabled by default for performance)
+        if should_log_boundary and self.log_request_start:
             try:
                 structured_logger.log(
                     level="INFO",

@@ -899,12 +899,17 @@ pip install -e ".[dev]"
 
 You can configure the gateway with SQLite, PostgreSQL (or any other compatible database) in .env.
 
-When using PostgreSQL, you need to install `psycopg2` driver.
+When using PostgreSQL, you need to install the `psycopg` (psycopg3) driver.
 
 ```bash
-uv pip install psycopg2-binary   # dev convenience
+uv pip install 'psycopg[binary]'   # dev convenience (pre-built wheels)
 # or
-uv pip install psycopg2          # production build
+uv pip install 'psycopg[c]'        # production build (requires compiler)
+```
+
+Connection URL format (must use `+psycopg` for psycopg3):
+```bash
+DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/mcp
 ```
 
 #### Quick Postgres container
@@ -1243,7 +1248,7 @@ MCP Gateway includes **vendor-agnostic OpenTelemetry support** for distributed t
 
 | Setting                         | Description                                    | Default               | Options                                    |
 | ------------------------------- | ---------------------------------------------- | --------------------- | ------------------------------------------ |
-| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `true`                | `true`, `false`                           |
+| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `false`               | `true`, `false`                           |
 | `OTEL_SERVICE_NAME`             | Service identifier in traces                   | `mcp-gateway`         | string                                     |
 | `OTEL_SERVICE_VERSION`          | Service version in traces                      | `0.9.0`               | string                                     |
 | `OTEL_DEPLOYMENT_ENVIRONMENT`   | Environment tag (dev/staging/prod)            | `development`         | string                                     |

@@ -44,9 +44,10 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 import httpx
+import orjson
 from pydantic import SecretStr, ValidationError
 from pydantic_core import ValidationError as CoreValidationError
-from sqlalchemy import and_, case, cast, desc, func, or_, select, String
+from sqlalchemy import and_, case, cast, desc, func, or_, select, String, text
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm import joinedload, Session
 from sqlalchemy.sql.functions import coalesce
@@ -55,6 +56,8 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 # First-Party
 # Authentication and password-related imports
 from mcpgateway.auth import get_current_user
+from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
+from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.common.models import LogLevel
 from mcpgateway.config import settings
 from mcpgateway.db import extract_json_field, get_db, GlobalConfig, ObservabilitySavedQuery, ObservabilitySpan, ObservabilityTrace
@@ -129,6 +132,7 @@ from mcpgateway.services.tool_service import ToolError, ToolNameConflictError, T
 from mcpgateway.utils.create_jwt_token import create_jwt_token, get_jwt_token
 from mcpgateway.utils.error_formatter import ErrorFormatter
 from mcpgateway.utils.metadata_capture import MetadataCapture
+from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.pagination import generate_pagination_links
 from mcpgateway.utils.passthrough_headers import PassthroughHeadersError
 from mcpgateway.utils.retry_manager import ResilientHttpClient
@@ -647,11 +651,8 @@ async def get_global_passthrough_headers(
         >>> inspect.iscoroutinefunction(get_global_passthrough_headers)
         True
     """
-    config = db.query(GlobalConfig).first()
-    if config:
-        passthrough_headers = config.passthrough_headers
-    else:
-        passthrough_headers = []
+    # Use cache for reads (Issue #1715)
+    passthrough_headers = global_config_cache.get_passthrough_headers(db, [])
     return GlobalConfigRead(passthrough_headers=passthrough_headers)
 
 
@@ -695,6 +696,8 @@ async def update_global_passthrough_headers(
         else:
             config.passthrough_headers = config_update.passthrough_headers
         db.commit()
+        # Invalidate cache so changes propagate immediately (Issue #1715)
+        global_config_cache.invalidate()
         return GlobalConfigRead(passthrough_headers=config.passthrough_headers)
     except (IntegrityError, ValidationError, PassthroughHeadersError) as e:
         db.rollback()
@@ -705,6 +708,137 @@ async def update_global_passthrough_headers(
         if isinstance(e, PassthroughHeadersError):
             raise HTTPException(status_code=500, detail=str(e))
         raise HTTPException(status_code=500, detail="Unknown error occurred")
+
+
+@admin_router.post("/config/passthrough-headers/invalidate-cache")
+@rate_limit(requests_per_minute=10)  # Strict limit for cache operations
+async def invalidate_passthrough_headers_cache(
+    _user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """Invalidate the GlobalConfig cache.
+
+    Forces an immediate cache refresh on the next access. Use this after
+    updating GlobalConfig outside the normal API flow, or when you need
+    changes to propagate immediately across all workers.
+
+    Args:
+        _user: Authenticated user
+
+    Returns:
+        Dict with invalidation status and cache statistics
+
+    Examples:
+        >>> # Test function exists and has correct name
+        >>> from mcpgateway.admin import invalidate_passthrough_headers_cache
+        >>> invalidate_passthrough_headers_cache.__name__
+        'invalidate_passthrough_headers_cache'
+        >>> # Test it's a coroutine function
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(invalidate_passthrough_headers_cache)
+        True
+    """
+    global_config_cache.invalidate()
+    stats = global_config_cache.stats()
+    return {
+        "status": "invalidated",
+        "message": "GlobalConfig cache invalidated successfully",
+        "cache_stats": stats,
+    }
+
+
+@admin_router.get("/config/passthrough-headers/cache-stats")
+@rate_limit(requests_per_minute=30)
+async def get_passthrough_headers_cache_stats(
+    _user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """Get GlobalConfig cache statistics.
+
+    Returns cache hit/miss counts, hit rate, TTL, and current cache status.
+    Useful for monitoring cache effectiveness and debugging.
+
+    Args:
+        _user: Authenticated user
+
+    Returns:
+        Dict with cache statistics
+
+    Examples:
+        >>> # Test function exists and has correct name
+        >>> from mcpgateway.admin import get_passthrough_headers_cache_stats
+        >>> get_passthrough_headers_cache_stats.__name__
+        'get_passthrough_headers_cache_stats'
+        >>> # Test it's a coroutine function
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(get_passthrough_headers_cache_stats)
+        True
+    """
+    return global_config_cache.stats()
+
+
+# ===================================
+# A2A Stats Cache Endpoints
+# ===================================
+
+
+@admin_router.post("/cache/a2a-stats/invalidate")
+@rate_limit(requests_per_minute=10)
+async def invalidate_a2a_stats_cache(
+    _user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """Invalidate the A2A stats cache.
+
+    Forces an immediate cache refresh on the next access. Use this after
+    modifying A2A agents outside the normal API flow, or when you need
+    changes to propagate immediately.
+
+    Args:
+        _user: Authenticated user
+
+    Returns:
+        Dict with invalidation status and cache statistics
+
+    Examples:
+        >>> from mcpgateway.admin import invalidate_a2a_stats_cache
+        >>> invalidate_a2a_stats_cache.__name__
+        'invalidate_a2a_stats_cache'
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(invalidate_a2a_stats_cache)
+        True
+    """
+    a2a_stats_cache.invalidate()
+    stats = a2a_stats_cache.stats()
+    return {
+        "status": "invalidated",
+        "message": "A2A stats cache invalidated successfully",
+        "cache_stats": stats,
+    }
+
+
+@admin_router.get("/cache/a2a-stats/stats")
+@rate_limit(requests_per_minute=30)
+async def get_a2a_stats_cache_stats(
+    _user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """Get A2A stats cache statistics.
+
+    Returns cache hit/miss counts, hit rate, TTL, and current cache status.
+    Useful for monitoring cache effectiveness and debugging.
+
+    Args:
+        _user: Authenticated user
+
+    Returns:
+        Dict with cache statistics
+
+    Examples:
+        >>> from mcpgateway.admin import get_a2a_stats_cache_stats
+        >>> get_a2a_stats_cache_stats.__name__
+        'get_a2a_stats_cache_stats'
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(get_a2a_stats_cache_stats)
+        True
+    """
+    return a2a_stats_cache.stats()
 
 
 @admin_router.get("/config/settings")
@@ -1203,10 +1337,10 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
             # User clicked "Select All" - get all tool IDs from hidden field
             all_tool_ids_json = str(form.get("allToolIds", "[]"))
             try:
-                all_tool_ids = json.loads(all_tool_ids_json)
+                all_tool_ids = orjson.loads(all_tool_ids_json)
                 associated_tools_list = all_tool_ids
                 LOGGER.info(f"Select All tools enabled: {len(all_tool_ids)} tools selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allToolIds JSON, falling back to checked tools")
 
         # Handle "Select All" for resources
@@ -1214,10 +1348,10 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
         if form.get("selectAllResources") == "true":
             all_resource_ids_json = str(form.get("allResourceIds", "[]"))
             try:
-                all_resource_ids = json.loads(all_resource_ids_json)
+                all_resource_ids = orjson.loads(all_resource_ids_json)
                 associated_resources_list = all_resource_ids
                 LOGGER.info(f"Select All resources enabled: {len(all_resource_ids)} resources selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allResourceIds JSON, falling back to checked resources")
 
         # Handle "Select All" for prompts
@@ -1225,10 +1359,10 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
         if form.get("selectAllPrompts") == "true":
             all_prompt_ids_json = str(form.get("allPromptIds", "[]"))
             try:
-                all_prompt_ids = json.loads(all_prompt_ids_json)
+                all_prompt_ids = orjson.loads(all_prompt_ids_json)
                 associated_prompts_list = all_prompt_ids
                 LOGGER.info(f"Select All prompts enabled: {len(all_prompt_ids)} prompts selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
 
         server = ServerCreate(
@@ -1244,7 +1378,7 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
         )
     except KeyError as e:
         # Convert KeyError to ValidationError-like response
-        return JSONResponse(content={"message": f"Missing required field: {e}", "success": False}, status_code=422)
+        return ORJSONResponse(content={"message": f"Missing required field: {e}", "success": False}, status_code=422)
     try:
         user_email = get_user_email(user)
         # Determine personal team for default assignment
@@ -1269,25 +1403,25 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
             team_id=team_id_cast,
             visibility=visibility,
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Server created successfully!", "success": True},
             status_code=200,
         )
 
     except CoreValidationError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=422)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=422)
     except ServerNameConflictError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except ServerError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValueError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=400)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
     except ValidationError as ex:
-        return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
     except IntegrityError as ex:
-        return JSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
+        return ORJSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
     except Exception as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/servers/{server_id}/edit")
@@ -1429,10 +1563,10 @@ async def admin_edit_server(
             # User clicked "Select All" - get all tool IDs from hidden field
             all_tool_ids_json = str(form.get("allToolIds", "[]"))
             try:
-                all_tool_ids = json.loads(all_tool_ids_json)
+                all_tool_ids = orjson.loads(all_tool_ids_json)
                 associated_tools_list = all_tool_ids
                 LOGGER.info(f"Select All tools enabled for edit: {len(all_tool_ids)} tools selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allToolIds JSON, falling back to checked tools")
 
         # Handle "Select All" for resources
@@ -1440,10 +1574,10 @@ async def admin_edit_server(
         if form.get("selectAllResources") == "true":
             all_resource_ids_json = str(form.get("allResourceIds", "[]"))
             try:
-                all_resource_ids = json.loads(all_resource_ids_json)
+                all_resource_ids = orjson.loads(all_resource_ids_json)
                 associated_resources_list = all_resource_ids
                 LOGGER.info(f"Select All resources enabled for edit: {len(all_resource_ids)} resources selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allResourceIds JSON, falling back to checked resources")
 
         # Handle "Select All" for prompts
@@ -1451,10 +1585,10 @@ async def admin_edit_server(
         if form.get("selectAllPrompts") == "true":
             all_prompt_ids_json = str(form.get("allPromptIds", "[]"))
             try:
-                all_prompt_ids = json.loads(all_prompt_ids_json)
+                all_prompt_ids = orjson.loads(all_prompt_ids_json)
                 associated_prompts_list = all_prompt_ids
                 LOGGER.info(f"Select All prompts enabled for edit: {len(all_prompt_ids)} prompts selected")
-            except json.JSONDecodeError:
+            except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
 
         server = ServerUpdate(
@@ -1482,28 +1616,28 @@ async def admin_edit_server(
             modified_user_agent=mod_metadata["modified_user_agent"],
         )
 
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Server updated successfully!", "success": True},
             status_code=200,
         )
     except (ValidationError, CoreValidationError) as ex:
         # Catch both Pydantic and pydantic_core validation errors
-        return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
     except ServerNameConflictError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except ServerError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValueError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=400)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
     except RuntimeError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except IntegrityError as ex:
-        return JSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
+        return ORJSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
-        return JSONResponse(content={"message": str(e), "success": False}, status_code=403)
+        return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
     except Exception as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/servers/{server_id}/toggle")
@@ -2565,6 +2699,8 @@ async def admin_ui(
     # --------------------------------------------------------------------------------
     try:
         raw_tools = await _call_list_with_team_support(tool_service.list_tools_for_user, db, user_email, include_inactive=include_inactive)
+        if isinstance(raw_tools, tuple):
+            raw_tools = raw_tools[0]
     except Exception as e:
         LOGGER.exception("Failed to load tools for user: %s", e)
         raw_tools = []
@@ -3132,7 +3268,8 @@ async def change_password_required_handler(request: Request, db: Session = Depen
             # Authenticate using the token
             # Create credentials object from cookie
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=jwt_token)
-            current_user = await get_current_user(credentials, db, request)
+            # get_current_user now uses fresh DB sessions internally
+            current_user = await get_current_user(credentials, request=request)
 
             if not current_user:
                 root_path = request.scope.get("root_path", "")
@@ -4011,7 +4148,7 @@ async def admin_delete_team(
 
 
 @admin_router.post("/teams/{team_id}/add-member")
-@require_permission("teams.write")  # Team write permission instead of admin user management
+@require_permission("teams.manage_members")
 async def admin_add_team_member(
     team_id: str,
     request: Request,
@@ -4095,7 +4232,7 @@ async def admin_add_team_member(
 
 
 @admin_router.post("/teams/{team_id}/update-member-role")
-@require_permission("teams.write")
+@require_permission("teams.manage_members")
 async def admin_update_team_member_role(
     team_id: str,
     request: Request,
@@ -4180,7 +4317,7 @@ async def admin_update_team_member_role(
 
 
 @admin_router.post("/teams/{team_id}/remove-member")
-@require_permission("teams.write")  # Team write permission instead of admin user management
+@require_permission("teams.manage_members")
 async def admin_remove_team_member(
     team_id: str,
     request: Request,
@@ -4302,10 +4439,9 @@ async def admin_leave_team(
         if team.is_personal:
             return HTMLResponse(content='<div class="text-red-500">Cannot leave your personal team</div>', status_code=400)
 
-        # Check if user is the last owner
+        # Check if user is the last owner (use SQL COUNT instead of loading all members)
         if user_role == "owner":
-            members = await team_service.get_team_members(team_id)
-            owner_count = sum(1 for _, membership in members if membership.role == "owner")
+            owner_count = team_service.count_team_owners(team_id)
             if owner_count <= 1:
                 return HTMLResponse(content='<div class="text-red-500">Cannot leave team as the last owner. Transfer ownership or delete the team instead.</div>', status_code=400)
 
@@ -4723,7 +4859,7 @@ async def admin_list_users(
             users_data = []
             for user_obj in users:
                 users_data.append({"email": user_obj.email, "full_name": user_obj.full_name, "is_active": user_obj.is_active, "is_admin": user_obj.is_admin})
-            return JSONResponse(content={"users": users_data})
+            return ORJSONResponse(content={"users": users_data})
 
         # Generate HTML for users
         users_html = ""
@@ -5635,7 +5771,7 @@ async def admin_list_tools(
     for t in tools:
         team_name = tool_service._get_team_name(db, getattr(t, "team_id", None))  # pylint: disable=protected-access
         t.team = team_name
-        result.append(tool_service._convert_tool_to_read(t))  # pylint: disable=protected-access
+        result.append(tool_service._convert_tool_to_read(t, include_metrics=False))  # pylint: disable=protected-access
 
     # Build pagination metadata
     pagination = PaginationMeta(
@@ -6300,7 +6436,7 @@ async def admin_resources_partial_html(
     resources_data = []
     for r in resources_db:
         try:
-            resources_data.append(local_resource_service._convert_resource_to_read(r))  # pylint: disable=protected-access
+            resources_data.append(local_resource_service._convert_resource_to_read(r, include_metrics=False))  # pylint: disable=protected-access
         except Exception as e:
             LOGGER.warning(f"Failed to convert resource {getattr(r, 'id', '<unknown>')} to schema: {e}")
             continue
@@ -6909,10 +7045,10 @@ async def admin_add_tool(
         "description": form.get("description"),
         "request_type": request_type,
         "integration_type": integration_type,
-        "headers": json.loads(headers_raw if isinstance(headers_raw, str) and headers_raw else "{}"),
-        "input_schema": json.loads(input_schema_raw if isinstance(input_schema_raw, str) and input_schema_raw else "{}"),
-        "output_schema": (json.loads(output_schema_raw) if isinstance(output_schema_raw, str) and output_schema_raw else None),
-        "annotations": json.loads(annotations_raw if isinstance(annotations_raw, str) and annotations_raw else "{}"),
+        "headers": orjson.loads(headers_raw if isinstance(headers_raw, str) and headers_raw else "{}"),
+        "input_schema": orjson.loads(input_schema_raw if isinstance(input_schema_raw, str) and input_schema_raw else "{}"),
+        "output_schema": (orjson.loads(output_schema_raw) if isinstance(output_schema_raw, str) and output_schema_raw else None),
+        "annotations": orjson.loads(annotations_raw if isinstance(annotations_raw, str) and annotations_raw else "{}"),
         "jsonpath_filter": form.get("jsonpath_filter", ""),
         "auth_type": form.get("auth_type", ""),
         "auth_username": form.get("auth_username", ""),
@@ -6924,13 +7060,13 @@ async def admin_add_tool(
         "visibility": visibility,
         "team_id": team_id,
         "owner_email": user_email,
-        "query_mapping": json.loads(form.get("query_mapping") or "{}"),
-        "header_mapping": json.loads(form.get("header_mapping") or "{}"),
+        "query_mapping": orjson.loads(form.get("query_mapping") or "{}"),
+        "header_mapping": orjson.loads(form.get("header_mapping") or "{}"),
         "timeout_ms": int(form.get("timeout_ms")) if form.get("timeout_ms") and form.get("timeout_ms").strip() else None,
         "expose_passthrough": form.get("expose_passthrough", "true"),
-        "allowlist": json.loads(form.get("allowlist") or "[]"),
-        "plugin_chain_pre": json.loads(form.get("plugin_chain_pre") or "[]"),
-        "plugin_chain_post": json.loads(form.get("plugin_chain_post") or "[]"),
+        "allowlist": orjson.loads(form.get("allowlist") or "[]"),
+        "plugin_chain_pre": orjson.loads(form.get("plugin_chain_pre") or "[]"),
+        "plugin_chain_post": orjson.loads(form.get("plugin_chain_post") or "[]"),
     }
     LOGGER.debug(f"Tool data built: {tool_data}")
     try:
@@ -6950,25 +7086,25 @@ async def admin_add_tool(
             import_batch_id=metadata["import_batch_id"],
             federation_source=metadata["federation_source"],
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Tool registered successfully!", "success": True},
             status_code=200,
         )
     except IntegrityError as ex:
         error_message = ErrorFormatter.format_database_error(ex)
         LOGGER.error(f"IntegrityError in admin_add_tool: {error_message}")
-        return JSONResponse(status_code=409, content=error_message)
+        return ORJSONResponse(status_code=409, content=error_message)
     except ToolNameConflictError as ex:
         LOGGER.error(f"ToolNameConflictError in admin_add_tool: {str(ex)}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except ToolError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValidationError as ex:  # This block should catch ValidationError
         LOGGER.error(f"ValidationError in admin_add_tool: {str(ex)}")
-        return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
     except Exception as ex:
         LOGGER.error(f"Unexpected error in admin_add_tool: {str(ex)}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/tools/{tool_id}/edit/", response_model=None)
@@ -7175,10 +7311,10 @@ async def admin_edit_tool(
         "custom_name": form.get("customName"),
         "url": form.get("url"),
         "description": form.get("description"),
-        "headers": json.loads(headers_raw2 if isinstance(headers_raw2, str) and headers_raw2 else "{}"),
-        "input_schema": json.loads(input_schema_raw2 if isinstance(input_schema_raw2, str) and input_schema_raw2 else "{}"),
-        "output_schema": (json.loads(output_schema_raw2) if isinstance(output_schema_raw2, str) and output_schema_raw2 else None),
-        "annotations": json.loads(annotations_raw2 if isinstance(annotations_raw2, str) and annotations_raw2 else "{}"),
+        "headers": orjson.loads(headers_raw2 if isinstance(headers_raw2, str) and headers_raw2 else "{}"),
+        "input_schema": orjson.loads(input_schema_raw2 if isinstance(input_schema_raw2, str) and input_schema_raw2 else "{}"),
+        "output_schema": (orjson.loads(output_schema_raw2) if isinstance(output_schema_raw2, str) and output_schema_raw2 else None),
+        "annotations": orjson.loads(annotations_raw2 if isinstance(annotations_raw2, str) and annotations_raw2 else "{}"),
         "jsonpath_filter": form.get("jsonpathFilter", ""),
         "auth_type": form.get("auth_type", ""),
         "auth_username": form.get("auth_username", ""),
@@ -7218,29 +7354,29 @@ async def admin_edit_tool(
             modified_user_agent=mod_metadata["modified_user_agent"],
             user_email=user_email,
         )
-        return JSONResponse(content={"message": "Edit tool successfully", "success": True}, status_code=200)
+        return ORJSONResponse(content={"message": "Edit tool successfully", "success": True}, status_code=200)
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": str(e), "success": False},
             status_code=403,
         )
     except IntegrityError as ex:
         error_message = ErrorFormatter.format_database_error(ex)
         LOGGER.error(f"IntegrityError in admin_tool_resource: {error_message}")
-        return JSONResponse(status_code=409, content=error_message)
+        return ORJSONResponse(status_code=409, content=error_message)
     except ToolNameConflictError as ex:
         LOGGER.error(f"ToolNameConflictError in admin_edit_tool: {str(ex)}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except ToolError as ex:
         LOGGER.error(f"ToolError in admin_edit_tool: {str(ex)}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValidationError as ex:  # Catch Pydantic validation errors
         LOGGER.error(f"ValidationError in admin_edit_tool: {str(ex)}")
-        return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
     except Exception as ex:  # Generic catch-all for unexpected errors
         LOGGER.error(f"Unexpected error in admin_edit_tool: {str(ex)}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/tools/{tool_id}/delete")
@@ -7680,8 +7816,8 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         auth_headers: list[dict[str, Any]] = []
         if auth_headers_json:
             try:
-                auth_headers = json.loads(auth_headers_json)
-            except (json.JSONDecodeError, ValueError):
+                auth_headers = orjson.loads(auth_headers_json)
+            except (orjson.JSONDecodeError, ValueError):
                 auth_headers = []
 
         # Parse OAuth configuration - support both JSON string and individual form fields
@@ -7694,12 +7830,12 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         # Option 1: Pre-assembled oauth_config JSON (from API calls)
         if oauth_config_json and oauth_config_json != "None":
             try:
-                oauth_config = json.loads(oauth_config_json)
+                oauth_config = orjson.loads(oauth_config_json)
                 # Encrypt the client secret if present
                 if oauth_config and "client_secret" in oauth_config:
                     encryption = get_encryption_service(settings.auth_encryption_secret)
                     oauth_config["client_secret"] = encryption.encrypt_secret(oauth_config["client_secret"])
-            except (json.JSONDecodeError, ValueError) as e:
+            except (orjson.JSONDecodeError, ValueError) as e:
                 LOGGER.error(f"Failed to parse OAuth config: {e}")
                 oauth_config = None
 
@@ -7758,8 +7894,8 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         passthrough_headers = str(form.get("passthrough_headers"))
         if passthrough_headers and passthrough_headers.strip():
             try:
-                passthrough_headers = json.loads(passthrough_headers)
-            except (json.JSONDecodeError, ValueError):
+                passthrough_headers = orjson.loads(passthrough_headers)
+            except (orjson.JSONDecodeError, ValueError):
                 # Fallback to comma-separated parsing
                 passthrough_headers = [h.strip() for h in passthrough_headers.split(",") if h.strip()]
         else:
@@ -7820,17 +7956,17 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         )
     except KeyError as e:
         # Convert KeyError to ValidationError-like response
-        return JSONResponse(content={"message": f"Missing required field: {e}", "success": False}, status_code=422)
+        return ORJSONResponse(content={"message": f"Missing required field: {e}", "success": False}, status_code=422)
 
     except ValidationError as ex:
         # --- Getting only the custom message from the ValueError ---
         error_ctx = [str(err["ctx"]["error"]) for err in ex.errors()]
-        return JSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
+        return ORJSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
 
     except RuntimeError as re:
         # --- Getting only the custom message from the ValueError ---
         error_ctx = [str(re)]
-        return JSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
+        return ORJSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
 
     user_email = get_user_email(user)
     team_id = form.get("team_id", None)
@@ -7868,27 +8004,27 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
                 "4. Return to the admin panel\n\n"
                 "Tools will not work until OAuth authorization is completed."
             )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": message, "success": True},
             status_code=200,
         )
 
     except GatewayConnectionError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=502)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=502)
     except GatewayDuplicateConflictError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except GatewayNameConflictError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except ValueError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=400)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
     except RuntimeError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValidationError as ex:
-        return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+        return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
     except IntegrityError as ex:
-        return JSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
+        return ORJSONResponse(content=ErrorFormatter.format_database_error(ex), status_code=409)
     except Exception as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 # OAuth callback is now handled by the dedicated OAuth router at /oauth/callback
@@ -8013,16 +8149,16 @@ async def admin_edit_gateway(
         auth_headers = []
         if auth_headers_json:
             try:
-                auth_headers = json.loads(auth_headers_json)
-            except (json.JSONDecodeError, ValueError):
+                auth_headers = orjson.loads(auth_headers_json)
+            except (orjson.JSONDecodeError, ValueError):
                 auth_headers = []
 
         # Handle passthrough_headers
         passthrough_headers = str(form.get("passthrough_headers"))
         if passthrough_headers and passthrough_headers.strip():
             try:
-                passthrough_headers = json.loads(passthrough_headers)
-            except (json.JSONDecodeError, ValueError):
+                passthrough_headers = orjson.loads(passthrough_headers)
+            except (orjson.JSONDecodeError, ValueError):
                 # Fallback to comma-separated parsing
                 passthrough_headers = [h.strip() for h in passthrough_headers.split(",") if h.strip()]
         else:
@@ -8035,12 +8171,12 @@ async def admin_edit_gateway(
         # Option 1: Pre-assembled oauth_config JSON (from API calls)
         if oauth_config_json and oauth_config_json != "None":
             try:
-                oauth_config = json.loads(oauth_config_json)
+                oauth_config = orjson.loads(oauth_config_json)
                 # Encrypt the client secret if present and not empty
                 if oauth_config and "client_secret" in oauth_config and oauth_config["client_secret"]:
                     encryption = get_encryption_service(settings.auth_encryption_secret)
                     oauth_config["client_secret"] = encryption.encrypt_secret(oauth_config["client_secret"])
-            except (json.JSONDecodeError, ValueError) as e:
+            except (orjson.JSONDecodeError, ValueError) as e:
                 LOGGER.error(f"Failed to parse OAuth config: {e}")
                 oauth_config = None
 
@@ -8139,28 +8275,28 @@ async def admin_edit_gateway(
             modified_user_agent=mod_metadata["modified_user_agent"],
             user_email=user_email,
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Gateway updated successfully!", "success": True},
             status_code=200,
         )
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": str(e), "success": False},
             status_code=403,
         )
     except Exception as ex:
         if isinstance(ex, GatewayConnectionError):
-            return JSONResponse(content={"message": str(ex), "success": False}, status_code=502)
+            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=502)
         if isinstance(ex, ValueError):
-            return JSONResponse(content={"message": str(ex), "success": False}, status_code=400)
+            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=400)
         if isinstance(ex, RuntimeError):
-            return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
         if isinstance(ex, ValidationError):
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
-            return JSONResponse(status_code=409, content=ErrorFormatter.format_database_error(ex))
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+            return ORJSONResponse(status_code=409, content=ErrorFormatter.format_database_error(ex))
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/gateways/{gateway_id}/delete")
@@ -8548,7 +8684,7 @@ async def admin_add_resource(request: Request, db: Session = Depends(get_db), us
             owner_email=user_email,
             visibility=visibility,
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Add resource registered successfully!", "success": True},
             status_code=200,
         )
@@ -8566,16 +8702,16 @@ async def admin_add_resource(request: Request, db: Session = Depends(get_db), us
 
         if isinstance(ex, ValidationError):
             LOGGER.error(f"ValidationError in admin_add_resource: {ErrorFormatter.format_validation_error(ex)}")
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
             LOGGER.error(f"IntegrityError in admin_add_resource: {error_message}")
-            return JSONResponse(status_code=409, content=error_message)
+            return ORJSONResponse(status_code=409, content=error_message)
         if isinstance(ex, ResourceURIConflictError):
             LOGGER.error(f"ResourceURIConflictError in admin_add_resource: {ex}")
-            return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+            return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
         LOGGER.error(f"Error in admin_add_resource: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/resources/{resource_id}/edit")
@@ -8700,26 +8836,26 @@ async def admin_edit_resource(
             modified_user_agent=mod_metadata["modified_user_agent"],
             user_email=get_user_email(user),
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Resource updated successfully!", "success": True},
             status_code=200,
         )
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
-        return JSONResponse(content={"message": str(e), "success": False}, status_code=403)
+        return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
     except Exception as ex:
         if isinstance(ex, ValidationError):
             LOGGER.error(f"ValidationError in admin_edit_resource: {ErrorFormatter.format_validation_error(ex)}")
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
             LOGGER.error(f"IntegrityError in admin_edit_resource: {error_message}")
-            return JSONResponse(status_code=409, content=error_message)
+            return ORJSONResponse(status_code=409, content=error_message)
         if isinstance(ex, ResourceURIConflictError):
             LOGGER.error(f"ResourceURIConflictError in admin_edit_resource: {ex}")
-            return JSONResponse(status_code=409, content={"message": str(ex), "success": False})
+            return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
         LOGGER.error(f"Error in admin_edit_resource: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/resources/{resource_id}/delete")
@@ -9101,7 +9237,7 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
         args_value = form.get("arguments")
         if isinstance(args_value, str) and args_value.strip():
             args_json = args_value
-        arguments = json.loads(args_json)
+        arguments = orjson.loads(args_json)
         prompt = PromptCreate(
             name=str(form["name"]),
             description=str(form.get("description")),
@@ -9128,23 +9264,23 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
             owner_email=user_email,
             visibility=visibility,
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Prompt registered successfully!", "success": True},
             status_code=200,
         )
     except Exception as ex:
         if isinstance(ex, ValidationError):
             LOGGER.error(f"ValidationError in admin_add_prompt: {ErrorFormatter.format_validation_error(ex)}")
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
             LOGGER.error(f"IntegrityError in admin_add_prompt: {error_message}")
-            return JSONResponse(status_code=409, content=error_message)
+            return ORJSONResponse(status_code=409, content=error_message)
         if isinstance(ex, PromptNameConflictError):
             LOGGER.error(f"PromptNameConflictError in admin_add_prompt: {ex}")
-            return JSONResponse(status_code=409, content={"message": str(ex), "success": False})
+            return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
         LOGGER.error(f"Error in admin_add_prompt: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/prompts/{prompt_id}/edit")
@@ -9233,7 +9369,7 @@ async def admin_edit_prompt(
     LOGGER.info(f"Verifying team for user {user_email} with team_id {team_id}")
 
     args_json: str = str(form.get("arguments")) or "[]"
-    arguments = json.loads(args_json)
+    arguments = orjson.loads(args_json)
     # Parse tags from comma-separated string
     tags_str = str(form.get("tags", ""))
     tags: List[str] = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
@@ -9259,26 +9395,26 @@ async def admin_edit_prompt(
             modified_user_agent=mod_metadata["modified_user_agent"],
             user_email=user_email,
         )
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "Prompt updated successfully!", "success": True},
             status_code=200,
         )
     except PermissionError as e:
         LOGGER.info(f"Permission denied for user {get_user_email(user)}: {e}")
-        return JSONResponse(content={"message": str(e), "success": False}, status_code=403)
+        return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
     except Exception as ex:
         if isinstance(ex, ValidationError):
             LOGGER.error(f"ValidationError in admin_edit_prompt: {ErrorFormatter.format_validation_error(ex)}")
-            return JSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
             LOGGER.error(f"IntegrityError in admin_edit_prompt: {error_message}")
-            return JSONResponse(status_code=409, content=error_message)
+            return ORJSONResponse(status_code=409, content=error_message)
         if isinstance(ex, PromptNameConflictError):
             LOGGER.error(f"PromptNameConflictError in admin_edit_prompt: {ex}")
-            return JSONResponse(status_code=409, content={"message": str(ex), "success": False})
+            return ORJSONResponse(status_code=409, content={"message": str(ex), "success": False})
         LOGGER.error(f"Error in admin_edit_prompt: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/prompts/{prompt_id}/delete")
@@ -9679,10 +9815,10 @@ async def get_aggregated_metrics(
         "prompts": await prompt_service.aggregate_metrics(db),
         "servers": await server_service.aggregate_metrics(db),
         "topPerformers": {
-            "tools": await tool_service.get_top_tools(db, limit=None),
-            "resources": await resource_service.get_top_resources(db, limit=None),
-            "prompts": await prompt_service.get_top_prompts(db, limit=None),
-            "servers": await server_service.get_top_servers(db, limit=None),
+            "tools": await tool_service.get_top_tools(db, limit=10),
+            "resources": await resource_service.get_top_resources(db, limit=10),
+            "prompts": await prompt_service.get_top_prompts(db, limit=10),
+            "servers": await server_service.get_top_servers(db, limit=10),
         },
     }
     return metrics
@@ -10300,7 +10436,7 @@ async def admin_events(request: Request, _user=Depends(get_current_user_with_per
 
                     # SSE format
                     event_type = event.get("type", "message")
-                    event_data = json.dumps(event.get("data", {}))
+                    event_data = orjson.dumps(event.get("data", {})).decode()
 
                     yield f"event: {event_type}\ndata: {event_data}\n\n"
 
@@ -10458,43 +10594,43 @@ async def admin_import_tools(
                 payload = await request.json()
             except Exception as ex:
                 LOGGER.exception("Invalid JSON body")
-                return JSONResponse({"success": False, "message": f"Invalid JSON: {ex}"}, status_code=422)
+                return ORJSONResponse({"success": False, "message": f"Invalid JSON: {ex}"}, status_code=422)
         else:
             try:
                 form = await request.form()
             except Exception as ex:
                 LOGGER.exception("Invalid form body")
-                return JSONResponse({"success": False, "message": f"Invalid form data: {ex}"}, status_code=422)
+                return ORJSONResponse({"success": False, "message": f"Invalid form data: {ex}"}, status_code=422)
             # Check for file upload first
             if "tools_file" in form:
                 file = form["tools_file"]
                 if isinstance(file, StarletteUploadFile):
                     content = await file.read()
                     try:
-                        payload = json.loads(content.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError) as ex:
+                        payload = orjson.loads(content.decode("utf-8"))
+                    except (orjson.JSONDecodeError, UnicodeDecodeError) as ex:
                         LOGGER.exception("Invalid JSON file")
-                        return JSONResponse({"success": False, "message": f"Invalid JSON file: {ex}"}, status_code=422)
+                        return ORJSONResponse({"success": False, "message": f"Invalid JSON file: {ex}"}, status_code=422)
                 else:
-                    return JSONResponse({"success": False, "message": "Invalid file upload"}, status_code=422)
+                    return ORJSONResponse({"success": False, "message": "Invalid file upload"}, status_code=422)
             else:
                 # Check for JSON in form fields
                 raw_val = form.get("tools") or form.get("tools_json") or form.get("json") or form.get("payload")
                 raw = raw_val if isinstance(raw_val, str) else None
                 if not raw:
-                    return JSONResponse({"success": False, "message": "Missing tools/tools_json/json/payload form field."}, status_code=422)
+                    return ORJSONResponse({"success": False, "message": "Missing tools/tools_json/json/payload form field."}, status_code=422)
                 try:
-                    payload = json.loads(raw)
+                    payload = orjson.loads(raw)
                 except Exception as ex:
                     LOGGER.exception("Invalid JSON in form field")
-                    return JSONResponse({"success": False, "message": f"Invalid JSON: {ex}"}, status_code=422)
+                    return ORJSONResponse({"success": False, "message": f"Invalid JSON: {ex}"}, status_code=422)
 
         if not isinstance(payload, list):
-            return JSONResponse({"success": False, "message": "Payload must be a JSON array of tools."}, status_code=422)
+            return ORJSONResponse({"success": False, "message": "Payload must be a JSON array of tools."}, status_code=422)
 
         max_batch = settings.mcpgateway_bulk_import_max_tools
         if len(payload) > max_batch:
-            return JSONResponse({"success": False, "message": f"Too many tools ({len(payload)}). Max {max_batch}."}, status_code=413)
+            return ORJSONResponse({"success": False, "message": f"Too many tools ({len(payload)}). Max {max_batch}."}, status_code=413)
 
         created, errors = [], []
 
@@ -10564,7 +10700,7 @@ async def admin_import_tools(
         else:
             rd["message"] = f"Imported {len(created)} of {len(payload)} tools. {len(errors)} failed."
 
-        return JSONResponse(
+        return ORJSONResponse(
             response_data,
             status_code=200,  # Always return 200, success field indicates if all succeeded
         )
@@ -10575,7 +10711,7 @@ async def admin_import_tools(
     except Exception as ex:
         # absolute catch-all: report instead of crashing
         LOGGER.exception("Fatal error in admin_import_tools")
-        return JSONResponse({"success": False, "message": str(ex)}, status_code=500)
+        return ORJSONResponse({"success": False, "message": str(ex)}, status_code=500)
 
 
 ####################
@@ -10743,11 +10879,11 @@ async def admin_stream_logs(
                             continue
 
                 # Send SSE event
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"data: {orjson.dumps(event).decode()}\n\n"
 
         except Exception as e:
             LOGGER.error(f"Error in log streaming: {e}")
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield f"event: error\ndata: {orjson.dumps({'error': str(e)}).decode()}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -11200,7 +11336,7 @@ async def admin_import_preview(request: Request, db: Session = Depends(get_db), 
         # Generate preview
         preview_data = await import_service.preview_import(db=db, import_data=import_data)
 
-        return JSONResponse(content={"success": True, "preview": preview_data, "message": f"Import preview generated. Found {preview_data['summary']['total_items']} total items."})
+        return ORJSONResponse(content={"success": True, "preview": preview_data, "message": f"Import preview generated. Found {preview_data['summary']['total_items']} total items."})
 
     except ImportValidationError as e:
         LOGGER.error(f"Import validation failed for user {user}: {str(e)}")
@@ -11263,7 +11399,7 @@ async def admin_import_configuration(request: Request, db: Session = Depends(get
             db=db, import_data=import_data, conflict_strategy=conflict_strategy, dry_run=dry_run, rekey_secret=rekey_secret, imported_by=username, selected_entities=selected_entities
         )
 
-        return JSONResponse(content=status.to_dict())
+        return ORJSONResponse(content=status.to_dict())
 
     except ImportServiceError as e:
         LOGGER.error(f"Admin import failed for user {user}: {str(e)}")
@@ -11293,7 +11429,7 @@ async def admin_get_import_status(import_id: str, user=Depends(get_current_user_
     if not status:
         raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
 
-    return JSONResponse(content=status.to_dict())
+    return ORJSONResponse(content=status.to_dict())
 
 
 @admin_router.get("/import/status")
@@ -11309,7 +11445,7 @@ async def admin_list_import_statuses(user=Depends(get_current_user_with_permissi
     LOGGER.debug(f"Admin user {user} requested all import statuses")
 
     statuses = import_service.list_import_statuses()
-    return JSONResponse(content=[status.to_dict() for status in statuses])
+    return ORJSONResponse(content=[status.to_dict() for status in statuses])
 
 
 # ============================================================================ #
@@ -11538,7 +11674,7 @@ async def admin_add_a2a_agent(
 
     if not a2a_service or not settings.mcpgateway_a2a_enabled:
         LOGGER.warning("A2A agent creation attempted but A2A features are disabled")
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "A2A features are disabled!", "success": False},
             status_code=403,
         )
@@ -11563,8 +11699,8 @@ async def admin_add_a2a_agent(
         auth_headers: list[dict[str, Any]] = []
         if auth_headers_json:
             try:
-                auth_headers = json.loads(auth_headers_json)
-            except (json.JSONDecodeError, ValueError):
+                auth_headers = orjson.loads(auth_headers_json)
+            except (orjson.JSONDecodeError, ValueError):
                 auth_headers = []
 
         # Parse OAuth configuration - support both JSON string and individual form fields
@@ -11577,12 +11713,12 @@ async def admin_add_a2a_agent(
         # Option 1: Pre-assembled oauth_config JSON (from API calls)
         if oauth_config_json and oauth_config_json != "None":
             try:
-                oauth_config = json.loads(oauth_config_json)
+                oauth_config = orjson.loads(oauth_config_json)
                 # Encrypt the client secret if present
                 if oauth_config and "client_secret" in oauth_config:
                     encryption = get_encryption_service(settings.auth_encryption_secret)
                     oauth_config["client_secret"] = encryption.encrypt_secret(oauth_config["client_secret"])
-            except (json.JSONDecodeError, ValueError) as e:
+            except (orjson.JSONDecodeError, ValueError) as e:
                 LOGGER.error(f"Failed to parse OAuth config: {e}")
                 oauth_config = None
 
@@ -11638,8 +11774,8 @@ async def admin_add_a2a_agent(
         passthrough_headers = str(form.get("passthrough_headers"))
         if passthrough_headers and passthrough_headers.strip():
             try:
-                passthrough_headers = json.loads(passthrough_headers)
-            except (json.JSONDecodeError, ValueError):
+                passthrough_headers = orjson.loads(passthrough_headers)
+            except (orjson.JSONDecodeError, ValueError):
                 # Fallback to comma-separated parsing
                 passthrough_headers = [h.strip() for h in passthrough_headers.split(",") if h.strip()]
         else:
@@ -11694,33 +11830,33 @@ async def admin_add_a2a_agent(
             visibility=form.get("visibility", "private"),
         )
 
-        return JSONResponse(
+        return ORJSONResponse(
             content={"message": "A2A agent created successfully!", "success": True},
             status_code=200,
         )
 
     except CoreValidationError as ex:
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=422)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=422)
     except A2AAgentNameConflictError as ex:
         LOGGER.error(f"A2A agent name conflict: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=409)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=409)
     except A2AAgentError as ex:
         LOGGER.error(f"A2A agent error: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
     except ValidationError as ex:
         LOGGER.error(f"Validation error while creating A2A agent: {ex}")
-        return JSONResponse(
+        return ORJSONResponse(
             content=ErrorFormatter.format_validation_error(ex),
             status_code=422,
         )
     except IntegrityError as ex:
-        return JSONResponse(
+        return ORJSONResponse(
             content=ErrorFormatter.format_database_error(ex),
             status_code=409,
         )
     except Exception as ex:
         LOGGER.error(f"Error creating A2A agent: {ex}")
-        return JSONResponse(content={"message": str(ex), "success": False}, status_code=500)
+        return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
 @admin_router.post("/a2a/{agent_id}/edit")
@@ -11856,8 +11992,8 @@ async def admin_edit_a2a_agent(
         capabilities = {}
         if raw_capabilities:
             try:
-                capabilities = json.loads(raw_capabilities)
-            except (ValueError, json.JSONDecodeError):
+                capabilities = orjson.loads(raw_capabilities)
+            except (ValueError, orjson.JSONDecodeError):
                 capabilities = {}
 
         # Config
@@ -11865,8 +12001,8 @@ async def admin_edit_a2a_agent(
         config = {}
         if raw_config:
             try:
-                config = json.loads(raw_config)
-            except (ValueError, json.JSONDecodeError):
+                config = orjson.loads(raw_config)
+            except (ValueError, orjson.JSONDecodeError):
                 config = {}
 
         # Parse auth_headers JSON if present
@@ -11874,16 +12010,16 @@ async def admin_edit_a2a_agent(
         auth_headers = []
         if auth_headers_json:
             try:
-                auth_headers = json.loads(auth_headers_json)
-            except (json.JSONDecodeError, ValueError):
+                auth_headers = orjson.loads(auth_headers_json)
+            except (orjson.JSONDecodeError, ValueError):
                 auth_headers = []
 
         # Passthrough headers
         passthrough_headers = str(form.get("passthrough_headers"))
         if passthrough_headers and passthrough_headers.strip():
             try:
-                passthrough_headers = json.loads(passthrough_headers)
-            except (json.JSONDecodeError, ValueError):
+                passthrough_headers = orjson.loads(passthrough_headers)
+            except (orjson.JSONDecodeError, ValueError):
                 # Fallback to comma-separated parsing
                 passthrough_headers = [h.strip() for h in passthrough_headers.split(",") if h.strip()]
         else:
@@ -11896,12 +12032,12 @@ async def admin_edit_a2a_agent(
         # Option 1: Pre-assembled oauth_config JSON (from API calls)
         if oauth_config_json and oauth_config_json != "None":
             try:
-                oauth_config = json.loads(oauth_config_json)
+                oauth_config = orjson.loads(oauth_config_json)
                 # Encrypt the client secret if present and not empty
                 if oauth_config and "client_secret" in oauth_config and oauth_config["client_secret"]:
                     encryption = get_encryption_service(settings.auth_encryption_secret)
                     oauth_config["client_secret"] = encryption.encrypt_secret(oauth_config["client_secret"])
-            except (json.JSONDecodeError, ValueError) as e:
+            except (orjson.JSONDecodeError, ValueError) as e:
                 LOGGER.error(f"Failed to parse OAuth config: {e}")
                 oauth_config = None
 
@@ -11997,14 +12133,14 @@ async def admin_edit_a2a_agent(
             modified_user_agent=mod_metadata["modified_user_agent"],
         )
 
-        return JSONResponse({"message": "A2A agent updated successfully", "success": True}, status_code=200)
+        return ORJSONResponse({"message": "A2A agent updated successfully", "success": True}, status_code=200)
 
     except ValidationError as ve:
-        return JSONResponse({"message": str(ve), "success": False}, status_code=422)
+        return ORJSONResponse({"message": str(ve), "success": False}, status_code=422)
     except IntegrityError as ie:
-        return JSONResponse({"message": str(ie), "success": False}, status_code=409)
+        return ORJSONResponse({"message": str(ie), "success": False}, status_code=409)
     except Exception as e:
-        return JSONResponse({"message": str(e), "success": False}, status_code=500)
+        return ORJSONResponse({"message": str(e), "success": False}, status_code=500)
 
 
 @admin_router.post("/a2a/{agent_id}/toggle")
@@ -12137,7 +12273,7 @@ async def admin_test_a2a_agent(
         HTTPException: If A2A features are disabled
     """
     if not a2a_service or not settings.mcpgateway_a2a_enabled:
-        return JSONResponse(content={"success": False, "error": "A2A features are disabled"}, status_code=403)
+        return ORJSONResponse(content={"success": False, "error": "A2A features are disabled"}, status_code=403)
 
     try:
         user_email = get_user_email(user)
@@ -12165,11 +12301,11 @@ async def admin_test_a2a_agent(
             user_id=user_email,
         )
 
-        return JSONResponse(content={"success": True, "result": result, "agent_name": agent.name, "test_timestamp": time.time()})
+        return ORJSONResponse(content={"success": True, "result": result, "agent_name": agent.name, "test_timestamp": time.time()})
 
     except Exception as e:
         LOGGER.error(f"Error testing A2A agent {agent_id}: {e}")
-        return JSONResponse(content={"success": False, "error": str(e), "agent_id": agent_id}, status_code=500)
+        return ORJSONResponse(content={"success": False, "error": str(e), "agent_id": agent_id}, status_code=500)
 
 
 # gRPC Service Management Endpoints
@@ -12231,7 +12367,7 @@ async def admin_create_grpc_service(
         metadata = MetadataCapture.capture(request)  # pylint: disable=no-member
         user_email = get_user_email(user)
         result = await grpc_service_mgr.register_service(db, service, user_email, metadata)
-        return JSONResponse(content=jsonable_encoder(result), status_code=201)
+        return ORJSONResponse(content=jsonable_encoder(result), status_code=201)
     except GrpcServiceNameConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except GrpcServiceError as e:
@@ -12298,7 +12434,7 @@ async def admin_update_grpc_service(
         metadata = MetadataCapture.capture(request)  # pylint: disable=no-member
         user_email = get_user_email(user)
         result = await grpc_service_mgr.update_service(db, service_id, service, user_email, metadata)
-        return JSONResponse(content=jsonable_encoder(result))
+        return ORJSONResponse(content=jsonable_encoder(result))
     except GrpcServiceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except GrpcServiceNameConflictError as e:
@@ -12333,7 +12469,7 @@ async def admin_toggle_grpc_service(
     try:
         service = await grpc_service_mgr.get_service(db, service_id)
         result = await grpc_service_mgr.toggle_service(db, service_id, not service.enabled)
-        return JSONResponse(content=jsonable_encoder(result))
+        return ORJSONResponse(content=jsonable_encoder(result))
     except GrpcServiceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -12391,7 +12527,7 @@ async def admin_reflect_grpc_service(
 
     try:
         result = await grpc_service_mgr.reflect_service(db, service_id)
-        return JSONResponse(content=jsonable_encoder(result))
+        return ORJSONResponse(content=jsonable_encoder(result))
     except GrpcServiceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except GrpcServiceError as e:
@@ -12423,7 +12559,7 @@ async def admin_get_grpc_methods(
 
     try:
         methods = await grpc_service_mgr.get_service_methods(db, service_id)
-        return JSONResponse(content={"methods": methods})
+        return ORJSONResponse(content={"methods": methods})
     except GrpcServiceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -12451,7 +12587,7 @@ async def get_tools_section(
         user_email = get_user_email(user)
 
         # Get team-filtered tools
-        tools_list = await local_tool_service.list_tools_for_user(db, user_email, team_id=team_id, include_inactive=True)
+        tools_list, _ = await local_tool_service.list_tools_for_user(db, user_email, team_id=team_id, include_inactive=True)
 
         # Convert to JSON-serializable format
         tools = []
@@ -12471,11 +12607,11 @@ async def get_tools_section(
             )
             tools.append(tool_dict)
 
-        return JSONResponse(content=jsonable_encoder({"tools": tools, "team_id": team_id}))
+        return ORJSONResponse(content=jsonable_encoder({"tools": tools, "team_id": team_id}))
 
     except Exception as e:
         LOGGER.error(f"Error loading tools section: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @admin_router.get("/sections/resources")
@@ -12526,11 +12662,11 @@ async def get_resources_section(
             )
             resources.append(resource_dict)
 
-        return JSONResponse(content={"resources": resources, "team_id": team_id})
+        return ORJSONResponse(content={"resources": resources, "team_id": team_id})
 
     except Exception as e:
         LOGGER.error(f"Error loading resources section: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @admin_router.get("/sections/prompts")
@@ -12582,11 +12718,11 @@ async def get_prompts_section(
             )
             prompts.append(prompt_dict)
 
-        return JSONResponse(content={"prompts": prompts, "team_id": team_id})
+        return ORJSONResponse(content={"prompts": prompts, "team_id": team_id})
 
     except Exception as e:
         LOGGER.error(f"Error loading prompts section: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @admin_router.get("/sections/servers")
@@ -12638,11 +12774,11 @@ async def get_servers_section(
             )
             servers.append(server_dict)
 
-        return JSONResponse(content={"servers": servers, "team_id": team_id})
+        return ORJSONResponse(content={"servers": servers, "team_id": team_id})
 
     except Exception as e:
         LOGGER.error(f"Error loading servers section: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @admin_router.get("/sections/gateways")
@@ -12699,11 +12835,11 @@ async def get_gateways_section(
                 }
             gateways.append(gateway_dict)
 
-        return JSONResponse(content={"gateways": gateways, "team_id": team_id})
+        return ORJSONResponse(content={"gateways": gateways, "team_id": team_id})
 
     except Exception as e:
         LOGGER.error(f"Error loading gateways section: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 ####################
@@ -12740,7 +12876,7 @@ async def get_plugins_partial(request: Request, db: Session = Depends(get_db), u
 
         # Get plugin data
         plugins = plugin_service.get_all_plugins()
-        stats = plugin_service.get_plugin_statistics()
+        stats = await plugin_service.get_plugin_statistics()
 
         # Prepare context for template
         context = {"request": request, "plugins": plugins, "stats": stats, "plugins_enabled": plugin_manager is not None, "root_path": request.scope.get("root_path", "")}
@@ -12869,7 +13005,7 @@ async def get_plugin_stats(request: Request, db: Session = Depends(get_db), user
             plugin_service.set_plugin_manager(plugin_manager)
 
         # Get statistics
-        stats = plugin_service.get_plugin_statistics()
+        stats = await plugin_service.get_plugin_statistics()
 
         # Log marketplace analytics access
         structured_logger.info(
@@ -13257,9 +13393,9 @@ async def get_system_stats(
         # First-Party
         from mcpgateway.services.system_stats_service import SystemStatsService  # pylint: disable=import-outside-toplevel
 
-        # Get metrics
+        # Get metrics (using cached version for performance)
         service = SystemStatsService()
-        stats = service.get_comprehensive_stats(db)
+        stats = await service.get_comprehensive_stats_cached(db)
 
         LOGGER.info(f"System metrics retrieved successfully for user {user}")
 
@@ -13272,7 +13408,7 @@ async def get_system_stats(
             )
 
         # Return JSON for API requests
-        return JSONResponse(content=stats)
+        return ORJSONResponse(content=stats)
 
     except Exception as e:
         LOGGER.error(f"System metrics retrieval failed for user {user}: {str(e)}", exc_info=True)
@@ -13436,6 +13572,7 @@ async def get_observability_stats(request: Request, hours: int = Query(24, ge=1,
 
         return request.app.state.templates.TemplateResponse("observability_stats.html", {"request": request, "stats": stats})
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13530,6 +13667,7 @@ async def get_observability_traces(
         root_path = request.scope.get("root_path", "")
         return request.app.state.templates.TemplateResponse("observability_traces_list.html", {"request": request, "traces": traces, "root_path": root_path})
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13558,6 +13696,7 @@ async def get_observability_trace_detail(request: Request, trace_id: str, _user=
         root_path = request.scope.get("root_path", "")
         return request.app.state.templates.TemplateResponse("observability_trace_detail.html", {"request": request, "trace": trace, "root_path": root_path})
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13604,6 +13743,7 @@ async def save_observability_query(
         LOGGER.error(f"Failed to save query: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13647,6 +13787,7 @@ async def list_observability_queries(request: Request, user=Depends(get_current_
             for q in queries
         ]
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13689,6 +13830,7 @@ async def get_observability_query(request: Request, query_id: int, user=Depends(
             "use_count": query.use_count,
         }
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13757,6 +13899,7 @@ async def update_observability_query(
         LOGGER.error(f"Failed to update query: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13785,6 +13928,7 @@ async def delete_observability_query(request: Request, query_id: int, user=Depen
         db.delete(query)
         db.commit()
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13830,6 +13974,7 @@ async def track_query_usage(request: Request, query_id: int, user=Depends(get_cu
         LOGGER.error(f"Failed to track query usage: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -13858,55 +14003,142 @@ async def get_latency_percentiles(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # Query all traces with duration in time range
-        traces = (
-            db.query(ObservabilityTrace.start_time, ObservabilityTrace.duration_ms)
-            .filter(ObservabilityTrace.start_time >= cutoff_time, ObservabilityTrace.duration_ms.isnot(None))
-            .order_by(ObservabilityTrace.start_time)
-            .all()
-        )
-
-        if not traces:
-            return {"timestamps": [], "p50": [], "p90": [], "p95": [], "p99": []}
-
-        # Group traces into time buckets
-        buckets: Dict[datetime, List[float]] = defaultdict(list)
-        for trace in traces:
-            # Round down to nearest interval
-            bucket_time = trace.start_time.replace(second=0, microsecond=0)
-            bucket_time = bucket_time - timedelta(minutes=bucket_time.minute % interval_minutes, seconds=bucket_time.second, microseconds=bucket_time.microsecond)
-            buckets[bucket_time].append(trace.duration_ms)
-
-        # Calculate percentiles for each bucket
-        timestamps = []
-        p50_values = []
-        p90_values = []
-        p95_values = []
-        p99_values = []
-
-        for bucket_time in sorted(buckets.keys()):
-            durations = sorted(buckets[bucket_time])
-            n = len(durations)
-
-            if n > 0:
-                # Calculate percentile indices
-                p50_idx = max(0, int(n * 0.50) - 1)
-                p90_idx = max(0, int(n * 0.90) - 1)
-                p95_idx = max(0, int(n * 0.95) - 1)
-                p99_idx = max(0, int(n * 0.99) - 1)
-
-                timestamps.append(bucket_time.isoformat())
-                p50_values.append(round(durations[p50_idx], 2))
-                p90_values.append(round(durations[p90_idx], 2))
-                p95_values.append(round(durations[p95_idx], 2))
-                p99_values.append(round(durations[p99_idx], 2))
-
-        return {"timestamps": timestamps, "p50": p50_values, "p90": p90_values, "p95": p95_values, "p99": p99_values}
+        # Use SQL aggregation for PostgreSQL, Python fallback for SQLite
+        dialect_name = db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            return _get_latency_percentiles_postgresql(db, cutoff_time, interval_minutes)
+        return _get_latency_percentiles_python(db, cutoff_time, interval_minutes)
     except Exception as e:
         LOGGER.error(f"Failed to calculate latency percentiles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
+
+
+def _get_latency_percentiles_postgresql(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
+    """Compute time-bucketed latency percentiles using PostgreSQL.
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        interval_minutes: Bucket size in minutes
+
+    Returns:
+        dict: Time-series percentile data
+    """
+    # PostgreSQL query with epoch-based bucketing (works for any interval including > 60 min)
+    stats_sql = text(
+        """
+        SELECT
+            TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM start_time) / :interval_seconds) * :interval_seconds) as bucket,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) as p50,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY duration_ms) as p90,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) as p95,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) as p99
+        FROM observability_traces
+        WHERE start_time >= :cutoff_time AND duration_ms IS NOT NULL
+        GROUP BY bucket
+        ORDER BY bucket
+        """
+    )
+
+    interval_seconds = interval_minutes * 60
+    results = db.execute(stats_sql, {"cutoff_time": cutoff_time, "interval_seconds": interval_seconds}).fetchall()
+
+    if not results:
+        return {"timestamps": [], "p50": [], "p90": [], "p95": [], "p99": []}
+
+    timestamps = []
+    p50_values = []
+    p90_values = []
+    p95_values = []
+    p99_values = []
+
+    for row in results:
+        timestamps.append(row.bucket.isoformat() if row.bucket else "")
+        p50_values.append(round(float(row.p50), 2) if row.p50 else 0)
+        p90_values.append(round(float(row.p90), 2) if row.p90 else 0)
+        p95_values.append(round(float(row.p95), 2) if row.p95 else 0)
+        p99_values.append(round(float(row.p99), 2) if row.p99 else 0)
+
+    return {"timestamps": timestamps, "p50": p50_values, "p90": p90_values, "p95": p95_values, "p99": p99_values}
+
+
+def _get_latency_percentiles_python(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
+    """Compute time-bucketed latency percentiles using Python (fallback for SQLite).
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        interval_minutes: Bucket size in minutes
+
+    Returns:
+        dict: Time-series percentile data
+    """
+    # Query all traces with duration in time range
+    traces = (
+        db.query(ObservabilityTrace.start_time, ObservabilityTrace.duration_ms)
+        .filter(ObservabilityTrace.start_time >= cutoff_time, ObservabilityTrace.duration_ms.isnot(None))
+        .order_by(ObservabilityTrace.start_time)
+        .all()
+    )
+
+    if not traces:
+        return {"timestamps": [], "p50": [], "p90": [], "p95": [], "p99": []}
+
+    # Group traces into time buckets using epoch-based bucketing (works for any interval)
+    interval_seconds = interval_minutes * 60
+    buckets: Dict[datetime, List[float]] = defaultdict(list)
+    for trace in traces:
+        trace_time = trace.start_time
+        if trace_time.tzinfo is None:
+            trace_time = trace_time.replace(tzinfo=timezone.utc)
+        epoch = trace_time.timestamp()
+        bucket_epoch = (epoch // interval_seconds) * interval_seconds
+        bucket_time = datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+        buckets[bucket_time].append(trace.duration_ms)
+
+    # Calculate percentiles for each bucket
+    timestamps = []
+    p50_values = []
+    p90_values = []
+    p95_values = []
+    p99_values = []
+
+    def percentile_cont(data: List[float], p: float) -> float:
+        """Linear interpolation percentile matching PostgreSQL percentile_cont.
+
+        Args:
+            data: Sorted list of float values.
+            p: Percentile value between 0 and 1.
+
+        Returns:
+            float: Interpolated percentile value.
+        """
+        n = len(data)
+        if n == 0:
+            return 0.0
+        if n == 1:
+            return data[0]
+        k = p * (n - 1)
+        f = int(k)
+        c = k - f
+        if f + 1 < n:
+            return data[f] + c * (data[f + 1] - data[f])
+        return data[f]
+
+    for bucket_time in sorted(buckets.keys()):
+        durations = sorted(buckets[bucket_time])
+
+        if durations:
+            timestamps.append(bucket_time.isoformat())
+            p50_values.append(round(percentile_cont(durations, 0.50), 2))
+            p90_values.append(round(percentile_cont(durations, 0.90), 2))
+            p95_values.append(round(percentile_cont(durations, 0.95), 2))
+            p99_values.append(round(percentile_cont(durations, 0.99), 2))
+
+    return {"timestamps": timestamps, "p50": p50_values, "p90": p90_values, "p95": p95_values, "p99": p99_values}
 
 
 @admin_router.get("/observability/metrics/timeseries", response_model=dict)
@@ -13934,54 +14166,301 @@ async def get_timeseries_metrics(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # Query traces grouped by time bucket
-        traces = db.query(ObservabilityTrace.start_time, ObservabilityTrace.status).filter(ObservabilityTrace.start_time >= cutoff_time).order_by(ObservabilityTrace.start_time).all()
-
-        if not traces:
-            return {"timestamps": [], "request_count": [], "success_count": [], "error_count": [], "error_rate": []}
-
-        # Group traces into time buckets
-        buckets: Dict[datetime, Dict[str, int]] = defaultdict(lambda: {"total": 0, "success": 0, "error": 0})
-        for trace in traces:
-            # Round down to nearest interval
-            bucket_time = trace.start_time.replace(second=0, microsecond=0)
-            bucket_time = bucket_time - timedelta(minutes=bucket_time.minute % interval_minutes, seconds=bucket_time.second, microseconds=bucket_time.microsecond)
-
-            buckets[bucket_time]["total"] += 1
-            if trace.status == "ok":
-                buckets[bucket_time]["success"] += 1
-            elif trace.status == "error":
-                buckets[bucket_time]["error"] += 1
-
-        # Build time-series arrays
-        timestamps = []
-        request_counts = []
-        success_counts = []
-        error_counts = []
-        error_rates = []
-
-        for bucket_time in sorted(buckets.keys()):
-            bucket = buckets[bucket_time]
-            error_rate = (bucket["error"] / bucket["total"] * 100) if bucket["total"] > 0 else 0
-
-            timestamps.append(bucket_time.isoformat())
-            request_counts.append(bucket["total"])
-            success_counts.append(bucket["success"])
-            error_counts.append(bucket["error"])
-            error_rates.append(round(error_rate, 2))
-
-        return {
-            "timestamps": timestamps,
-            "request_count": request_counts,
-            "success_count": success_counts,
-            "error_count": error_counts,
-            "error_rate": error_rates,
-        }
+        # Use SQL aggregation for PostgreSQL, Python fallback for SQLite
+        dialect_name = db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            return _get_timeseries_metrics_postgresql(db, cutoff_time, interval_minutes)
+        return _get_timeseries_metrics_python(db, cutoff_time, interval_minutes)
     except Exception as e:
         LOGGER.error(f"Failed to calculate timeseries metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
+
+
+def _get_timeseries_metrics_postgresql(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
+    """Compute time-series metrics using PostgreSQL.
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        interval_minutes: Bucket size in minutes
+
+    Returns:
+        dict: Time-series metrics data
+    """
+    # Use epoch-based bucketing (works for any interval including > 60 min)
+    stats_sql = text(
+        """
+        SELECT
+            TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM start_time) / :interval_seconds) * :interval_seconds) as bucket,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) as success,
+            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error
+        FROM observability_traces
+        WHERE start_time >= :cutoff_time
+        GROUP BY bucket
+        ORDER BY bucket
+        """
+    )
+
+    interval_seconds = interval_minutes * 60
+    results = db.execute(stats_sql, {"cutoff_time": cutoff_time, "interval_seconds": interval_seconds}).fetchall()
+
+    if not results:
+        return {"timestamps": [], "request_count": [], "success_count": [], "error_count": [], "error_rate": []}
+
+    timestamps = []
+    request_counts = []
+    success_counts = []
+    error_counts = []
+    error_rates = []
+
+    for row in results:
+        total = row.total or 0
+        error = row.error or 0
+        error_rate = (error / total * 100) if total > 0 else 0
+
+        timestamps.append(row.bucket.isoformat() if row.bucket else "")
+        request_counts.append(total)
+        success_counts.append(row.success or 0)
+        error_counts.append(error)
+        error_rates.append(round(error_rate, 2))
+
+    return {
+        "timestamps": timestamps,
+        "request_count": request_counts,
+        "success_count": success_counts,
+        "error_count": error_counts,
+        "error_rate": error_rates,
+    }
+
+
+def _get_timeseries_metrics_python(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
+    """Compute time-series metrics using Python (fallback for SQLite).
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        interval_minutes: Bucket size in minutes
+
+    Returns:
+        dict: Time-series metrics data
+    """
+    # Query traces grouped by time bucket
+    traces = db.query(ObservabilityTrace.start_time, ObservabilityTrace.status).filter(ObservabilityTrace.start_time >= cutoff_time).order_by(ObservabilityTrace.start_time).all()
+
+    if not traces:
+        return {"timestamps": [], "request_count": [], "success_count": [], "error_count": [], "error_rate": []}
+
+    # Group traces into time buckets using epoch-based bucketing (works for any interval)
+    interval_seconds = interval_minutes * 60
+    buckets: Dict[datetime, Dict[str, int]] = defaultdict(lambda: {"total": 0, "success": 0, "error": 0})
+    for trace in traces:
+        trace_time = trace.start_time
+        if trace_time.tzinfo is None:
+            trace_time = trace_time.replace(tzinfo=timezone.utc)
+        epoch = trace_time.timestamp()
+        bucket_epoch = (epoch // interval_seconds) * interval_seconds
+        bucket_time = datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+
+        buckets[bucket_time]["total"] += 1
+        if trace.status == "ok":
+            buckets[bucket_time]["success"] += 1
+        elif trace.status == "error":
+            buckets[bucket_time]["error"] += 1
+
+    # Build time-series arrays
+    timestamps = []
+    request_counts = []
+    success_counts = []
+    error_counts = []
+    error_rates = []
+
+    for bucket_time in sorted(buckets.keys()):
+        bucket = buckets[bucket_time]
+        error_rate = (bucket["error"] / bucket["total"] * 100) if bucket["total"] > 0 else 0
+
+        timestamps.append(bucket_time.isoformat())
+        request_counts.append(bucket["total"])
+        success_counts.append(bucket["success"])
+        error_counts.append(bucket["error"])
+        error_rates.append(round(error_rate, 2))
+
+    return {
+        "timestamps": timestamps,
+        "request_count": request_counts,
+        "success_count": success_counts,
+        "error_count": error_counts,
+        "error_rate": error_rates,
+    }
+
+
+def _get_latency_heatmap_postgresql(db: Session, cutoff_time: datetime, hours: int, time_buckets: int, latency_buckets: int) -> dict:
+    """Compute latency heatmap using PostgreSQL (optimized path).
+
+    Uses SQL arithmetic for efficient 2D histogram computation.
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        hours: Time range in hours
+        time_buckets: Number of time buckets
+        latency_buckets: Number of latency buckets
+
+    Returns:
+        dict: Heatmap data with time and latency dimensions
+    """
+    # First, get min/max durations
+    stats_query = text(
+        """
+        SELECT MIN(duration_ms) as min_d, MAX(duration_ms) as max_d
+        FROM observability_traces
+        WHERE start_time >= :cutoff_time AND duration_ms IS NOT NULL
+    """
+    )
+    stats_row = db.execute(stats_query, {"cutoff_time": cutoff_time}).fetchone()
+
+    if not stats_row or stats_row.min_d is None:
+        return {"time_labels": [], "latency_labels": [], "data": []}
+
+    min_duration = float(stats_row.min_d)
+    max_duration = float(stats_row.max_d)
+    latency_range = max_duration - min_duration
+
+    # Handle case where all durations are the same
+    if latency_range == 0:
+        latency_range = 1.0
+        max_duration = min_duration + 1.0
+
+    time_range_minutes = hours * 60
+    latency_bucket_size = latency_range / latency_buckets
+    time_bucket_minutes = time_range_minutes / time_buckets
+
+    # Use SQL arithmetic for 2D histogram bucketing
+    heatmap_query = text(
+        """
+        SELECT
+            LEAST(GREATEST(
+                (EXTRACT(EPOCH FROM (start_time - :cutoff_time)) / 60.0 / :time_bucket_minutes)::int,
+                0
+            ), :time_buckets - 1) as time_idx,
+            LEAST(GREATEST(
+                ((duration_ms - :min_duration) / :latency_bucket_size)::int,
+                0
+            ), :latency_buckets - 1) as latency_idx,
+            COUNT(*) as cnt
+        FROM observability_traces
+        WHERE start_time >= :cutoff_time AND duration_ms IS NOT NULL
+        GROUP BY time_idx, latency_idx
+    """
+    )
+
+    rows = db.execute(
+        heatmap_query,
+        {
+            "cutoff_time": cutoff_time,
+            "time_bucket_minutes": time_bucket_minutes,
+            "time_buckets": time_buckets,
+            "min_duration": min_duration,
+            "latency_bucket_size": latency_bucket_size,
+            "latency_buckets": latency_buckets,
+        },
+    ).fetchall()
+
+    # Initialize heatmap matrix
+    heatmap = [[0 for _ in range(time_buckets)] for _ in range(latency_buckets)]
+
+    # Populate from SQL results
+    for row in rows:
+        time_idx = int(row.time_idx)
+        latency_idx = int(row.latency_idx)
+        if 0 <= time_idx < time_buckets and 0 <= latency_idx < latency_buckets:
+            heatmap[latency_idx][time_idx] = int(row.cnt)
+
+    # Generate labels
+    time_labels = []
+    for i in range(time_buckets):
+        bucket_time = cutoff_time + timedelta(minutes=i * time_bucket_minutes)
+        time_labels.append(bucket_time.strftime("%H:%M"))
+
+    latency_labels = []
+    for i in range(latency_buckets):
+        bucket_min = min_duration + i * latency_bucket_size
+        bucket_max = bucket_min + latency_bucket_size
+        latency_labels.append(f"{bucket_min:.0f}-{bucket_max:.0f}ms")
+
+    return {"time_labels": time_labels, "latency_labels": latency_labels, "data": heatmap}
+
+
+def _get_latency_heatmap_python(db: Session, cutoff_time: datetime, hours: int, time_buckets: int, latency_buckets: int) -> dict:
+    """Compute latency heatmap using Python (fallback for SQLite).
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        hours: Time range in hours
+        time_buckets: Number of time buckets
+        latency_buckets: Number of latency buckets
+
+    Returns:
+        dict: Heatmap data with time and latency dimensions
+    """
+    # Query all traces with duration
+    traces = (
+        db.query(ObservabilityTrace.start_time, ObservabilityTrace.duration_ms)
+        .filter(ObservabilityTrace.start_time >= cutoff_time, ObservabilityTrace.duration_ms.isnot(None))
+        .order_by(ObservabilityTrace.start_time)
+        .all()
+    )
+
+    if not traces:
+        return {"time_labels": [], "latency_labels": [], "data": []}
+
+    # Calculate time bucket size
+    time_range = hours * 60  # minutes
+    time_bucket_minutes = time_range / time_buckets
+
+    # Find latency range and create buckets
+    durations = [t.duration_ms for t in traces]
+    min_duration = min(durations)
+    max_duration = max(durations)
+    latency_range = max_duration - min_duration
+    latency_bucket_size = latency_range / latency_buckets if latency_range > 0 else 1
+
+    # Initialize heatmap matrix
+    heatmap = [[0 for _ in range(time_buckets)] for _ in range(latency_buckets)]
+
+    # Populate heatmap
+    for trace in traces:
+        trace_time = trace.start_time
+        # Convert naive SQLite datetime to UTC aware
+        if trace_time.tzinfo is None:
+            trace_time = trace_time.replace(tzinfo=timezone.utc)
+
+        # Calculate time bucket index
+        time_diff = (trace_time - cutoff_time).total_seconds() / 60  # minutes
+        time_idx = min(int(time_diff / time_bucket_minutes), time_buckets - 1)
+
+        # Calculate latency bucket index
+        latency_idx = min(int((trace.duration_ms - min_duration) / latency_bucket_size), latency_buckets - 1)
+
+        heatmap[latency_idx][time_idx] += 1
+
+    # Generate labels
+    time_labels = []
+    for i in range(time_buckets):
+        bucket_time = cutoff_time + timedelta(minutes=i * time_bucket_minutes)
+        time_labels.append(bucket_time.strftime("%H:%M"))
+
+    latency_labels = []
+    for i in range(latency_buckets):
+        bucket_min = min_duration + i * latency_bucket_size
+        bucket_max = bucket_min + latency_bucket_size
+        latency_labels.append(f"{bucket_min:.0f}-{bucket_max:.0f}ms")
+
+    return {"time_labels": time_labels, "latency_labels": latency_labels, "data": heatmap}
 
 
 @admin_router.get("/observability/metrics/top-slow", response_model=dict)
@@ -14043,6 +14522,7 @@ async def get_top_slow_endpoints(
         LOGGER.error(f"Failed to get top slow endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14103,6 +14583,7 @@ async def get_top_volume_endpoints(
         LOGGER.error(f"Failed to get top volume endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14166,6 +14647,7 @@ async def get_top_error_endpoints(
         LOGGER.error(f"Failed to get top error endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14178,6 +14660,9 @@ async def get_latency_heatmap(
     _user=Depends(get_current_user_with_permissions),
 ):
     """Get latency distribution heatmap data.
+
+    Uses PostgreSQL SQL aggregation for efficient computation when available,
+    falls back to Python for SQLite.
 
     Args:
         request: FastAPI request object
@@ -14194,67 +14679,18 @@ async def get_latency_heatmap(
     """
     db = next(get_db())
     try:
-        # Make cutoff_time UTC aware
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # Query all traces with duration
-        traces = (
-            db.query(ObservabilityTrace.start_time, ObservabilityTrace.duration_ms)
-            .filter(ObservabilityTrace.start_time >= cutoff_time, ObservabilityTrace.duration_ms.isnot(None))
-            .order_by(ObservabilityTrace.start_time)
-            .all()
-        )
-
-        if not traces:
-            return {"time_labels": [], "latency_labels": [], "data": []}
-
-        # Calculate time bucket size
-        time_range = hours * 60  # minutes
-        time_bucket_minutes = time_range / time_buckets
-
-        # Find latency range and create buckets
-        durations = [t.duration_ms for t in traces]
-        min_duration = min(durations)
-        max_duration = max(durations)
-        latency_range = max_duration - min_duration
-        latency_bucket_size = latency_range / latency_buckets if latency_range > 0 else 1
-
-        # Initialize heatmap matrix
-        heatmap = [[0 for _ in range(time_buckets)] for _ in range(latency_buckets)]
-
-        # Populate heatmap
-        for trace in traces:
-            trace_time = trace.start_time
-            # Convert naive SQLite datetime to UTC aware
-            if trace_time.tzinfo is None:
-                trace_time = trace_time.replace(tzinfo=timezone.utc)
-
-            # Calculate time bucket index
-            time_diff = (trace_time - cutoff_time).total_seconds() / 60  # minutes
-            time_idx = min(int(time_diff / time_bucket_minutes), time_buckets - 1)
-
-            # Calculate latency bucket index
-            latency_idx = min(int((trace.duration_ms - min_duration) / latency_bucket_size), latency_buckets - 1)
-
-            heatmap[latency_idx][time_idx] += 1
-
-        # Generate labels
-        time_labels = []
-        for i in range(time_buckets):
-            bucket_time = cutoff_time + timedelta(minutes=i * time_bucket_minutes)
-            time_labels.append(bucket_time.strftime("%H:%M"))
-
-        latency_labels = []
-        for i in range(latency_buckets):
-            bucket_min = min_duration + i * latency_bucket_size
-            bucket_max = bucket_min + latency_bucket_size
-            latency_labels.append(f"{bucket_min:.0f}-{bucket_max:.0f}ms")
-
-        return {"time_labels": time_labels, "latency_labels": latency_labels, "data": heatmap}
+        # Route to appropriate implementation based on database dialect
+        dialect_name = db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            return _get_latency_heatmap_postgresql(db, cutoff_time, hours, time_buckets, latency_buckets)
+        return _get_latency_heatmap_python(db, cutoff_time, hours, time_buckets, latency_buckets)
     except Exception as e:
         LOGGER.error(f"Failed to generate latency heatmap: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14318,6 +14754,7 @@ async def get_tool_usage(
         LOGGER.error(f"Failed to get tool usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14410,6 +14847,7 @@ async def get_tool_performance(
         LOGGER.error(f"Failed to get tool performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14472,6 +14910,7 @@ async def get_tool_errors(
         LOGGER.error(f"Failed to get tool error statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14542,6 +14981,7 @@ async def get_tool_chains(
         LOGGER.error(f"Failed to get tool chain statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14634,6 +15074,7 @@ async def get_prompt_usage(
         LOGGER.error(f"Failed to get prompt usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14726,6 +15167,7 @@ async def get_prompt_performance(
         LOGGER.error(f"Failed to get prompt performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14780,6 +15222,7 @@ async def get_prompts_errors(
 
         return {"prompts": prompts_data, "time_range_hours": hours}
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14872,6 +15315,7 @@ async def get_resource_usage(
         LOGGER.error(f"Failed to get resource usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -14964,6 +15408,7 @@ async def get_resource_performance(
         LOGGER.error(f"Failed to get resource performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -15018,6 +15463,7 @@ async def get_resources_errors(
 
         return {"resources": resources_data, "time_range_hours": hours}
     finally:
+        db.commit()  # Commit read-only transaction to avoid implicit rollback
         db.close()
 
 
@@ -15104,7 +15550,7 @@ async def get_performance_stats(
                 },
             )
 
-        return JSONResponse(content=dashboard_data)
+        return ORJSONResponse(content=dashboard_data)
 
     except Exception as e:
         LOGGER.error(f"Performance metrics retrieval failed: {str(e)}", exc_info=True)
@@ -15133,7 +15579,7 @@ async def get_performance_system(
 
     service = get_performance_service(db)
     metrics = service.get_system_metrics()
-    return JSONResponse(content=metrics.model_dump())
+    return metrics.model_dump()
 
 
 @admin_router.get("/performance/workers")
@@ -15158,7 +15604,7 @@ async def get_performance_workers(
 
     service = get_performance_service(db)
     workers = service.get_worker_metrics()
-    return JSONResponse(content=[w.model_dump() for w in workers])
+    return [w.model_dump() for w in workers]
 
 
 @admin_router.get("/performance/requests")
@@ -15183,7 +15629,7 @@ async def get_performance_requests(
 
     service = get_performance_service(db)
     metrics = service.get_request_metrics()
-    return JSONResponse(content=metrics.model_dump())
+    return metrics.model_dump()
 
 
 @admin_router.get("/performance/cache")
@@ -15208,7 +15654,7 @@ async def get_performance_cache(
 
     service = get_performance_service(db)
     metrics = await service.get_cache_metrics()
-    return JSONResponse(content=metrics.model_dump())
+    return metrics.model_dump()
 
 
 @admin_router.get("/performance/history")
@@ -15238,10 +15684,10 @@ async def get_performance_history(
     service = get_performance_service(db)
     start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    history = service.get_history(
+    history = await service.get_history(
         db=db,
         period_type=period_type,
         start_time=start_time,
     )
 
-    return JSONResponse(content=history.model_dump())
+    return history.model_dump()

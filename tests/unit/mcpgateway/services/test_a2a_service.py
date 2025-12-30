@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 # First-Party
+from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
 from mcpgateway.db import A2AAgent as DbA2AAgent
 from mcpgateway.schemas import A2AAgentCreate, A2AAgentUpdate
 from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictError, A2AAgentNotFoundError, A2AAgentService
@@ -38,6 +39,10 @@ def mock_logging_services():
 
 class TestA2AAgentService:
     """Test suite for A2A Agent Service."""
+
+    def setup_method(self):
+        """Clear the A2A stats cache before each test to ensure isolation."""
+        a2a_stats_cache.invalidate()
 
     @pytest.fixture
     def service(self):
@@ -288,8 +293,10 @@ class TestA2AAgentService:
         with pytest.raises(A2AAgentNotFoundError):
             await service.delete_agent(mock_db, "non-existent-id")
 
+    @patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service")
+    @patch("mcpgateway.services.a2a_service.fresh_db_session")
     @patch("httpx.AsyncClient")
-    async def test_invoke_agent_success(self, mock_client_class, service, mock_db, sample_db_agent):
+    async def test_invoke_agent_success(self, mock_client_class, mock_fresh_db, mock_metrics_buffer_fn, service, mock_db, sample_db_agent):
         """Test successful agent invocation."""
         # Mock HTTP client
         mock_client = AsyncMock()
@@ -309,11 +316,19 @@ class TestA2AAgentService:
                 auth_type=sample_db_agent.auth_type,
                 auth_value=sample_db_agent.auth_value,
                 protocol_version=sample_db_agent.protocol_version,
+                agent_type="generic",
             )
         )
-        mock_db.add = MagicMock()
-        mock_db.commit = MagicMock()
-        mock_db.execute.return_value.scalar_one.return_value = sample_db_agent
+
+        # Mock fresh_db_session for last_interaction update
+        mock_ts_db = MagicMock()
+        mock_ts_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
+        mock_fresh_db.return_value.__enter__.return_value = mock_ts_db
+        mock_fresh_db.return_value.__exit__.return_value = None
+
+        # Mock metrics buffer service
+        mock_metrics_buffer = MagicMock()
+        mock_metrics_buffer_fn.return_value = mock_metrics_buffer
 
         # Execute
         result = await service.invoke_agent(mock_db, sample_db_agent.name, {"test": "data"})
@@ -321,8 +336,10 @@ class TestA2AAgentService:
         # Verify
         assert result["response"] == "Test response"
         mock_client.post.assert_called_once()
-        mock_db.add.assert_called()  # Metrics added
-        mock_db.commit.assert_called()
+        # Metrics recorded via buffer service
+        mock_metrics_buffer.record_a2a_agent_metric_with_duration.assert_called_once()
+        # last_interaction updated via fresh_db_session
+        mock_ts_db.commit.assert_called()
 
     async def test_invoke_agent_disabled(self, service, mock_db, sample_db_agent):
         """Test invoking disabled agent."""
@@ -336,8 +353,10 @@ class TestA2AAgentService:
         with pytest.raises(A2AAgentError, match="disabled"):
             await service.invoke_agent(mock_db, sample_db_agent.name, {"test": "data"})
 
+    @patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service")
+    @patch("mcpgateway.services.a2a_service.fresh_db_session")
     @patch("httpx.AsyncClient")
-    async def test_invoke_agent_http_error(self, mock_client_class, service, mock_db, sample_db_agent):
+    async def test_invoke_agent_http_error(self, mock_client_class, mock_fresh_db, mock_metrics_buffer_fn, service, mock_db, sample_db_agent):
         """Test agent invocation with HTTP error."""
         # Mock HTTP client with error response
         mock_client = AsyncMock()
@@ -357,31 +376,47 @@ class TestA2AAgentService:
                 auth_type=sample_db_agent.auth_type,
                 auth_value=sample_db_agent.auth_value,
                 protocol_version=sample_db_agent.protocol_version,
+                agent_type="generic",
             )
         )
-        mock_db.add = MagicMock()
-        mock_db.commit = MagicMock()
-        mock_db.execute.return_value.scalar_one.return_value = sample_db_agent
+
+        # Mock fresh_db_session for last_interaction update
+        mock_ts_db = MagicMock()
+        mock_ts_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
+        mock_fresh_db.return_value.__enter__.return_value = mock_ts_db
+        mock_fresh_db.return_value.__exit__.return_value = None
+
+        # Mock metrics buffer service
+        mock_metrics_buffer = MagicMock()
+        mock_metrics_buffer_fn.return_value = mock_metrics_buffer
 
         # Execute and verify exception
         with pytest.raises(A2AAgentError, match="HTTP 500"):
             await service.invoke_agent(mock_db, sample_db_agent.name, {"test": "data"})
 
-        # Verify metrics were still recorded
-        mock_db.add.assert_called()
-        mock_db.commit.assert_called()
+        # Verify metrics were still recorded via buffer service
+        mock_metrics_buffer.record_a2a_agent_metric_with_duration.assert_called_once()
+        # last_interaction updated via fresh_db_session
+        mock_ts_db.commit.assert_called()
 
     async def test_aggregate_metrics(self, service, mock_db):
         """Test metrics aggregation."""
         # Mock database queries
-        mock_db.execute.return_value.scalar.side_effect = [5, 3]  # total_agents, active_agents
-        mock_db.execute.return_value.first.return_value = MagicMock(
-            total_interactions=100,
-            successful_interactions=90,
-            avg_response_time=1.5,
-            min_response_time=0.5,
-            max_response_time=3.0,
-        )
+        # The cache uses .one() to get both total and active in a single query
+        mock_counts_result = MagicMock()
+        mock_counts_result.total = 5
+        mock_counts_result.active = 3
+
+        mock_metrics_result = MagicMock()
+        mock_metrics_result.total_interactions = 100
+        mock_metrics_result.successful_interactions = 90
+        mock_metrics_result.avg_response_time = 1.5
+        mock_metrics_result.min_response_time = 0.5
+        mock_metrics_result.max_response_time = 3.0
+
+        # First call is from cache (get_counts -> .one()), second is metrics query (.first())
+        mock_db.execute.return_value.one.return_value = mock_counts_result
+        mock_db.execute.return_value.first.return_value = mock_metrics_result
 
         # Execute
         result = await service.aggregate_metrics(mock_db)
@@ -463,7 +498,7 @@ class TestA2AAgentService:
         print(f"sample_db_agent: {sample_db_agent}")
         # Patch decode_auth to return a dummy decoded dict
         with patch("mcpgateway.schemas.decode_auth", return_value={"user": "decoded"}):
-            result = service._db_to_schema(mock_db, sample_db_agent)
+            result = service._db_to_schema(mock_db, sample_db_agent, include_metrics=True)
 
         # Verify
         assert result.id == sample_db_agent.id
