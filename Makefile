@@ -125,14 +125,10 @@ uv:
 	fi
 
 .PHONY: venv
-venv:
+venv: uv
 	@rm -Rf "$(VENV_DIR)"
 	@test -d "$(VENVS_DIR)" || mkdir -p "$(VENVS_DIR)"
-	@python3 -m venv "$(VENV_DIR)"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m pip install --upgrade pip setuptools pdm"
-	# Eventually, we want to transition to using uv/uvx exclusively, at which point we will only need
-	# a virtual environment if the user has not installed uv into their account.
-	@/bin/bash -c "type uv || ( source $(VENV_DIR)/bin/activate && python3 -m pip install --upgrade uv )"
+	@uv venv "$(VENV_DIR)"
 	@echo -e "✅  Virtual env created.\n💡  Enter it with:\n    . $(VENV_DIR)/bin/activate\n"
 
 .PHONY: activate
@@ -492,6 +488,7 @@ clean:
 # help: 🧪 TESTING
 # help: smoketest            - Run smoketest.py --verbose (build container, add MCP server, test endpoints)
 # help: test                 - Run unit tests with pytest
+# help: test-altk            - Run tests with ALTK (agent-lifecycle-toolkit) installed
 # help: test-profile         - Run tests and show slowest 20 tests (durations >= 1s)
 # help: coverage             - Run tests with coverage, emit md/HTML/XML + badge, generate annotated files
 # help: htmlcov              - (re)build just the HTML coverage report into docs
@@ -508,7 +505,7 @@ clean:
 # help: query-log-analyze    - Analyze query log for N+1 patterns and slow queries
 # help: query-log-clear      - Clear database query log files
 
-.PHONY: smoketest test test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check test-db-perf test-db-perf-verbose dev-query-log query-log-tail query-log-analyze query-log-clear load-test load-test-ui load-test-light load-test-heavy load-test-sustained load-test-stress load-test-report load-test-compose load-test-timeserver load-test-fasttime load-test-1000 load-test-summary load-test-baseline load-test-baseline-ui load-test-baseline-stress load-test-agentgateway-mcp-server-time
+.PHONY: smoketest test test-altk test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check test-db-perf test-db-perf-verbose dev-query-log query-log-tail query-log-analyze query-log-clear load-test load-test-ui load-test-light load-test-heavy load-test-sustained load-test-stress load-test-report load-test-compose load-test-timeserver load-test-fasttime load-test-1000 load-test-summary load-test-baseline load-test-baseline-ui load-test-baseline-stress load-test-agentgateway-mcp-server-time
 
 ## --- Automated checks --------------------------------------------------------
 smoketest:
@@ -522,6 +519,16 @@ test:
 	@echo "🧪 Running tests..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		export DATABASE_URL='sqlite:///:memory:' && \
+		export TEST_DATABASE_URL='sqlite:///:memory:' && \
+		uv run --active pytest -n auto --maxfail=0 -v --ignore=tests/fuzz"
+
+test-altk:
+	@echo "🧪 Running tests with ALTK (agent-lifecycle-toolkit)..."
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		echo '📦 Installing ALTK optional dependency...' && \
+		uv pip install -q '.[altk]' && \
 		export DATABASE_URL='sqlite:///:memory:' && \
 		export TEST_DATABASE_URL='sqlite:///:memory:' && \
 		uv run --active pytest -n auto --maxfail=0 -v --ignore=tests/fuzz"
@@ -749,11 +756,79 @@ generate-report:                           ## Display most recent load test repo
 	done || echo "❌ No reports found. Run 'make generate-small' first."
 
 # =============================================================================
+# 📊 MONITORING STACK - Prometheus + Grafana + Exporters
+# =============================================================================
+# help: 📊 MONITORING STACK
+# help: monitoring-up          - Start monitoring stack (Prometheus, Grafana, exporters)
+# help: monitoring-down        - Stop monitoring stack
+# help: monitoring-clean       - Stop and remove all monitoring data (volumes)
+# help: monitoring-status      - Show status of monitoring services
+# help: monitoring-logs        - Show monitoring stack logs
+
+# Compose command for monitoring (requires --profile support)
+# podman-compose < 1.1.0 doesn't support --profile, so prefer docker compose or podman compose
+COMPOSE_CMD_MONITOR := $(shell \
+	if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then \
+		echo "docker compose"; \
+	elif command -v podman &>/dev/null && podman compose version &>/dev/null 2>&1; then \
+		echo "podman compose"; \
+	else \
+		echo "docker-compose"; \
+	fi)
+
+monitoring-up:                             ## Start monitoring stack (Prometheus, Grafana, exporters)
+	@echo "📊 Starting monitoring stack..."
+	$(COMPOSE_CMD_MONITOR) --profile monitoring up -d
+	@echo "⏳ Waiting for Grafana to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if curl -s -o /dev/null -w '' http://localhost:3000/api/health 2>/dev/null; then break; fi; \
+		sleep 2; \
+	done
+	@# Configure Grafana: star dashboard and set as home
+	@curl -s -X POST -u admin:changeme 'http://localhost:3000/api/user/stars/dashboard/uid/mcp-gateway-overview' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/org/preferences' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/user/preferences' >/dev/null 2>&1 || true
+	@echo ""
+	@echo "✅ Monitoring stack started!"
+	@echo ""
+	@echo "   🌐 Grafana:    http://localhost:3000 (admin/changeme)"
+	@echo "   🔥 Prometheus: http://localhost:9090"
+	@echo ""
+	@echo "   ★ MCP Gateway Overview (home dashboard):"
+	@echo "      • Gateway replicas, Nginx, PostgreSQL, Redis status"
+	@echo "      • Request rate, error rate, P95 latency"
+	@echo "      • Nginx connections and throughput"
+	@echo "      • Database queries and cache hit ratio"
+	@echo "      • Redis memory, ops/sec, hit rate"
+	@echo "      • Container CPU and memory usage"
+	@echo ""
+	@echo "   Run load test: make load-test-ui"
+
+monitoring-down:                           ## Stop monitoring stack
+	@echo "📊 Stopping monitoring stack..."
+	$(COMPOSE_CMD_MONITOR) --profile monitoring down
+	@echo "✅ Monitoring stack stopped."
+
+monitoring-status:                         ## Show status of monitoring services
+	@echo "📊 Monitoring stack status:"
+	@$(COMPOSE_CMD_MONITOR) ps --filter "label=com.docker.compose.profiles=monitoring" 2>/dev/null || \
+		$(COMPOSE_CMD_MONITOR) ps | grep -E "(prometheus|grafana|exporter|cadvisor)" || \
+		echo "   No monitoring services running. Start with 'make monitoring-up'"
+
+monitoring-logs:                           ## Show monitoring stack logs
+	$(COMPOSE_CMD_MONITOR) --profile monitoring logs -f --tail=100
+
+monitoring-clean:                          ## Stop and remove all monitoring data (volumes)
+	@echo "📊 Stopping and cleaning monitoring stack..."
+	$(COMPOSE_CMD_MONITOR) --profile monitoring down -v
+	@echo "✅ Monitoring stack stopped and volumes removed."
+
+# =============================================================================
 # 🔥 HTTP LOAD TESTING - Locust-based traffic generation
 # =============================================================================
 # help: 🔥 HTTP LOAD TESTING (Locust)
 # help: load-test             - Run HTTP load test (50 users, 60s, headless)
-# help: load-test-ui          - Start Locust web UI at http://localhost:8089
+# help: load-test-ui          - Start Locust web UI (distributed, auto-detect CPUs)
 # help: load-test-light       - Light load test (10 users, 30s)
 # help: load-test-heavy       - Heavy load test (200 users, 120s)
 # help: load-test-sustained   - Sustained load test (25 users, 300s)
@@ -802,11 +877,12 @@ load-test:                                 ## Run HTTP load test (50 users, 60s,
 	@echo "📊 CSV Reports: $(LOADTEST_CSV_PREFIX)_*.csv"
 
 load-test-ui:                              ## Start Locust web UI at http://localhost:8089
-	@echo "🔥 Starting Locust Web UI..."
+	@echo "🔥 Starting Locust Web UI (distributed, auto-detect CPUs)..."
 	@echo "   🌐 Open http://localhost:8089 in your browser"
 	@echo "   🎯 Default host: $(LOADTEST_HOST)"
 	@echo "   👥 Default users: $(LOADTEST_USERS), spawn rate: $(LOADTEST_SPAWN_RATE)/s"
 	@echo "   ⏱️  Default run time: $(LOADTEST_RUN_TIME)"
+	@echo "   🚀 Workers: auto-detect (1 per CPU core)"
 	@echo ""
 	@echo "   💡 Use 'User classes' dropdown to select FastTimeUser, etc."
 	@echo "   💡 Start server first with 'make dev' or 'docker compose up'"
@@ -818,6 +894,7 @@ load-test-ui:                              ## Start Locust web UI at http://loca
 			--users=$(LOADTEST_USERS) \
 			--spawn-rate=$(LOADTEST_SPAWN_RATE) \
 			--run-time=$(LOADTEST_RUN_TIME) \
+			--processes=-1 \
 			--class-picker"
 
 load-test-light:                           ## Light load test (10 users, 30s)
@@ -1627,11 +1704,11 @@ tox:                                ## 🧪  Multi-Python tox matrix (uv)
 		uv pip install -q tox tox-uv && \
 		python3 -m tox -p auto $(TOXARGS)"
 
-sbom:								## 🛡️  Generate SBOM & security report
+sbom: uv							## 🛡️  Generate SBOM & security report
 	@echo "🛡️   Generating SBOM & security report..."
 	@rm -Rf "$(VENV_DIR).sbom"
-	@python3 -m venv "$(VENV_DIR).sbom"
-	@/bin/bash -c "source $(VENV_DIR).sbom/bin/activate && python3 -m pip install --upgrade pip setuptools pdm uv && python3 -m uv pip install .[dev]"
+	@uv venv "$(VENV_DIR).sbom"
+	@/bin/bash -c "source $(VENV_DIR).sbom/bin/activate && uv pip install .[dev]"
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q cyclonedx-bom sbom2doc"
 	@echo "🔍  Generating SBOM from environment..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
@@ -2286,14 +2363,14 @@ PROJECT_BASEDIR     ?= $(strip $(PWD))
 # ─────────────────────────────────────────────────────────────────────────
 
 ## ─────────── Dependencies (compose + misc) ─────────────────────────────
-sonar-deps-podman:
+sonar-deps-podman: uv
 	@echo "🔧 Installing podman-compose ..."
-	python3 -m pip install --quiet podman-compose
+	uv tool install --quiet podman-compose
 
-sonar-deps-docker:
+sonar-deps-docker: uv
 	@echo "🔧 Ensuring $(COMPOSE_CMD) is available ..."
 	@command -v $(firstword $(COMPOSE_CMD)) >/dev/null || \
-	  python3 -m pip install --quiet docker-compose
+	  uv tool install --quiet docker-compose
 
 ## ─────────── Run SonarQube server (compose) ────────────────────────────
 sonar-up-podman:
@@ -2330,11 +2407,10 @@ sonar-submit-podman:
 		-Dproject.settings=$(SONAR_PROPS)
 
 ## ─────────── Python wrapper (pysonar-scanner) ───────────────────────────
-pysonar-scanner:
+pysonar-scanner: uv
 	@echo "🐍 Scanning code with pysonar-scanner (PyPI) ..."
 	@test -f $(SONAR_PROPS) || { echo "❌ $(SONAR_PROPS) not found."; exit 1; }
-	python3 -m pip install --upgrade --quiet pysonar-scanner
-	python3 -m pysonar_scanner \
+	uvx pysonar-scanner \
 		-Dproject.settings=$(SONAR_PROPS) \
 		-Dsonar.host.url=$(SONAR_HOST_URL) \
 		$(if $(SONAR_TOKEN),-Dsonar.login=$(SONAR_TOKEN),)
@@ -2480,13 +2556,9 @@ containerfile-update:
 # =============================================================================
 .PHONY: dist wheel sdist verify publish publish-testpypi
 
-dist: clean                  ## Build wheel + sdist into ./dist (optionally includes Rust plugins)
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
+dist: clean uv               ## Build wheel + sdist into ./dist (optionally includes Rust plugins)
 	@echo "📦 Building Python package..."
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build"
+	@uv build
 	@if [ "$(ENABLE_RUST_BUILD)" = "1" ]; then \
 		echo "🦀 Building Rust plugins..."; \
 		$(MAKE) rust-build || { echo "⚠️  Rust build failed, continuing without Rust plugins"; exit 0; }; \
@@ -2500,13 +2572,9 @@ dist: clean                  ## Build wheel + sdist into ./dist (optionally incl
 	@echo '   make publish         # Publish Python package'
 	@echo '   make rust-publish    # Publish Rust wheels (if configured)'
 
-wheel:                       ## Build wheel only (Python + optionally Rust)
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
+wheel: uv                    ## Build wheel only (Python + optionally Rust)
 	@echo "📦 Building Python wheel..."
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build -w"
+	@uv build --wheel
 	@if [ "$(ENABLE_RUST_BUILD)" = "1" ]; then \
 		echo "🦀 Building Rust wheels..."; \
 		$(MAKE) rust-build || { echo "⚠️  Rust build failed, continuing without Rust plugins"; exit 0; }; \
@@ -2516,27 +2584,21 @@ wheel:                       ## Build wheel only (Python + optionally Rust)
 	fi
 	@echo '🛠  Python wheel written to ./dist'
 
-sdist:                       ## Build source distribution only
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build -s"
+sdist: uv                    ## Build source distribution only
+	@echo "📦 Building source distribution..."
+	@uv build --sdist
 	@echo '🛠  Source distribution written to ./dist'
 
-verify: dist               ## Build, run metadata & manifest checks
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	twine check dist/* && \
-	check-manifest && \
-	pyroma -d ."
+verify: dist uv            ## Build, run metadata & manifest checks
+	@uvx twine check dist/* && uvx check-manifest && uvx pyroma -d .
 	@echo "✅  Package verified - ready to publish."
 
-publish: verify            ## Verify, then upload to PyPI
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && twine upload dist/*"
+publish: verify uv         ## Verify, then upload to PyPI
+	@uvx twine upload dist/*
 	@echo "🚀  Upload finished - check https://pypi.org/project/$(PROJECT_NAME)/"
 
-publish-testpypi: verify   ## Verify, then upload to TestPyPI
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && twine upload --repository testpypi dist/*"
+publish-testpypi: verify uv ## Verify, then upload to TestPyPI
+	@uvx twine upload --repository testpypi dist/*
 	@echo "🚀  Upload finished - check https://test.pypi.org/project/$(PROJECT_NAME)/"
 
 # Allow override via environment
@@ -3922,7 +3984,7 @@ LOCAL_PYPI_AUTH := $(LOCAL_PYPI_DIR)/.htpasswd
 
 local-pypi-install:
 	@echo "📦  Installing pypiserver..."
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install 'pypiserver>=2.3.0' passlib"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install 'pypiserver>=2.3.0' passlib"
 	@mkdir -p $(LOCAL_PYPI_DIR)
 
 local-pypi-start: local-pypi-install local-pypi-stop
@@ -4003,15 +4065,15 @@ local-pypi-upload-auth:
 local-pypi-test:
 	@echo "📥  Installing from local PyPI..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install --index-url $(LOCAL_PYPI_URL)/simple/ \
+	uv pip install --index-url $(LOCAL_PYPI_URL)/simple/ \
 	            --extra-index-url https://pypi.org/simple/ \
-	            --force-reinstall $(PROJECT_NAME)"
+	            --reinstall $(PROJECT_NAME)"
 	@echo "✅  Installed from local PyPI"
 
 local-pypi-clean: clean dist local-pypi-start-auth local-pypi-upload-auth local-pypi-test
 	@echo "🎉  Full local PyPI cycle complete!"
 	@echo "📊  Package info:"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip show $(PROJECT_NAME)"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip show $(PROJECT_NAME)"
 
 # Convenience target to restart server
 local-pypi-restart: local-pypi-stop local-pypi-start
@@ -4073,7 +4135,7 @@ DEVPI_PID := /tmp/devpi-server.pid
 devpi-install:
 	@echo "📦  Installing devpi server and client..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install devpi-server devpi-client devpi-web"
+	uv pip install devpi-server devpi-client devpi-web"
 	@echo "✅  DevPi installed"
 
 devpi-init: devpi-install
@@ -4179,15 +4241,15 @@ devpi-test:
 		exit 1; \
 	fi
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install --index-url $(DEVPI_URL)/$(DEVPI_INDEX)/+simple/ \
+	uv pip install --index-url $(DEVPI_URL)/$(DEVPI_INDEX)/+simple/ \
 	            --extra-index-url https://pypi.org/simple/ \
-	            --force-reinstall mcp-contextforge-gateway"
+	            --reinstall mcp-contextforge-gateway"
 	@echo "✅  Installed mcp-contextforge-gateway from devpi"
 
 devpi-clean: clean dist devpi-upload devpi-test
 	@echo "🎉  Full devpi cycle complete!"
 	@echo "📊  Package info:"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip show mcp-contextforge-gateway"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip show mcp-contextforge-gateway"
 
 devpi-status:
 	@echo "🔍  DevPi server status:"
@@ -4420,7 +4482,7 @@ ALEMBIC_CONFIG = mcpgateway/alembic.ini
 
 alembic-install:
 	@echo "➜ Installing Alembic ..."
-	pip install --quiet alembic sqlalchemy
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q alembic sqlalchemy"
 
 .PHONY: db-init
 db-init: ## Initialize alembic migrations
@@ -4536,7 +4598,7 @@ playwright-install:
 	@echo "🎭 Installing Playwright browsers (chromium)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e '.[playwright]' 2>/dev/null || pip install playwright pytest-playwright && \
+		uv pip install -e '.[playwright]' 2>/dev/null || uv pip install playwright pytest-playwright && \
 		playwright install chromium"
 	@echo "✅ Playwright chromium browser installed!"
 
@@ -4544,7 +4606,7 @@ playwright-install-all:
 	@echo "🎭 Installing all Playwright browsers..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e '.[playwright]' 2>/dev/null || pip install playwright pytest-playwright && \
+		uv pip install -e '.[playwright]' 2>/dev/null || uv pip install playwright pytest-playwright && \
 		playwright install"
 	@echo "✅ All Playwright browsers installed!"
 
@@ -4601,7 +4663,7 @@ test-ui-parallel: playwright-install
 	@echo "🎭 Running UI tests in parallel..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -q pytest-xdist && \
+		uv pip install -q pytest-xdist && \
 		pytest $(PLAYWRIGHT_DIR)/ -v -n auto --dist loadscope \
 		--browser chromium || { echo '❌ UI tests failed!'; exit 1; }"
 	@echo "✅ UI parallel tests completed!"
@@ -4612,7 +4674,7 @@ test-ui-report: playwright-install
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@mkdir -p $(PLAYWRIGHT_REPORTS)
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -q pytest-html && \
+		uv pip install -q pytest-html && \
 		pytest $(PLAYWRIGHT_DIR)/ -v --screenshot=only-on-failure \
 		--html=$(PLAYWRIGHT_REPORTS)/report.html --self-contained-html \
 		--browser chromium || true"
@@ -4986,8 +5048,7 @@ security-fix:                       ## 🔧 Auto-fix security issues where possi
 		find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus {} +"
 	@echo "➤ Updating dependencies to latest secure versions..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install --upgrade pip setuptools && \
-		python3 -m pip list --outdated"
+		uv pip list --outdated"
 	@echo "✅ Auto-fixes applied where possible"
 	@echo "⚠️  Manual review still required for:"
 	@echo "   - Dependency updates (run 'make update')"
@@ -5367,7 +5428,7 @@ fuzz-install:                       ## 🔧 Install all fuzzing dependencies
 	@echo "🔧 Installing fuzzing dependencies..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e .[fuzz]"
+		uv pip install -e .[fuzz]"
 	@echo "✅ Fuzzing tools installed"
 
 fuzz-hypothesis: fuzz-install         ## 🧪 Run Hypothesis property-based tests
@@ -5667,12 +5728,12 @@ rust-verify:                            ## Verify Rust plugin installation
 rust-check-maturin:                     ## Check/install maturin
 	@which maturin > /dev/null 2>&1 || { \
 		echo "📦 Installing maturin..."; \
-		/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install maturin"; \
+		/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install maturin"; \
 	}
 
 rust-install-deps:                      ## Install all Rust build dependencies
 	@echo "📦 Installing Rust build dependencies..."
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install maturin"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install maturin"
 	@rustup --version > /dev/null 2>&1 || { \
 		echo "❌ Rust not installed. Install with:"; \
 		echo "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \

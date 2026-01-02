@@ -861,6 +861,140 @@ MAX_TOOL_RETRIES=5
 TOOL_CONCURRENT_LIMIT=10
 ```
 
+### Execution Metrics Recording
+
+Control whether execution metrics are recorded to the database:
+
+```bash
+DB_METRICS_RECORDING_ENABLED=true   # Record execution metrics (default)
+DB_METRICS_RECORDING_ENABLED=false  # Disable execution metrics database writes
+```
+
+**What are execution metrics?**
+
+Each MCP operation (tool call, resource read, prompt get, etc.) records one database row with:
+
+- Entity ID (tool_id, resource_id, etc.)
+- Timestamp
+- Response time (seconds)
+- Success/failure status
+- Error message (if failed)
+- Interaction type (A2A metrics only)
+
+**When disabled:**
+
+- No new rows written to `ToolMetric`, `ResourceMetric`, `PromptMetric`, `ServerMetric`, `A2AAgentMetric` tables
+- Existing metrics remain queryable until cleanup removes them
+- Cleanup and rollup services still run (they process existing data)
+- Admin UI metrics pages show no new data
+
+**Use cases for disabling:**
+
+- External observability platforms handle all metrics (ELK, Datadog, Splunk, Grafana)
+- Minimal database footprint deployments
+- High-throughput environments where per-operation DB writes are costly
+
+**Related settings (separate systems):**
+
+| Setting | What it controls |
+|---------|------------------|
+| `METRICS_AGGREGATION_ENABLED` | Log aggregation into `PerformanceMetric` table |
+| `ENABLE_METRICS` | Prometheus `/metrics` endpoint |
+| `OBSERVABILITY_METRICS_ENABLED` | Internal observability system |
+
+To fully minimize metrics database writes, disable both:
+
+```bash
+DB_METRICS_RECORDING_ENABLED=false   # Disable execution metrics
+METRICS_AGGREGATION_ENABLED=false    # Disable log aggregation
+```
+
+### Metrics Cleanup and Rollup
+
+!!! tip "Automatic Metrics Management"
+    MCP Gateway automatically manages metrics data to prevent unbounded table growth while preserving historical analytics through hourly rollups.
+
+#### Understanding Raw vs Rollup Metrics
+
+**Raw metrics** store individual execution events (timestamp, response time, success/failure, error message). **Hourly rollups** aggregate these into summary statistics (counts, averages, p50/p95/p99 percentiles).
+
+| Use Case | Raw Metrics Needed? |
+|----------|---------------------|
+| Dashboard charts (latency percentiles) | No - rollups have p50/p95/p99 |
+| Error rate monitoring | No - rollups have success/failure counts |
+| Debugging specific failures | Yes - need exact error messages |
+| Identifying slowest requests | Yes - need individual rows |
+
+#### External Observability Integration
+
+If you use external observability platforms (ELK Stack, Datadog, Splunk, Grafana/Loki, CloudWatch, OpenTelemetry), raw metrics in the gateway database are typically redundant. Your external platform handles:
+
+- Detailed request logs and traces
+- Error message search and filtering
+- Individual request debugging
+- Compliance audit trails
+
+With external observability, the gateway's hourly rollups provide efficient aggregated analytics, while raw metrics can be deleted quickly (1 hour default).
+
+#### Configuration Reference
+
+**Cleanup Settings:**
+
+```bash
+METRICS_CLEANUP_ENABLED=true           # Enable automatic cleanup (default: true)
+METRICS_CLEANUP_INTERVAL_HOURS=1       # Hours between cleanup runs (default: 1)
+METRICS_RETENTION_DAYS=7               # Fallback retention when rollup disabled (default: 7)
+METRICS_CLEANUP_BATCH_SIZE=10000       # Batch size for deletion (default: 10000)
+```
+
+**Rollup Settings:**
+
+```bash
+METRICS_ROLLUP_ENABLED=true            # Enable hourly rollup (default: true)
+METRICS_ROLLUP_INTERVAL_HOURS=1        # Hours between rollup runs (default: 1)
+METRICS_ROLLUP_RETENTION_DAYS=365      # Rollup data retention (default: 365)
+METRICS_ROLLUP_LATE_DATA_HOURS=1       # Hours to re-process for late data (default: 1)
+```
+
+**Raw Metrics Deletion (when rollups exist):**
+
+```bash
+METRICS_DELETE_RAW_AFTER_ROLLUP=true   # Delete raw after rollup (default: true)
+METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS=1  # Hours before deletion (default: 1)
+```
+
+#### Configuration Examples
+
+**Default (recommended for most deployments):**
+Raw metrics deleted after 1 hour, hourly rollups retained for 1 year.
+
+**Without external observability (need debugging from raw data):**
+```bash
+METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS=168  # Keep raw data 7 days for debugging
+```
+
+**Disable raw deletion (compliance/audit requirements):**
+```bash
+METRICS_DELETE_RAW_AFTER_ROLLUP=false   # Keep all raw metrics
+METRICS_RETENTION_DAYS=90               # Delete raw after 90 days via cleanup
+```
+
+**Admin API Endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/metrics/cleanup` | POST | Trigger manual cleanup |
+| `/api/metrics/rollup` | POST | Trigger manual rollup |
+| `/api/metrics/stats` | GET | Get cleanup/rollup statistics |
+| `/api/metrics/config` | GET | Get current configuration |
+
+**Deletion behavior:**
+- Deleted tools/resources/prompts/servers are removed from Top Performers by default, but historical rollups remain for reporting.
+- To permanently erase metrics for a deleted entity, use the Admin UI delete prompt and choose **Purge metrics**, or call the delete endpoints with `?purge_metrics=true`.
+- Purge deletes use batched deletes sized by `METRICS_CLEANUP_BATCH_SIZE` to reduce long table locks on large datasets.
+
+See [ADR-030: Metrics Cleanup and Rollup](../architecture/adr/030-metrics-cleanup-rollup.md) for architecture details.
+
 ### Security Hardening
 
 ```bash

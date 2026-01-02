@@ -256,7 +256,7 @@ class TestToolService:
         # password = "test_password"
         # mock_tool.auth_value = "FpZyxAu5PVpT0FN-gJ0JUmdovCMS0emkwW1Vb8HvkhjiBZhj1gDgDRF1wcWNrjTJSLtkz1rLzKibXrhk4GbxXnV6LV4lSw_JDYZ2sPNRy68j_UKOJnf_"
         # mock_tool.auth_value = encode_auth({"user": "test_user", "password": "test_password"})
-        tool_read = tool_service._convert_tool_to_read(mock_tool)
+        tool_read = tool_service.convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "basic"
         assert tool_read.auth.username == "test_user"
@@ -270,7 +270,7 @@ class TestToolService:
         # Create auth_value with the following values
         # bearer token ABC123
         mock_tool.auth_value = encode_auth({"Authorization": "Bearer ABC123"})
-        tool_read = tool_service._convert_tool_to_read(mock_tool)
+        tool_read = tool_service.convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "bearer"
         assert tool_read.auth.token == "********"
@@ -284,11 +284,76 @@ class TestToolService:
         # {"test-api-key": "test-api-value"}
         # mock_tool.auth_value = "8pvPTCegaDhrx0bmBf488YvGg9oSo4cJJX68WCTvxjMY-C2yko_QSPGVggjjNt59TPvlGLsotTZvAiewPRQ"
         mock_tool.auth_value = encode_auth({"test-api-key": "test-api-value"})
-        tool_read = tool_service._convert_tool_to_read(mock_tool)
+        tool_read = tool_service.convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "authheaders"
         assert tool_read.auth.auth_header_key == "test-api-key"
         assert tool_read.auth.auth_header_value == "********"
+
+    @pytest.mark.asyncio
+    async def test_convert_tool_to_read_include_auth_false_skips_decode(self, tool_service, mock_tool):
+        """Verify include_auth=False skips decryption and returns minimal auth info."""
+        # Set up tool with encrypted basic auth
+        creds = base64.b64encode(b"test_user:test_password").decode()
+        auth_dict = {"Authorization": f"Basic {creds}"}
+        mock_tool.auth_type = "basic"
+        mock_tool.auth_value = encode_auth(auth_dict)
+
+        # Patch decode_auth to verify it's not called
+        with patch("mcpgateway.services.tool_service.decode_auth") as mock_decode:
+            tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=False)
+
+            # Verify decode_auth was NOT called
+            mock_decode.assert_not_called()
+
+            # Verify minimal auth info is returned
+            assert tool_read.auth is not None
+            assert tool_read.auth.auth_type == "basic"
+            # Other fields should be empty/default (not decrypted)
+            assert tool_read.auth.username == ""
+            assert tool_read.auth.password == ""
+
+    @pytest.mark.asyncio
+    async def test_convert_tool_to_read_include_auth_false_bearer(self, tool_service, mock_tool):
+        """Verify include_auth=False with bearer auth returns minimal auth info."""
+        mock_tool.auth_type = "bearer"
+        mock_tool.auth_value = encode_auth({"Authorization": "Bearer ABC123"})
+
+        with patch("mcpgateway.services.tool_service.decode_auth") as mock_decode:
+            tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=False)
+
+            mock_decode.assert_not_called()
+            assert tool_read.auth is not None
+            assert tool_read.auth.auth_type == "bearer"
+            assert tool_read.auth.token == ""
+
+    @pytest.mark.asyncio
+    async def test_convert_tool_to_read_oauth_no_auth_value(self, tool_service, mock_tool):
+        """Verify OAuth tools (auth_type set, auth_value=None) return auth=None."""
+        mock_tool.auth_type = "oauth"
+        mock_tool.auth_value = None
+
+        # Test with include_auth=True (detail view)
+        tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=True)
+        assert tool_read.auth is None
+
+        # Test with include_auth=False (list view)
+        tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=False)
+        assert tool_read.auth is None
+
+    @pytest.mark.asyncio
+    async def test_convert_tool_to_read_no_auth(self, tool_service, mock_tool):
+        """Verify tools with no auth return auth=None regardless of include_auth."""
+        mock_tool.auth_type = None
+        mock_tool.auth_value = None
+
+        # Test with include_auth=True
+        tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=True)
+        assert tool_read.auth is None
+
+        # Test with include_auth=False
+        tool_read = tool_service.convert_tool_to_read(mock_tool, include_auth=False)
+        assert tool_read.auth is None
 
     @pytest.mark.asyncio
     async def test_register_tool(self, tool_service, mock_tool, test_db):
@@ -303,7 +368,7 @@ class TestToolService:
 
         # Set up tool service methods
         tool_service._notify_tool_added = AsyncMock()
-        tool_service._convert_tool_to_read = Mock(
+        tool_service.convert_tool_to_read = Mock(
             return_value=ToolRead(
                 id="1",
                 original_name="test_tool",
@@ -583,64 +648,59 @@ class TestToolService:
                 "last_execution_time": None,
             },
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
-        # Mock DB to return a tuple of (tool, team_name) from LEFT JOIN
-        mock_row = MagicMock()
-        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
-        mock_row.team_name = None
-        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=[mock_row])))
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        # First call: fetch tools
+        # Second call (if tool has team_id): fetch team names
+        mock_tool.team_id = None  # No team, so no second query
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool])))))
+        test_db.commit = Mock()  # Mock commit to avoid errors
 
         # Call method
         result, next_cursor = await tool_service.list_tools(test_db)
 
-        # Verify DB query: should be called once (LEFT JOIN optimization)
-        assert test_db.execute.call_count == 1
+        # Verify DB query was called
+        assert test_db.execute.called
 
         # Verify result
         assert len(result) == 1
         assert result[0] == tool_read
         assert next_cursor is None  # No pagination needed for single result
-        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False)
+        tool_service.convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False, include_auth=False)
 
     @pytest.mark.asyncio
-    async def test_list_tools_for_user_pagination(self, tool_service, test_db, monkeypatch):
-        """Test list_tools_for_user returns next_cursor when page size is exceeded."""
+    async def test_list_tools_pagination(self, tool_service, test_db, monkeypatch):
+        """Test list_tools returns next_cursor when page size is exceeded."""
         monkeypatch.setattr(settings, "pagination_default_page_size", 1)
 
-        tool_1 = MagicMock(spec=DbTool, id="1")
-        tool_2 = MagicMock(spec=DbTool, id="2")
+        tool_1 = MagicMock(spec=DbTool, id="1", team_id=None)
+        tool_2 = MagicMock(spec=DbTool, id="2", team_id=None)
 
-        row_1 = MagicMock()
-        row_1.__getitem__ = lambda self, idx: tool_1 if idx == 0 else None
-        row_1.team_name = None
-
-        row_2 = MagicMock()
-        row_2.__getitem__ = lambda self, idx: tool_2 if idx == 0 else None
-        row_2.team_name = None
-
-        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=[row_1, row_2])))
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[tool_1, tool_2])))))
+        test_db.commit = Mock()
 
         mock_team = MagicMock(id="team-1", is_personal=True)
         with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
             mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
-            tool_service._convert_tool_to_read = Mock(side_effect=[MagicMock(), MagicMock()])
+            tool_service.convert_tool_to_read = Mock(side_effect=[MagicMock(), MagicMock()])
 
-            result, next_cursor = await tool_service.list_tools_for_user(test_db, user_email="user@example.com", team_id="team-1")
+            result, next_cursor = await tool_service.list_tools(test_db, user_email="user@example.com", team_id="team-1")
 
         assert len(result) == 1
         assert next_cursor is not None
         assert decode_cursor(next_cursor)["id"] == "1"
 
     @pytest.mark.asyncio
-    async def test_list_tools_for_user_denies_unknown_team(self, tool_service, test_db):
-        """Test list_tools_for_user returns empty when user lacks team membership."""
+    async def test_list_tools_denies_unknown_team(self, tool_service, test_db):
+        """Test list_tools returns empty when user lacks team membership."""
         test_db.execute = Mock()
         mock_team = MagicMock(id="other-team", is_personal=True)
 
         with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
             mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
-            result, next_cursor = await tool_service.list_tools_for_user(test_db, user_email="user@example.com", team_id="team-1")
+            result, next_cursor = await tool_service.list_tools(test_db, user_email="user@example.com", team_id="team-1")
 
         assert result == []
         assert next_cursor is None
@@ -652,16 +712,13 @@ class TestToolService:
         monkeypatch.setattr(settings, "pagination_default_page_size", 50)
         monkeypatch.setattr(settings, "pagination_max_page_size", 500)
 
-        tools = [MagicMock(spec=DbTool, id=str(i)) for i in range(150)]
-        rows = []
-        for tool in tools:
-            row = MagicMock()
-            row.__getitem__ = lambda self, idx, t=tool: t if idx == 0 else None
-            row.team_name = None
-            rows.append(row)
+        tools = [MagicMock(spec=DbTool, id=str(i), team_id=None) for i in range(150)]
 
-        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=rows[:101])))  # 100 + 1 for has_more check
-        tool_service._convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        # unified_paginate fetches limit+1 to check if there are more results
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=tools[:101])))))
+        test_db.commit = Mock()
+        tool_service.convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
 
         result, next_cursor = await tool_service.list_tools(test_db, limit=100)
 
@@ -673,16 +730,12 @@ class TestToolService:
         """Test list_tools with limit=0 returns all tools without pagination."""
         monkeypatch.setattr(settings, "pagination_default_page_size", 50)
 
-        tools = [MagicMock(spec=DbTool, id=str(i)) for i in range(200)]
-        rows = []
-        for tool in tools:
-            row = MagicMock()
-            row.__getitem__ = lambda self, idx, t=tool: t if idx == 0 else None
-            row.team_name = None
-            rows.append(row)
+        tools = [MagicMock(spec=DbTool, id=str(i), team_id=None) for i in range(200)]
 
-        test_db.execute = Mock(return_value=MagicMock(all=Mock(return_value=rows)))
-        tool_service._convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=tools)))))
+        test_db.commit = Mock()
+        tool_service.convert_tool_to_read = Mock(side_effect=lambda t, **kw: MagicMock())
 
         result, next_cursor = await tool_service.list_tools(test_db, limit=0)
 
@@ -694,11 +747,11 @@ class TestToolService:
         """Test listing tools."""
         # Mock DB to return a tuple of (tool, team_name) from LEFT JOIN
         mock_tool.enabled = False
-        mock_row = MagicMock()
-        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
-        mock_row.team_name = None
-        mock_execute = Mock(return_value=MagicMock(all=Mock(return_value=[mock_row])))
-        test_db.execute = mock_execute
+        mock_tool.team_id = None
+
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool])))))
+        test_db.commit = Mock()
 
         # Mock conversion
         tool_read = ToolRead(
@@ -734,18 +787,18 @@ class TestToolService:
             customName="test_tool",
             customNameSlug="test-tool",
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Call method
         result, _ = await tool_service.list_tools(test_db, include_inactive=True)
 
-        # Verify DB query: should be called once (LEFT JOIN optimization)
-        assert test_db.execute.call_count == 1
+        # Verify DB query was called
+        assert test_db.execute.called
 
         # Verify result
         assert len(result) == 1
         assert result[0] == tool_read
-        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False)
+        tool_service.convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False, include_auth=False)
 
     @pytest.mark.asyncio
     async def test_list_server_tools_active_only(self):
@@ -758,12 +811,12 @@ class TestToolService:
         mock_db.execute.return_value.all.return_value = [mock_row]
 
         service = ToolService()
-        service._convert_tool_to_read = Mock(return_value="converted_tool")
+        service.convert_tool_to_read = Mock(return_value="converted_tool")
 
         tools = await service.list_server_tools(mock_db, server_id="server123", include_inactive=False)
 
         assert tools == ["converted_tool"]
-        service._convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False)
+        service.convert_tool_to_read.assert_called_once_with(mock_tool, include_metrics=False, include_auth=False)
 
     @pytest.mark.asyncio
     async def test_list_server_tools_include_inactive(self):
@@ -782,12 +835,12 @@ class TestToolService:
         mock_db.execute.return_value.all.return_value = [active_row, inactive_row]
 
         service = ToolService()
-        service._convert_tool_to_read = Mock(side_effect=["active_converted", "inactive_converted"])
+        service.convert_tool_to_read = Mock(side_effect=["active_converted", "inactive_converted"])
 
         tools = await service.list_server_tools(mock_db, server_id="server123", include_inactive=True)
 
         assert tools == ["active_converted", "inactive_converted"]
-        assert service._convert_tool_to_read.call_count == 2
+        assert service.convert_tool_to_read.call_count == 2
 
     @pytest.mark.asyncio
     async def test_get_tool(self, tool_service, mock_tool, test_db):
@@ -829,7 +882,7 @@ class TestToolService:
             customName="test_tool",
             customNameSlug="test-tool",
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Call method
         result = await tool_service.get_tool(test_db, 1)
@@ -839,7 +892,7 @@ class TestToolService:
 
         # Verify result
         assert result == tool_read
-        tool_service._convert_tool_to_read.assert_called_once_with(mock_tool)
+        tool_service.convert_tool_to_read.assert_called_once_with(mock_tool)
 
     @pytest.mark.asyncio
     async def test_get_tool_not_found(self, tool_service, test_db):
@@ -874,6 +927,21 @@ class TestToolService:
 
         # Verify notification
         tool_service._notify_tool_deleted.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_tool_purge_metrics(self, tool_service, mock_tool, test_db):
+        """Test deleting a tool with metric purge."""
+        test_db.get = Mock(return_value=mock_tool)
+        test_db.delete = Mock()
+        test_db.commit = Mock()
+        test_db.execute = Mock()
+        tool_service._notify_tool_deleted = AsyncMock()
+
+        await tool_service.delete_tool(test_db, 1, purge_metrics=True)
+
+        assert test_db.execute.call_count == 2
+        test_db.delete.assert_called_once_with(mock_tool)
+        test_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_delete_tool_not_found(self, tool_service, test_db):
@@ -933,7 +1001,7 @@ class TestToolService:
                 "last_execution_time": None,
             },
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Deactivate the tool (it's active by default)
         result = await tool_service.toggle_tool_status(test_db, 1, activate=False, reachable=True)
@@ -1089,7 +1157,7 @@ class TestToolService:
                 "last_execution_time": None,
             },
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Deactivate the tool (it's active by default)
         result = await tool_service.toggle_tool_status(test_db, 1, activate=True, reachable=True)
@@ -1160,7 +1228,7 @@ class TestToolService:
                 "last_execution_time": None,
             },
         )
-        tool_service._convert_tool_to_read = Mock(return_value=tool_read)
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Create update request
         tool_update = ToolUpdate(
@@ -1892,8 +1960,8 @@ class TestToolService:
         # Reset all metrics
         await tool_service.reset_metrics(test_db)
 
-        # Verify DB operations
-        test_db.execute.assert_called_once()
+        # Verify DB operations (raw + hourly rollups)
+        assert test_db.execute.call_count == 2
         test_db.commit.assert_called_once()
 
         # Reset metrics for specific tool
@@ -1902,8 +1970,8 @@ class TestToolService:
 
         await tool_service.reset_metrics(test_db, tool_id=1)
 
-        # Verify DB operations with tool_id
-        test_db.execute.assert_called_once()
+        # Verify DB operations with tool_id (raw + hourly rollups)
+        assert test_db.execute.call_count == 2
         test_db.commit.assert_called_once()
 
     async def test_record_tool_metric(self, tool_service, mock_tool):
@@ -1962,59 +2030,66 @@ class TestToolService:
 
     @pytest.mark.asyncio
     async def test_aggregate_metrics(self, tool_service):
-        """Test aggregating metrics across all tools."""
+        """Test aggregating metrics across all tools using combined raw + rollup query."""
+        from unittest.mock import patch
+        from mcpgateway.services.metrics_query_service import AggregatedMetrics
+
         # Mock database
         mock_db = MagicMock()
 
-        # Create a mock object that behaves like the SQLAlchemy Row result
-        # The new implementation calls .one() and accesses attributes .total, .successful, etc.
-        mock_row = MagicMock()
-        mock_row.total = 10
-        mock_row.successful = 8
-        mock_row.failed = 2
-        mock_row.min_rt = 0.5
-        mock_row.max_rt = 5.0
-        mock_row.avg_rt = 2.3
-        mock_row.last_time = "2025-01-10T12:00:00"
+        # Create a mock AggregatedMetrics result
+        mock_result = AggregatedMetrics(
+            total_executions=10,
+            successful_executions=8,
+            failed_executions=2,
+            failure_rate=0.2,
+            min_response_time=0.5,
+            max_response_time=5.0,
+            avg_response_time=2.3,
+            last_execution_time="2025-01-10T12:00:00",
+            raw_count=6,
+            rollup_count=4,
+        )
 
-        # Setup the chain: db.execute(...).one() -> returns the mock_row
-        mock_db.execute.return_value.one.return_value = mock_row
-
-        result = await tool_service.aggregate_metrics(mock_db)
+        with patch("mcpgateway.services.metrics_query_service.aggregate_metrics_combined", return_value=mock_result):
+            result = await tool_service.aggregate_metrics(mock_db)
 
         assert result == {
             "total_executions": 10,
             "successful_executions": 8,
             "failed_executions": 2,
-            "failure_rate": 0.2,  # 2/10
+            "failure_rate": 0.2,
             "min_response_time": 0.5,
             "max_response_time": 5.0,
             "avg_response_time": 2.3,
             "last_execution_time": "2025-01-10T12:00:00",
         }
 
-        # Verify only 1 query was executed (optimization check)
-        assert mock_db.execute.call_count == 1
-
     @pytest.mark.asyncio
     async def test_aggregate_metrics_no_data(self, tool_service):
         """Test aggregating metrics when no data exists."""
+        from unittest.mock import patch
+        from mcpgateway.services.metrics_query_service import AggregatedMetrics
+
         # Mock database
         mock_db = MagicMock()
 
-        # Create a mock object for empty results (None values)
-        mock_row = MagicMock()
-        mock_row.total = 0
-        mock_row.successful = 0
-        mock_row.failed = 0
-        mock_row.min_rt = None
-        mock_row.max_rt = None
-        mock_row.avg_rt = None
-        mock_row.last_time = None
+        # Create a mock AggregatedMetrics result with no data
+        mock_result = AggregatedMetrics(
+            total_executions=0,
+            successful_executions=0,
+            failed_executions=0,
+            failure_rate=0.0,
+            min_response_time=None,
+            max_response_time=None,
+            avg_response_time=None,
+            last_execution_time=None,
+            raw_count=0,
+            rollup_count=0,
+        )
 
-        mock_db.execute.return_value.one.return_value = mock_row
-
-        result = await tool_service.aggregate_metrics(mock_db)
+        with patch("mcpgateway.services.metrics_query_service.aggregate_metrics_combined", return_value=mock_result):
+            result = await tool_service.aggregate_metrics(mock_db)
 
         assert result == {
             "total_executions": 0,
@@ -2026,9 +2101,6 @@ class TestToolService:
             "avg_response_time": None,
             "last_execution_time": None,
         }
-
-        # Verify optimization
-        assert mock_db.execute.call_count == 1
 
     async def test_validate_tool_url_success(self, tool_service):
         """Test successful tool URL validation."""
@@ -2126,30 +2198,47 @@ class TestToolService:
     @pytest.mark.asyncio
     async def test_get_top_tools(self, tool_service, test_db):
         """Test get_top_tools method."""
-        # Mock database query result
-        mock_results = [
-            (1, "tool1", 10, 1.5, 90.0, "2024-01-01T12:00:00"),
-            (2, "tool2", 5, 2.0, 80.0, "2024-01-02T12:00:00"),
-        ]
+        # Mock the combined query results (TopPerformerResult objects)
+        mock_performer1 = MagicMock()
+        mock_performer1.id = "1"
+        mock_performer1.name = "tool1"
+        mock_performer1.execution_count = 10
+        mock_performer1.avg_response_time = 1.5
+        mock_performer1.success_rate = 90.0
+        mock_performer1.last_execution = "2024-01-01T12:00:00"
 
-        # Mock the execute method on the test_db (which is likely a MagicMock)
-        test_db.execute = MagicMock()
-        test_db.execute.return_value.all.return_value = mock_results
+        mock_performer2 = MagicMock()
+        mock_performer2.id = "2"
+        mock_performer2.name = "tool2"
+        mock_performer2.execution_count = 5
+        mock_performer2.avg_response_time = 2.0
+        mock_performer2.success_rate = 80.0
+        mock_performer2.last_execution = "2024-01-02T12:00:00"
 
-        with patch("mcpgateway.services.tool_service.build_top_performers") as mock_build:
-            mock_build.return_value = ["top_performer1", "top_performer2"]
+        mock_combined_results = [mock_performer1, mock_performer2]
 
-            # Run the method
-            result = await tool_service.get_top_tools(test_db, limit=5)
+        # tool_service imports at top-level, so patch where it's used
+        with patch("mcpgateway.services.tool_service.get_top_performers_combined") as mock_combined:
+            mock_combined.return_value = mock_combined_results
 
-            # Assert the result is as expected
-            assert result == ["top_performer1", "top_performer2"]
+            with patch("mcpgateway.services.tool_service.build_top_performers") as mock_build:
+                mock_build.return_value = ["top_performer1", "top_performer2"]
 
-            # Assert build_top_performers was called with the mock results
-            mock_build.assert_called_once_with(mock_results)
+                # Run the method
+                result = await tool_service.get_top_tools(test_db, limit=5)
 
-            # Verify that the execute method was called once
-            test_db.execute.assert_called_once()
+                # Assert the result is as expected
+                assert result == ["top_performer1", "top_performer2"]
+
+                # Assert get_top_performers_combined was called with correct params
+                mock_combined.assert_called_once()
+                call_kwargs = mock_combined.call_args[1]
+                assert call_kwargs["metric_type"] == "tool"
+                assert call_kwargs["limit"] == 5
+                assert call_kwargs["include_deleted"] is False
+
+                # Assert build_top_performers was called with the combined results
+                mock_build.assert_called_once_with(mock_combined_results)
 
     @pytest.mark.asyncio
     async def test_list_tools_with_tags(self, tool_service, mock_tool):
@@ -2164,16 +2253,18 @@ class TestToolService:
 
         session = MagicMock()
 
-        # Mock LEFT JOIN row result
-        mock_row = MagicMock()
-        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
-        mock_row.team_name = "test-team"
-        session.execute.return_value.all.return_value = [mock_row]
+        # Mock DB execute chain for unified_paginate: execute().scalars().all()
+        mock_tool.team_id = None
+        session.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool])))))
+        session.commit = Mock()
 
         bind = MagicMock()
         bind.dialect = MagicMock()
         bind.dialect.name = "sqlite"  # or "postgresql" or "mysql"
         session.get_bind.return_value = bind
+
+        # Mock convert_tool_to_read
+        tool_service.convert_tool_to_read = Mock(return_value=MagicMock())
 
         with patch("mcpgateway.services.tool_service.select", return_value=mock_query):
             with patch("mcpgateway.services.tool_service.json_contains_expr") as mock_json_contains:
@@ -2181,7 +2272,7 @@ class TestToolService:
                 fake_condition = MagicMock()
                 mock_json_contains.return_value = fake_condition
 
-                result, _ = await tool_service.list_tools(session, tags=["test", "production"])
+                result, _ = await tool_service.list_tools(session, tags=["test", "production"], include_inactive=True)
 
                 # json_contains_expr should be called once with the tags list
                 mock_json_contains.assert_called_once()
@@ -2686,12 +2777,24 @@ class TestToolService:
 #                               extract_using_jq                              #
 # --------------------------------------------------------------------------- #
 def test_extract_using_jq_happy_path():
-    data = {"a": 123}
+    """Test jq filter extraction works correctly with caching."""
+    from mcpgateway.services.tool_service import _compile_jq_filter
 
-    with patch("mcpgateway.services.tool_service.jq.all", return_value=[123]) as mock_jq:
-        out = extract_using_jq(data, ".a")
-        mock_jq.assert_called_once_with(".a", data)
-        assert out == [123]
+    # Clear cache for clean test state
+    _compile_jq_filter.cache_clear()
+
+    data = {"a": 123, "b": 456}
+
+    # Test actual behavior (no mocking)
+    result = extract_using_jq(data, ".a")
+    assert result == [123]
+
+    # Verify caching works
+    result2 = extract_using_jq({"a": 999}, ".a")
+    assert result2 == [999]
+
+    info = _compile_jq_filter.cache_info()
+    assert info.hits == 1  # Second call hit cache
 
 
 def test_extract_using_jq_short_circuits_and_errors():
@@ -2704,3 +2807,68 @@ def test_extract_using_jq_short_circuits_and_errors():
 
     # Unsupported input type
     assert extract_using_jq(42, ".foo") == ["Input data must be a JSON string, dictionary, or list."]
+
+
+# --------------------------------------------------------------------------- #
+#                         Cache Behavior Tests                                #
+# --------------------------------------------------------------------------- #
+
+
+class TestJqFilterCaching:
+    """Tests for jq filter caching (#1813)."""
+
+    def test_jq_caching_works(self):
+        """Verify jq filter compilation is cached."""
+        from mcpgateway.services.tool_service import _compile_jq_filter
+
+        _compile_jq_filter.cache_clear()
+
+        result1 = extract_using_jq({"a": 1}, ".a")
+        assert result1 == [1]
+
+        result2 = extract_using_jq({"a": 99}, ".a")
+        assert result2 == [99]
+
+        info = _compile_jq_filter.cache_info()
+        assert info.hits == 1
+
+    def test_empty_filter_bypasses_cache(self):
+        """Empty filter should return data directly without caching."""
+        data = {"x": "y"}
+        result = extract_using_jq(data, "")
+        assert result is data
+
+
+class TestSchemaValidatorCaching:
+    """Tests for JSON Schema validator caching (#1809)."""
+
+    def test_schema_caching_works(self):
+        """Verify schema validation uses cached validator class."""
+        from mcpgateway.services.tool_service import _get_validator_class_and_check, _canonicalize_schema
+
+        _get_validator_class_and_check.cache_clear()
+
+        schema = {"type": "object", "properties": {"foo": {"type": "string"}}}
+        schema_json = _canonicalize_schema(schema)
+
+        cls1, s1 = _get_validator_class_and_check(schema_json)
+        cls2, s2 = _get_validator_class_and_check(schema_json)
+
+        assert cls1 is cls2
+
+        info = _get_validator_class_and_check.cache_info()
+        assert info.hits == 1
+
+    def test_validation_still_works(self):
+        """Verify cached validation still catches errors."""
+        from mcpgateway.services.tool_service import _validate_with_cached_schema
+        import jsonschema
+
+        schema = {"type": "object", "properties": {"foo": {"type": "string"}}, "required": ["foo"]}
+
+        # Valid instance
+        _validate_with_cached_schema({"foo": "bar"}, schema)
+
+        # Invalid instance
+        with pytest.raises(jsonschema.ValidationError):
+            _validate_with_cached_schema({"foo": 123}, schema)

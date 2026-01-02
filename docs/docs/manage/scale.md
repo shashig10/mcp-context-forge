@@ -4,7 +4,9 @@
 
 ## Overview
 
-MCP Gateway is designed to scale from single-container development environments to distributed multi-node production deployments. This guide covers:
+MCP Gateway is designed to scale from single-container development environments to distributed multi-node production deployments. For a visual overview of the high-performance architecture including Rust-powered components, see the [Performance Architecture Diagram](../architecture/performance-architecture.md).
+
+This guide covers:
 
 - **Vertical Scaling**: Optimizing single-instance performance with Gunicorn workers
 - **Horizontal Scaling**: Multi-container deployments with shared state
@@ -2008,6 +2010,17 @@ CACHE_TYPE=redis
 - True horizontal scaling
 - Automatic failover
 
+#### Session Cleanup Performance
+
+For high session counts, MCP Gateway uses parallel session cleanup with bounded concurrency to efficiently manage database-backed sessions:
+
+- Uses `asyncio.gather()` with semaphore for parallel database operations
+- Default concurrency limit of 20 prevents DB pool exhaustion
+- Achieves 11-13x speedup over sequential cleanup
+- Runs automatically every 5 minutes
+
+See [Parallel Session Cleanup](parallel-session-cleanup.md) for implementation details.
+
 ### Long-Running Connections
 
 MCP Gateway supports long-running connections for streaming:
@@ -2490,6 +2503,7 @@ MCP Gateway is built on a high-performance foundation:
 
 ### Reference Documentation
 
+- [Performance Architecture Diagram](../architecture/performance-architecture.md)
 - [Gunicorn Configuration](../deployment/local.md)
 - [Kubernetes Deployment](../deployment/kubernetes.md)
 - [Helm Charts](../deployment/helm.md)

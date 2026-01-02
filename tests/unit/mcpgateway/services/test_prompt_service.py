@@ -125,6 +125,23 @@ def _patch_promptread(monkeypatch):
     monkeypatch.setattr(PromptRead, "model_validate", staticmethod(lambda d: d))
 
 
+@pytest.fixture(autouse=True)
+def reset_jinja_singleton():
+    """Reset the module-level Jinja environment singleton before each test.
+
+    This is needed because PromptService now uses a shared singleton for
+    the Jinja environment (for caching), so tests that modify the environment
+    can affect subsequent tests.
+    """
+    import mcpgateway.services.prompt_service as ps
+
+    ps._JINJA_ENV = None
+    ps._compile_jinja_template.cache_clear()
+    yield
+    ps._JINJA_ENV = None
+    ps._compile_jinja_template.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # main service fixture
 # ---------------------------------------------------------------------------
@@ -425,6 +442,21 @@ class TestPromptService:
         test_db.delete.assert_called_once_with(p)
         prompt_service._notify_prompt_deleted.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_delete_prompt_purge_metrics(self, prompt_service, test_db):
+        p = _build_db_prompt()
+        test_db.get = Mock(return_value=p)
+        test_db.delete = Mock()
+        test_db.commit = Mock()
+        test_db.execute = Mock()
+        prompt_service._notify_prompt_deleted = AsyncMock()
+
+        await prompt_service.delete_prompt(test_db, 1, purge_metrics=True)
+
+        assert test_db.execute.call_count == 2
+        test_db.delete.assert_called_once_with(p)
+        test_db.commit.assert_called_once()
+
 
     @pytest.mark.asyncio
     async def test_delete_prompt_not_found(self, prompt_service, test_db):
@@ -493,15 +525,20 @@ class TestPromptService:
         assert "code" in required
 
     def test_render_template_fallback_and_error(self, prompt_service):
-        # Patch jinja_env.from_string to raise
-        prompt_service._jinja_env.from_string = Mock(side_effect=Exception("bad"))
-        # Fallback to format
-        template = "Hello, {name}!"
-        result = prompt_service._render_template(template, {"name": "Alice"})
-        assert result == "Hello, Alice!"
-        # Format also fails
-        with pytest.raises(PromptError):
-            prompt_service._render_template(template, {})
+        # Patch _compile_jinja_template to return a template that fails on render
+        with patch("mcpgateway.services.prompt_service._compile_jinja_template") as mock_compile:
+            mock_template = MagicMock()
+            mock_template.render.side_effect = Exception("bad")
+            mock_compile.return_value = mock_template
+
+            # Fallback to format
+            template = "Hello, {name}!"
+            result = prompt_service._render_template(template, {"name": "Alice"})
+            assert result == "Hello, Alice!"
+
+            # Format also fails
+            with pytest.raises(PromptError):
+                prompt_service._render_template(template, {})
 
     def test_parse_messages_roles(self, prompt_service):
         text = "# User:\nHello\n# Assistant:\nHi!"
@@ -515,31 +552,34 @@ class TestPromptService:
 
     @pytest.mark.asyncio
     async def test_aggregate_and_reset_metrics(self, prompt_service, test_db):
-        # Mock a single aggregated query result with .one() call
-        mock_result = MagicMock()
-        mock_result.total_executions = 10
-        mock_result.successful_executions = 8
-        mock_result.failed_executions = 2
-        mock_result.min_response_time = 0.1
-        mock_result.max_response_time = 0.9
-        mock_result.avg_response_time = 0.5
-        mock_result.last_execution_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        # Mock aggregate_metrics_combined to return a proper AggregatedMetrics result
+        from mcpgateway.services.metrics_query_service import AggregatedMetrics
 
-        execute_result = MagicMock()
-        execute_result.one.return_value = mock_result
-        test_db.execute = Mock(return_value=execute_result)
+        mock_result = AggregatedMetrics(
+            total_executions=10,
+            successful_executions=8,
+            failed_executions=2,
+            failure_rate=0.2,
+            min_response_time=0.1,
+            max_response_time=0.9,
+            avg_response_time=0.5,
+            last_execution_time="2025-01-01T00:00:00+00:00",
+            raw_count=6,
+            rollup_count=4,
+        )
 
-        metrics = await prompt_service.aggregate_metrics(test_db)
-        assert metrics["total_executions"] == 10
-        assert metrics["successful_executions"] == 8
-        assert metrics["failed_executions"] == 2
-        assert metrics["failure_rate"] == 0.2
+        with patch("mcpgateway.services.metrics_query_service.aggregate_metrics_combined", return_value=mock_result):
+            metrics = await prompt_service.aggregate_metrics(test_db)
+            assert metrics["total_executions"] == 10
+            assert metrics["successful_executions"] == 8
+            assert metrics["failed_executions"] == 2
+            assert metrics["failure_rate"] == 0.2
 
         # reset_metrics
         test_db.execute = Mock()
         test_db.commit = Mock()
         await prompt_service.reset_metrics(test_db)
-        test_db.execute.assert_called()
+        assert test_db.execute.call_count == 2
         test_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
@@ -581,3 +621,61 @@ class TestPromptService:
                 # finally, your service should return the list produced by mock_db.execute(...)
                 assert isinstance(result, list)
                 assert len(result) == 1
+
+
+# --------------------------------------------------------------------------- #
+#                         Cache Behavior Tests                                #
+# --------------------------------------------------------------------------- #
+
+
+class TestJinjaTemplateCaching:
+    """Tests for Jinja template caching (#1814)."""
+
+    def test_template_caching_works(self):
+        """Verify template compilation is cached across renders."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+        template = "Hello {{ name }}"
+
+        result1 = service._render_template(template, {"name": "World"})
+        assert result1 == "Hello World"
+
+        result2 = service._render_template(template, {"name": "Claude"})
+        assert result2 == "Hello Claude"
+
+        info = _compile_jinja_template.cache_info()
+        assert info.hits == 1
+        assert info.misses == 1
+
+    def test_different_templates_cached_separately(self):
+        """Verify different templates get separate cache entries."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+
+        result1 = service._render_template("Hello {{ name }}", {"name": "A"})
+        result2 = service._render_template("Goodbye {{ name }}", {"name": "B"})
+
+        assert result1 == "Hello A"
+        assert result2 == "Goodbye B"
+
+        info = _compile_jinja_template.cache_info()
+        assert info.misses == 2  # Two different templates
+
+    def test_format_fallback_still_works(self):
+        """Verify Python format() fallback works when Jinja render fails."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+
+        # Mock _compile_jinja_template to return a template that fails on render
+        with patch("mcpgateway.services.prompt_service._compile_jinja_template") as mock_compile:
+            mock_template = MagicMock()
+            mock_template.render.side_effect = Exception("Jinja render error")
+            mock_compile.return_value = mock_template
+
+            # Should fall back to Python format()
+            template = "Hello, {name}!"
+            result = service._render_template(template, {"name": "Alice"})
+            assert result == "Hello, Alice!"

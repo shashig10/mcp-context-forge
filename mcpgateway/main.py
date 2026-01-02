@@ -29,6 +29,7 @@ Structure:
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
+from functools import lru_cache
 import json
 import os as _os  # local alias to avoid collisions
 import sys
@@ -86,6 +87,12 @@ from mcpgateway.schemas import (
     A2AAgentCreate,
     A2AAgentRead,
     A2AAgentUpdate,
+    CursorPaginatedA2AAgentsResponse,
+    CursorPaginatedGatewaysResponse,
+    CursorPaginatedPromptsResponse,
+    CursorPaginatedResourcesResponse,
+    CursorPaginatedServersResponse,
+    CursorPaginatedToolsResponse,
     GatewayCreate,
     GatewayRead,
     GatewayUpdate,
@@ -278,10 +285,26 @@ def get_user_email(user):
 resource_cache = ResourceCache(max_size=settings.resource_cache_size, ttl=settings.resource_cache_ttl)
 
 
+@lru_cache(maxsize=512)
+def _parse_jsonpath(jsonpath: str) -> JSONPath:
+    """Cache parsed JSONPath expression.
+
+    Args:
+        jsonpath: The JSONPath expression string.
+
+    Returns:
+        Parsed JSONPath object.
+
+    Raises:
+        Exception: If the JSONPath expression is invalid.
+    """
+    return parse(jsonpath)
+
+
 def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict[str, str]] = None) -> Union[List, Dict]:
     """
     Applies the given JSONPath expression and mappings to the data.
-    Only return data that is required by the user dynamically.
+    Uses cached parsed expressions for performance.
 
     Args:
         data: The JSON data to query.
@@ -309,7 +332,7 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
         jsonpath = "$[*]"
 
     try:
-        main_expr: JSONPath = parse(jsonpath)
+        main_expr: JSONPath = _parse_jsonpath(jsonpath)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid main JSONPath expression: {e}")
 
@@ -331,8 +354,8 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
 
 def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> list[Any]:
     """
-    Applies the given JSONPath expression and mappings to the data.
-    Only return data that is required by the user dynamically.
+    Applies mappings to data using cached JSONPath expressions.
+    Parses each mapping expression once per call, not per item.
 
     Args:
         data: The set of data to apply mappings to.
@@ -348,16 +371,18 @@ def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> l
         >>> transform_data_with_mappings([{'first_name': "Bruce", 'second_name': "Wayne"},{'first_name': "Diana", 'second_name': "Prince"}], {"n": "$.first_name"})
         [{'n': 'Bruce'}, {'n': 'Diana'}]
     """
+    # Pre-parse all mapping expressions once (not per item)
+    parsed_mappings: Dict[str, JSONPath] = {}
+    for new_key, mapping_expr_str in mappings.items():
+        try:
+            parsed_mappings[new_key] = _parse_jsonpath(mapping_expr_str)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
 
     mapped_results = []
     for item in data:
         mapped_item = {}
-        for new_key, mapping_expr_str in mappings.items():
-            try:
-                mapping_expr = parse(mapping_expr_str)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
-
+        for new_key, mapping_expr in parsed_mappings.items():
             try:
                 mapping_matches = mapping_expr.find(item)
             except Exception as e:
@@ -476,7 +501,28 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             metrics_buffer_service = get_metrics_buffer_service()
             await metrics_buffer_service.start()
-            logger.info("Metrics buffer service initialized")
+            if settings.db_metrics_recording_enabled:
+                logger.info("Metrics buffer service initialized")
+            else:
+                logger.info("Metrics buffer service initialized (recording disabled)")
+
+        # Initialize metrics cleanup service for automatic deletion of old metrics
+        if settings.metrics_cleanup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_cleanup_service import get_metrics_cleanup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_cleanup_service = get_metrics_cleanup_service()
+            await metrics_cleanup_service.start()
+            logger.info("Metrics cleanup service initialized (retention: %d days)", settings.metrics_retention_days)
+
+        # Initialize metrics rollup service for hourly aggregation
+        if settings.metrics_rollup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_rollup_service import get_metrics_rollup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_rollup_service = get_metrics_rollup_service()
+            await metrics_rollup_service.start()
+            logger.info("Metrics rollup service initialized (interval: %dh)", settings.metrics_rollup_interval_hours)
 
         refresh_slugs_on_startup()
 
@@ -602,6 +648,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             metrics_buffer_service = get_metrics_buffer_service()
             services_to_shutdown.insert(0, metrics_buffer_service)  # Shutdown first to flush metrics
+
+        # Add metrics rollup service if enabled (shutdown before cleanup)
+        if settings.metrics_rollup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_rollup_service import get_metrics_rollup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_rollup_service = get_metrics_rollup_service()
+            services_to_shutdown.insert(1, metrics_rollup_service)
+
+        # Add metrics cleanup service if enabled
+        if settings.metrics_cleanup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_cleanup_service import get_metrics_cleanup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_cleanup_service = get_metrics_cleanup_service()
+            services_to_shutdown.insert(2, metrics_cleanup_service)
 
         await shutdown_services(services_to_shutdown)
 
@@ -1280,9 +1342,7 @@ if plugin_manager:
 # IMPORTANT: Must be registered BEFORE CorrelationIDMiddleware so it executes AFTER correlation ID is set
 # Gateway boundary logging (request_started/completed) runs regardless of log_requests setting
 # Detailed payload logging only runs if log_detailed_requests=True
-app.add_middleware(
-    RequestLoggingMiddleware, enable_gateway_logging=True, log_detailed_requests=settings.log_requests, log_level=settings.log_level, max_body_size=settings.log_max_size_mb * 1024 * 1024
-)  # Convert MB to bytes
+app.add_middleware(RequestLoggingMiddleware, enable_gateway_logging=True, log_detailed_requests=settings.log_requests, log_level=settings.log_level, max_body_size=settings.log_detailed_max_body_size)
 
 # Add custom DocsAuthMiddleware
 app.add_middleware(DocsAuthMiddleware)
@@ -1769,23 +1829,29 @@ async def handle_sampling(request: Request, db: Session = Depends(get_db), user=
 ###############
 # Server APIs #
 ###############
-@server_router.get("", response_model=List[ServerRead])
-@server_router.get("/", response_model=List[ServerRead])
+@server_router.get("", response_model=Union[List[ServerRead], CursorPaginatedServersResponse])
+@server_router.get("/", response_model=Union[List[ServerRead], CursorPaginatedServersResponse])
 @require_permission("servers.read")
 async def list_servers(
     request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of servers to return"),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> List[ServerRead]:
+) -> Union[List[ServerRead], Dict[str, Any]]:
     """
-    Lists servers accessible to the user, with team filtering support.
+    Lists servers accessible to the user, with team filtering and cursor pagination support.
 
     Args:
         request (Request): The incoming request object for team_id retrieval.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of servers to return.
         include_inactive (bool): Whether to include inactive servers in the response.
         tags (Optional[str]): Comma-separated list of tags to filter by.
         team_id (Optional[str]): Filter by specific team ID.
@@ -1794,7 +1860,7 @@ async def list_servers(
         user (str): The authenticated user making the request.
 
     Returns:
-        List[ServerRead]: A list of server objects the user has access to.
+        Union[List[ServerRead], Dict[str, Any]]: A list of server objects or paginated response with nextCursor.
     """
     # Parse tags parameter if provided
     tags_list = None
@@ -1816,15 +1882,24 @@ async def list_servers(
     # Determine final team ID
     team_id = team_id or token_team_id
 
-    # Use team-filtered server listing
-    if team_id or visibility:
-        data = await server_service.list_servers_for_user(db=db, user_email=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive)
-        # Apply tag filtering to team-filtered results if needed
-        if tags_list:
-            data = [server for server in data if any(tag in server.tags for tag in tags_list)]
-    else:
-        # Use existing method for backward compatibility when no team filtering
-        data = await server_service.list_servers(db, include_inactive=include_inactive, tags=tags_list)
+    # Use consolidated server listing with optional team filtering
+    logger.debug(f"User: {user_email} requested server list with include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}")
+    data, next_cursor = await server_service.list_servers(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
+
+    if include_pagination:
+        payload = {"servers": [server.model_dump(by_alias=True) for server in data]}
+        if next_cursor:
+            payload["nextCursor"] = next_cursor
+        return payload
     return data
 
 
@@ -2018,12 +2093,18 @@ async def toggle_server_status(
 
 @server_router.delete("/{server_id}", response_model=Dict[str, str])
 @require_permission("servers.delete")
-async def delete_server(server_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+async def delete_server(
+    server_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this server"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
     """
     Deletes a server by its ID.
 
     Args:
         server_id (str): The ID of the server to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this server.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
 
@@ -2037,7 +2118,7 @@ async def delete_server(server_id: str, db: Session = Depends(get_db), user=Depe
         logger.debug(f"User {user} is deleting server with ID {server_id}")
         user_email = user.get("email") if isinstance(user, dict) else str(user)
         await server_service.get_server(db, server_id)
-        await server_service.delete_server(db, server_id, user_email=user_email)
+        await server_service.delete_server(db, server_id, user_email=user_email, purge_metrics=purge_metrics)
         return {
             "status": "success",
             "message": f"Server {server_id} deleted successfully",
@@ -2247,56 +2328,76 @@ async def server_get_prompts(
 ##################
 # A2A Agent APIs #
 ##################
-@a2a_router.get("", response_model=List[A2AAgentRead])
-@a2a_router.get("/", response_model=List[A2AAgentRead])
+@a2a_router.get("", response_model=Union[List[A2AAgentRead], CursorPaginatedA2AAgentsResponse])
+@a2a_router.get("/", response_model=Union[List[A2AAgentRead], CursorPaginatedA2AAgentsResponse])
 @require_permission("a2a.read")
 async def list_a2a_agents(
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = Query(None, description="Filter by team ID"),
     visibility: Optional[str] = Query(None, description="Filter by visibility (private, team, public)"),
-    skip: int = Query(0, ge=0, description="Number of agents to skip for pagination"),
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of agents to return"),
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, description="Maximum number of agents to return"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> List[A2AAgentRead]:
+) -> Union[List[A2AAgentRead], Dict[str, Any]]:
     """
-    Lists A2A agents user has access to with team filtering.
+    Lists A2A agents user has access to with cursor pagination and team filtering.
 
     Args:
         include_inactive (bool): Whether to include inactive agents in the response.
         tags (Optional[str]): Comma-separated list of tags to filter by.
         team_id (Optional[str]): Team ID to filter by.
         visibility (Optional[str]): Visibility level to filter by.
-        skip (int): Number of agents to skip for pagination.
-        limit (int): Maximum number of agents to return.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of agents to return.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
 
     Returns:
-        List[A2AAgentRead]: A list of A2A agent objects the user has access to.
+        Union[List[A2AAgentRead], Dict[str, Any]]: A list of A2A agent objects or paginated response with nextCursor.
 
     Raises:
         HTTPException: If A2A service is not available.
     """
-    # Parse tags parameter if provided (keeping for backward compatibility)
+    # Parse tags parameter if provided
     tags_list = None
     if tags:
         tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
 
-    logger.debug(f"User {user} requested A2A agent list with team_id={team_id}, visibility={visibility}, tags={tags_list}")
     user_email: Optional[str] = "Unknown"
-
     if hasattr(user, "email"):
         user_email = getattr(user, "email", "Unknown")
     elif isinstance(user, dict):
         user_email = str(user.get("email", "Unknown"))
     else:
-        user_email = "Uknown"
-    # Use team-aware filtering
+        user_email = "Unknown"
+
+    logger.debug(f"User: {user_email} requested A2A agent list with team_id={team_id}, visibility={visibility}, tags={tags_list}, cursor={cursor}")
+
     if a2a_service is None:
         raise HTTPException(status_code=503, detail="A2A service not available")
-    return await a2a_service.list_agents_for_user(db, user_info=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive, skip=skip, limit=limit)
+
+    # Use consolidated agent listing with optional team filtering
+    data, next_cursor = await a2a_service.list_agents(
+        db=db,
+        cursor=cursor,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        limit=limit,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
+
+    if include_pagination:
+        payload = {"agents": [agent.model_dump(by_alias=True) for agent in data]}
+        if next_cursor:
+            payload["nextCursor"] = next_cursor
+        return payload
+    return data
 
 
 @a2a_router.get("/{agent_id}", response_model=A2AAgentRead)
@@ -2498,12 +2599,18 @@ async def toggle_a2a_agent_status(
 
 @a2a_router.delete("/{agent_id}", response_model=Dict[str, str])
 @require_permission("a2a.delete")
-async def delete_a2a_agent(agent_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+async def delete_a2a_agent(
+    agent_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this agent"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
     """
     Deletes an A2A agent by its ID.
 
     Args:
         agent_id (str): The ID of the agent to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this agent.
         db (Session): The database session used to interact with the data store.
         user (str): The authenticated user making the request.
 
@@ -2518,7 +2625,7 @@ async def delete_a2a_agent(agent_id: str, db: Session = Depends(get_db), user=De
         if a2a_service is None:
             raise HTTPException(status_code=503, detail="A2A service not available")
         user_email = user.get("email") if isinstance(user, dict) else str(user)
-        await a2a_service.delete_agent(db, agent_id, user_email=user_email)
+        await a2a_service.delete_agent(db, agent_id, user_email=user_email, purge_metrics=purge_metrics)
         return {
             "status": "success",
             "message": f"A2A Agent {agent_id} deleted successfully",
@@ -2583,8 +2690,8 @@ async def invoke_a2a_agent(
 #############
 # Tool APIs #
 #############
-@tool_router.get("", response_model=Union[List[ToolRead], List[Dict], Dict, List])
-@tool_router.get("/", response_model=Union[List[ToolRead], List[Dict], Dict, List])
+@tool_router.get("", response_model=Union[List[ToolRead], CursorPaginatedToolsResponse])
+@tool_router.get("/", response_model=Union[List[ToolRead], CursorPaginatedToolsResponse])
 @require_permission("tools.read")
 async def list_tools(
     request: Request,
@@ -2642,22 +2749,19 @@ async def list_tools(
     # Determine final team ID
     team_id = team_id or token_team_id
 
-    # Use team-filtered tool listing
-    if team_id or visibility:
-        data, next_cursor = await tool_service.list_tools_for_user(
-            db=db,
-            user_email=user_email,
-            team_id=team_id,
-            visibility=visibility,
-            include_inactive=include_inactive,
-            cursor=cursor,
-            gateway_id=gateway_id,
-            tags=tags_list,
-            limit=limit,
-        )
-    else:
-        # Use existing method for backward compatibility when no team filtering
-        data, next_cursor = await tool_service.list_tools(db, cursor=cursor, include_inactive=include_inactive, tags=tags_list, gateway_id=gateway_id, limit=limit)
+    # Use unified list_tools() with optional team filtering
+    # When team_id or visibility is specified, user_email enables team-based access control
+    data, next_cursor = await tool_service.list_tools(
+        db=db,
+        cursor=cursor,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        gateway_id=gateway_id,
+        limit=limit,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
 
     if apijsonpath is None:
         if include_pagination:
@@ -2853,12 +2957,18 @@ async def update_tool(
 
 @tool_router.delete("/{tool_id}")
 @require_permission("tools.delete")
-async def delete_tool(tool_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+async def delete_tool(
+    tool_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this tool"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
     """
     Permanently deletes a tool by ID.
 
     Args:
         tool_id (str): The ID of the tool to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this tool.
         db (Session): The database session dependency.
         user (str): The authenticated user making the request.
 
@@ -2871,7 +2981,7 @@ async def delete_tool(tool_id: str, db: Session = Depends(get_db), user=Depends(
     try:
         logger.debug(f"User {user} is deleting tool with ID {tool_id}")
         user_email = user.get("email") if isinstance(user, dict) else str(user)
-        await tool_service.delete_tool(db, tool_id, user_email=user_email)
+        await tool_service.delete_tool(db, tool_id, user_email=user_email, purge_metrics=purge_metrics)
         return {"status": "success", "message": f"Tool {tool_id} permanently deleted"}
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -2987,25 +3097,29 @@ async def toggle_resource_status(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@resource_router.get("", response_model=List[ResourceRead])
-@resource_router.get("/", response_model=List[ResourceRead])
+@resource_router.get("", response_model=Union[List[ResourceRead], CursorPaginatedResourcesResponse])
+@resource_router.get("/", response_model=Union[List[ResourceRead], CursorPaginatedResourcesResponse])
 @require_permission("resources.read")
 async def list_resources(
     request: Request,
-    cursor: Optional[str] = None,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of resources to return"),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> List[Dict[str, Any]]:
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Retrieve a list of resources accessible to the user, with team filtering support.
+    Retrieve a list of resources accessible to the user, with team filtering and cursor pagination support.
 
     Args:
         request (Request): The FastAPI request object for team_id retrieval
-        cursor (Optional[str]): Optional cursor for pagination.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of resources to return.
         include_inactive (bool): Whether to include inactive resources.
         tags (Optional[str]): Comma-separated list of tags to filter by.
         team_id (Optional[str]): Filter by specific team ID.
@@ -3014,7 +3128,7 @@ async def list_resources(
         user (str): Authenticated user.
 
     Returns:
-        List[ResourceRead]: List of resources the user has access to.
+        Union[List[ResourceRead], Dict[str, Any]]: List of resources or paginated response with nextCursor.
     """
     # Parse tags parameter if provided
     tags_list = None
@@ -3036,19 +3150,25 @@ async def list_resources(
     # Determine final team ID
     team_id = team_id or token_team_id
 
-    # Use team-filtered resource listing
-    if team_id or visibility:
-        data = await resource_service.list_resources_for_user(db=db, user_email=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive)
-        # Apply tag filtering to team-filtered results if needed
-        if tags_list:
-            data = [resource for resource in data if any(tag in resource.tags for tag in tags_list)]
-    else:
-        # Use existing method for backward compatibility when no team filtering
-        logger.debug(f"User {user_email} requested resource list with cursor {cursor}, include_inactive={include_inactive}, tags={tags_list}")
-        if cached := resource_cache.get("resource_list"):
-            return cached
-        data, _ = await resource_service.list_resources(db, include_inactive=include_inactive, tags=tags_list)
-        resource_cache.set("resource_list", data)
+    # Use unified list_resources() with optional team filtering
+    # When team_id or visibility is specified, user_email enables team-based access control
+    logger.debug(f"User {user_email} requested resource list with cursor {cursor}, include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}")
+    data, next_cursor = await resource_service.list_resources(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
+
+    if include_pagination:
+        payload = {"resources": [resource.model_dump(by_alias=True) if hasattr(resource, "model_dump") else resource for resource in data]}
+        if next_cursor:
+            payload["nextCursor"] = next_cursor
+        return payload
     return data
 
 
@@ -3260,12 +3380,18 @@ async def update_resource(
 
 @resource_router.delete("/{resource_id}")
 @require_permission("resources.delete")
-async def delete_resource(resource_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+async def delete_resource(
+    resource_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this resource"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
     """
     Delete a resource by its ID.
 
     Args:
         resource_id (str): ID of the resource to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this resource.
         db (Session): Database session.
         user (str): Authenticated user.
 
@@ -3278,7 +3404,7 @@ async def delete_resource(resource_id: str, db: Session = Depends(get_db), user=
     try:
         logger.debug(f"User {user} is deleting resource with id {resource_id}")
         user_email = user.get("email") if isinstance(user, dict) else str(user)
-        await resource_service.delete_resource(db, resource_id, user_email=user_email)
+        await resource_service.delete_resource(db, resource_id, user_email=user_email, purge_metrics=purge_metrics)
         await invalidate_resource_cache(resource_id)
         return {"status": "success", "message": f"Resource {resource_id} deleted"}
     except PermissionError as e:
@@ -3348,25 +3474,29 @@ async def toggle_prompt_status(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@prompt_router.get("", response_model=List[PromptRead])
-@prompt_router.get("/", response_model=List[PromptRead])
+@prompt_router.get("", response_model=Union[List[PromptRead], CursorPaginatedPromptsResponse])
+@prompt_router.get("/", response_model=Union[List[PromptRead], CursorPaginatedPromptsResponse])
 @require_permission("prompts.read")
 async def list_prompts(
     request: Request,
-    cursor: Optional[str] = None,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of prompts to return"),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> List[Dict[str, Any]]:
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    List prompts accessible to the user, with team filtering support.
+    List prompts accessible to the user, with team filtering and cursor pagination support.
 
     Args:
         request (Request): The FastAPI request object for team_id retrieval
-        cursor: Cursor for pagination.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of prompts to return.
         include_inactive: Include inactive prompts.
         tags: Comma-separated list of tags to filter by.
         team_id: Filter by specific team ID.
@@ -3375,7 +3505,7 @@ async def list_prompts(
         user: Authenticated user.
 
     Returns:
-        List of prompt records the user has access to.
+        Union[List[Dict[str, Any]], Dict[str, Any]]: List of prompt records or paginated response with nextCursor.
     """
     # Parse tags parameter if provided
     tags_list = None
@@ -3397,16 +3527,24 @@ async def list_prompts(
     # Determine final team ID
     team_id = team_id or token_team_id
 
-    # Use team-filtered prompt listing
-    if team_id or visibility:
-        data = await prompt_service.list_prompts_for_user(db=db, user_email=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive)
-        # Apply tag filtering to team-filtered results if needed
-        if tags_list:
-            data = [prompt for prompt in data if any(tag in prompt.tags for tag in tags_list)]
-    else:
-        # Use existing method for backward compatibility when no team filtering
-        logger.debug(f"User: {user_email} requested prompt list with include_inactive={include_inactive}, cursor={cursor}, tags={tags_list}")
-        data, _ = await prompt_service.list_prompts(db, cursor=cursor, include_inactive=include_inactive, tags=tags_list)
+    # Use consolidated prompt listing with optional team filtering
+    logger.debug(f"User: {user_email} requested prompt list with include_inactive={include_inactive}, cursor={cursor}, tags={tags_list}, team_id={team_id}, visibility={visibility}")
+    data, next_cursor = await prompt_service.list_prompts(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
+
+    if include_pagination:
+        payload = {"prompts": [prompt.model_dump(by_alias=True) if hasattr(prompt, "model_dump") else prompt for prompt in data]}
+        if next_cursor:
+            payload["nextCursor"] = next_cursor
+        return payload
     return data
 
 
@@ -3660,12 +3798,18 @@ async def update_prompt(
 
 @prompt_router.delete("/{prompt_id}")
 @require_permission("prompts.delete")
-async def delete_prompt(prompt_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+async def delete_prompt(
+    prompt_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this prompt"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
     """
     Delete a prompt by ID.
 
     Args:
         prompt_id: ID of the prompt.
+        purge_metrics: Whether to delete raw + hourly rollup metrics for this prompt.
         db: Database session.
         user: Authenticated user.
 
@@ -3678,7 +3822,7 @@ async def delete_prompt(prompt_id: str, db: Session = Depends(get_db), user=Depe
     logger.debug(f"User: {user} requested deletion of prompt {prompt_id}")
     try:
         user_email = user.get("email") if isinstance(user, dict) else str(user)
-        await prompt_service.delete_prompt(db, prompt_id, user_email=user_email)
+        await prompt_service.delete_prompt(db, prompt_id, user_email=user_email, purge_metrics=purge_metrics)
         return {"status": "success", "message": f"Prompt {prompt_id} deleted"}
     except Exception as e:
         if isinstance(e, PermissionError):
@@ -3744,22 +3888,28 @@ async def toggle_gateway_status(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@gateway_router.get("", response_model=List[GatewayRead])
-@gateway_router.get("/", response_model=List[GatewayRead])
+@gateway_router.get("", response_model=Union[List[GatewayRead], CursorPaginatedGatewaysResponse])
+@gateway_router.get("/", response_model=Union[List[GatewayRead], CursorPaginatedGatewaysResponse])
 @require_permission("gateways.read")
 async def list_gateways(
     request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of gateways to return"),
     include_inactive: bool = False,
     team_id: Optional[str] = Query(None, description="Filter by team ID"),
     visibility: Optional[str] = Query(None, description="Filter by visibility: private, team, public"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> List[GatewayRead]:
+) -> Union[List[GatewayRead], Dict[str, Any]]:
     """
-    List all gateways.
+    List all gateways with cursor pagination support.
 
     Args:
         request (Request): The FastAPI request object for team_id retrieval
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of gateways to return.
         include_inactive: Include inactive gateways.
         team_id (Optional): Filter by specific team ID.
         visibility (Optional): Filter by visibility (private, team, public).
@@ -3767,7 +3917,7 @@ async def list_gateways(
         user: Authenticated user.
 
     Returns:
-        List of gateway records.
+        Union[List[GatewayRead], Dict[str, Any]]: List of gateway records or paginated response with nextCursor.
     """
     logger.debug(f"User '{user}' requested list of gateways with include_inactive={include_inactive}")
 
@@ -3786,10 +3936,24 @@ async def list_gateways(
     # Determine final team ID
     team_id = team_id or token_team_id
 
-    if team_id or visibility:
-        return await gateway_service.list_gateways_for_user(db=db, user_email=user_email, team_id=team_id, visibility=visibility, include_inactive=include_inactive)
+    # Use consolidated gateway listing with optional team filtering
+    logger.debug(f"User: {user_email} requested gateway list with include_inactive={include_inactive}, team_id={team_id}, visibility={visibility}")
+    data, next_cursor = await gateway_service.list_gateways(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        user_email=user_email if (team_id or visibility) else None,
+        team_id=team_id,
+        visibility=visibility,
+    )
 
-    return await gateway_service.list_gateways(db, include_inactive=include_inactive)
+    if include_pagination:
+        payload = {"gateways": [gateway.model_dump(by_alias=True) for gateway in data]}
+        if next_cursor:
+            payload["nextCursor"] = next_cursor
+        return payload
+    return data
 
 
 @gateway_router.post("", response_model=GatewayRead)
@@ -5202,6 +5366,14 @@ if settings.observability_enabled:
     logger.info("Observability router included - observability API endpoints enabled")
 else:
     logger.info("Observability router not included - observability disabled")
+
+# Conditionally include metrics maintenance router if cleanup or rollup is enabled
+if settings.metrics_cleanup_enabled or settings.metrics_rollup_enabled:
+    # First-Party
+    from mcpgateway.routers.metrics_maintenance import router as metrics_maintenance_router
+
+    app.include_router(metrics_maintenance_router)
+    logger.info("Metrics maintenance router included - cleanup/rollup API endpoints enabled")
 
 # Conditionally include A2A router if A2A features are enabled
 if settings.mcpgateway_a2a_enabled:

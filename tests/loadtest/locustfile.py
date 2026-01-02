@@ -19,6 +19,7 @@ Environment Variables (also reads from .env file):
     LOADTEST_USERS: Number of concurrent users (default: 1000)
     LOADTEST_SPAWN_RATE: Users spawned per second (default: 100)
     LOADTEST_RUN_TIME: Test duration, e.g., "60s", "5m" (default: 5m)
+    LOADTEST_JWT_EXPIRY_HOURS: JWT token expiry in hours (default: 8760 = 1 year)
     MCPGATEWAY_BEARER_TOKEN: JWT token for authenticated requests
     BASIC_AUTH_USER: Basic auth username (default: admin)
     BASIC_AUTH_PASSWORD: Basic auth password (default: changeme)
@@ -137,6 +138,9 @@ JWT_ISSUER = _get_config("JWT_ISSUER", "mcpgateway")
 # Default to platform admin email for guaranteed authentication
 # This matches the PLATFORM_ADMIN_EMAIL default in .env.example
 JWT_USERNAME = _get_config("JWT_USERNAME", _get_config("PLATFORM_ADMIN_EMAIL", "admin@example.com"))
+# Token expiry in hours - default 8760 (1 year) to avoid expiration during long load tests
+# JTI (JWT ID) is automatically generated for each token for proper cache keying
+JWT_TOKEN_EXPIRY_HOURS = int(_get_config("LOADTEST_JWT_EXPIRY_HOURS", "8760"))
 
 # Log loaded configuration (masking sensitive values)
 logger.info("Configuration loaded:")
@@ -145,6 +149,7 @@ logger.info(f"  JWT_ALGORITHM: {JWT_ALGORITHM}")
 logger.info(f"  JWT_AUDIENCE: {JWT_AUDIENCE}")
 logger.info(f"  JWT_ISSUER: {JWT_ISSUER}")
 logger.info(f"  JWT_SECRET_KEY: {'*' * len(JWT_SECRET_KEY) if JWT_SECRET_KEY else '(not set)'}")
+logger.info(f"  JWT_TOKEN_EXPIRY_HOURS: {JWT_TOKEN_EXPIRY_HOURS}")
 
 # Test data pools (populated during test setup)
 # IDs for REST API calls (GET /tools/{id}, etc.)
@@ -183,61 +188,88 @@ def on_locust_init(environment, **_kwargs):  # pylint: disable=unused-argument
         logger.info("Running in standalone mode")
 
 
+def _fetch_json(url: str, headers: dict[str, str], timeout: float = 30.0) -> tuple[int, Any]:
+    """Fetch JSON from URL using urllib (gevent-safe, no threading issues with Python 3.13).
+
+    Args:
+        url: Full URL to fetch
+        headers: HTTP headers to include
+        timeout: Request timeout in seconds
+
+    Returns:
+        Tuple of (status_code, json_data or None)
+    """
+    # Standard
+    import json  # pylint: disable=import-outside-toplevel
+    import urllib.error  # pylint: disable=import-outside-toplevel
+    import urllib.request  # pylint: disable=import-outside-toplevel
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return (resp.status, data)
+    except urllib.error.HTTPError as e:
+        return (e.code, None)
+    except Exception:
+        return (0, None)
+
+
 @events.test_start.add_listener
 def on_test_start(environment, **_kwargs):  # pylint: disable=unused-argument
-    """Fetch existing entity IDs for use in tests."""
+    """Fetch existing entity IDs for use in tests.
+
+    Uses urllib.request instead of httpx to avoid Python 3.13/gevent threading conflicts.
+    httpx creates threads that trigger '_DummyThread' object has no attribute '_handle' errors.
+    """
     logger.info("Test starting - fetching entity IDs...")
 
     host = environment.host or "http://localhost:8080"
     headers = _get_auth_headers()
 
     try:
-        # Third-Party
-        import httpx  # pylint: disable=import-outside-toplevel
+        # Fetch tools
+        # API returns {"tools": [...], "nextCursor": ...} or list for legacy
+        status, data = _fetch_json(f"{host}/tools", headers)
+        if status == 200 and data:
+            items = data if isinstance(data, list) else data.get("tools", data.get("items", []))
+            TOOL_IDS.extend([str(t.get("id")) for t in items[:50] if t.get("id")])
+            TOOL_NAMES.extend([str(t.get("name")) for t in items[:50] if t.get("name")])
+            logger.info(f"Loaded {len(TOOL_IDS)} tool IDs, {len(TOOL_NAMES)} tool names")
 
-        with httpx.Client(base_url=host, timeout=30.0) as client:
-            # Fetch tools
-            resp = client.get("/tools", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get("items", [])
-                TOOL_IDS.extend([str(t.get("id")) for t in items[:50] if t.get("id")])
-                TOOL_NAMES.extend([str(t.get("name")) for t in items[:50] if t.get("name")])
-                logger.info(f"Loaded {len(TOOL_IDS)} tool IDs, {len(TOOL_NAMES)} tool names")
+        # Fetch servers
+        # API returns {"servers": [...], "nextCursor": ...} or list for legacy
+        status, data = _fetch_json(f"{host}/servers", headers)
+        if status == 200 and data:
+            items = data if isinstance(data, list) else data.get("servers", data.get("items", []))
+            SERVER_IDS.extend([str(s.get("id")) for s in items[:50] if s.get("id")])
+            logger.info(f"Loaded {len(SERVER_IDS)} server IDs")
 
-            # Fetch servers
-            resp = client.get("/servers", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get("items", [])
-                SERVER_IDS.extend([str(s.get("id")) for s in items[:50] if s.get("id")])
-                logger.info(f"Loaded {len(SERVER_IDS)} server IDs")
+        # Fetch gateways
+        # API returns {"gateways": [...], "nextCursor": ...} or list for legacy
+        status, data = _fetch_json(f"{host}/gateways", headers)
+        if status == 200 and data:
+            items = data if isinstance(data, list) else data.get("gateways", data.get("items", []))
+            GATEWAY_IDS.extend([str(g.get("id")) for g in items[:50] if g.get("id")])
+            logger.info(f"Loaded {len(GATEWAY_IDS)} gateway IDs")
 
-            # Fetch gateways
-            resp = client.get("/gateways", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get("items", [])
-                GATEWAY_IDS.extend([str(g.get("id")) for g in items[:50] if g.get("id")])
-                logger.info(f"Loaded {len(GATEWAY_IDS)} gateway IDs")
+        # Fetch resources
+        # API returns {"resources": [...], "nextCursor": ...} or list for legacy
+        status, data = _fetch_json(f"{host}/resources", headers)
+        if status == 200 and data:
+            items = data if isinstance(data, list) else data.get("resources", data.get("items", []))
+            RESOURCE_IDS.extend([str(r.get("id")) for r in items[:50] if r.get("id")])
+            RESOURCE_URIS.extend([str(r.get("uri")) for r in items[:50] if r.get("uri")])
+            logger.info(f"Loaded {len(RESOURCE_IDS)} resource IDs, {len(RESOURCE_URIS)} resource URIs")
 
-            # Fetch resources
-            resp = client.get("/resources", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get("items", [])
-                RESOURCE_IDS.extend([str(r.get("id")) for r in items[:50] if r.get("id")])
-                RESOURCE_URIS.extend([str(r.get("uri")) for r in items[:50] if r.get("uri")])
-                logger.info(f"Loaded {len(RESOURCE_IDS)} resource IDs, {len(RESOURCE_URIS)} resource URIs")
-
-            # Fetch prompts
-            resp = client.get("/prompts", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data if isinstance(data, list) else data.get("items", [])
-                PROMPT_IDS.extend([str(p.get("id")) for p in items[:50] if p.get("id")])
-                PROMPT_NAMES.extend([str(p.get("name")) for p in items[:50] if p.get("name")])
-                logger.info(f"Loaded {len(PROMPT_IDS)} prompt IDs, {len(PROMPT_NAMES)} prompt names")
+        # Fetch prompts
+        # API returns {"prompts": [...], "nextCursor": ...} or list for legacy
+        status, data = _fetch_json(f"{host}/prompts", headers)
+        if status == 200 and data:
+            items = data if isinstance(data, list) else data.get("prompts", data.get("items", []))
+            PROMPT_IDS.extend([str(p.get("id")) for p in items[:50] if p.get("id")])
+            PROMPT_NAMES.extend([str(p.get("name")) for p in items[:50] if p.get("name")])
+            logger.info(f"Loaded {len(PROMPT_IDS)} prompt IDs, {len(PROMPT_NAMES)} prompt names")
 
     except Exception as e:
         logger.warning(f"Failed to fetch entity IDs: {e}")
@@ -354,6 +386,14 @@ def _generate_jwt_token() -> str:
 
     Uses PyJWT to create a token with the configured secret and algorithm.
     Reads JWT settings from .env file or environment variables.
+
+    The token includes:
+    - sub: User email (JWT_USERNAME)
+    - exp: Expiration time (configurable via LOADTEST_JWT_EXPIRY_HOURS, default 1 year)
+    - iat: Issued at time
+    - aud: Audience (JWT_AUDIENCE)
+    - iss: Issuer (JWT_ISSUER)
+    - jti: JWT ID - unique identifier for cache keying and token revocation
     """
     try:
         # Standard
@@ -362,15 +402,17 @@ def _generate_jwt_token() -> str:
         # Third-Party
         import jwt  # pylint: disable=import-outside-toplevel
 
+        jti = str(uuid.uuid4())
         payload = {
             "sub": JWT_USERNAME,
-            "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+            "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_TOKEN_EXPIRY_HOURS),
             "iat": datetime.now(timezone.utc),
             "aud": JWT_AUDIENCE,
             "iss": JWT_ISSUER,
+            "jti": jti,  # JWT ID for auth cache keying and token revocation support
         }
         token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-        logger.info(f"Generated JWT token for user: {JWT_USERNAME} (aud={JWT_AUDIENCE}, iss={JWT_ISSUER})")
+        logger.info(f"Generated JWT token for user: {JWT_USERNAME} (aud={JWT_AUDIENCE}, iss={JWT_ISSUER}, jti={jti[:8]}..., expires_in={JWT_TOKEN_EXPIRY_HOURS}h)")
         return token
     except ImportError:
         logger.warning("PyJWT not installed, falling back to basic auth. Install with: pip install pyjwt")
@@ -1273,6 +1315,7 @@ class WriteAPIUser(BaseUser):
     def read_and_refresh_gateway(self):
         """Read existing gateway and trigger a refresh."""
         # First, get list of gateways
+        # API returns {"gateways": [...], "nextCursor": ...} or list for legacy
         with self.client.get(
             "/gateways",
             headers=self.auth_headers,
@@ -1283,7 +1326,9 @@ class WriteAPIUser(BaseUser):
                 response.failure(f"Failed to list gateways: {response.status_code}")
                 return
             try:
-                gateways = response.json()
+                data = response.json()
+                # Extract gateways list from paginated response
+                gateways = data if isinstance(data, list) else data.get("gateways", data.get("items", []))
                 if not gateways:
                     response.success()
                     return

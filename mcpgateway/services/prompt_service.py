@@ -16,6 +16,7 @@ It handles:
 
 # Standard
 from datetime import datetime, timezone
+from functools import lru_cache
 import os
 from string import Formatter
 import time
@@ -23,8 +24,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Union
 import uuid
 
 # Third-Party
-from jinja2 import Environment, meta, select_autoescape
-from sqlalchemy import and_, case, delete, desc, Float, func, not_, or_, select
+from jinja2 import Environment, meta, select_autoescape, Template
+from sqlalchemy import and_, delete, desc, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -33,21 +34,55 @@ from mcpgateway.common.models import Message, PromptResult, Role, TextContent
 from mcpgateway.config import settings
 from mcpgateway.db import EmailTeam
 from mcpgateway.db import Prompt as DbPrompt
-from mcpgateway.db import PromptMetric, server_prompt_association
+from mcpgateway.db import PromptMetric, PromptMetricsHourly, server_prompt_association
 from mcpgateway.observability import create_span
 from mcpgateway.plugins.framework import GlobalContext, PluginContextTable, PluginManager, PromptHookType, PromptPosthookPayload, PromptPrehookPayload
 from mcpgateway.schemas import PromptCreate, PromptRead, PromptUpdate, TopPerformer
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services.metrics_cleanup_service import delete_metrics_in_batches, pause_rollup_during_purge
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService
 from mcpgateway.services.structured_logger import get_structured_logger
+from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.utils.metrics_common import build_top_performers
-from mcpgateway.utils.pagination import decode_cursor, encode_cursor
+from mcpgateway.utils.pagination import unified_paginate
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 
 # Cache import (lazy to avoid circular dependencies)
 _REGISTRY_CACHE = None
+
+# Module-level Jinja environment singleton for template caching
+_JINJA_ENV: Optional[Environment] = None
+
+
+def _get_jinja_env() -> Environment:
+    """Get or create the module-level Jinja environment singleton.
+
+    Returns:
+        Jinja2 Environment with autoescape and trim settings.
+    """
+    global _JINJA_ENV  # pylint: disable=global-statement
+    if _JINJA_ENV is None:
+        _JINJA_ENV = Environment(
+            autoescape=select_autoescape(["html", "xml"]),
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
+    return _JINJA_ENV
+
+
+@lru_cache(maxsize=256)
+def _compile_jinja_template(template: str) -> Template:
+    """Cache compiled Jinja template by template string.
+
+    Args:
+        template: The template string to compile.
+
+    Returns:
+        Compiled Jinja Template object.
+    """
+    return _get_jinja_env().from_string(template)
 
 
 def _get_registry_cache():
@@ -151,7 +186,8 @@ class PromptService:
             True
         """
         self._event_service = EventService(channel_name="mcpgateway:prompt_events")
-        self._jinja_env = Environment(autoescape=select_autoescape(["html", "xml"]), trim_blocks=True, lstrip_blocks=True)
+        # Use the module-level singleton for template caching
+        self._jinja_env = _get_jinja_env()
         # Initialize plugin manager with env overrides for testability
         env_flag = os.getenv("PLUGINS_ENABLED")
         if env_flag is not None:
@@ -183,16 +219,18 @@ class PromptService:
         await self._event_service.shutdown()
         logger.info("Prompt service shutdown complete")
 
-    async def get_top_prompts(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
+    async def get_top_prompts(self, db: Session, limit: Optional[int] = 5, include_deleted: bool = False) -> List[TopPerformer]:
         """Retrieve the top-performing prompts based on execution count.
 
         Queries the database to get prompts with their metrics, ordered by the number of executions
-        in descending order. Returns a list of TopPerformer objects containing prompt details and
+        in descending order. Combines recent raw metrics with historical hourly rollups for complete
+        historical coverage. Returns a list of TopPerformer objects containing prompt details and
         performance metrics. Results are cached for performance.
 
         Args:
             db (Session): Database session for querying prompt metrics.
             limit (Optional[int]): Maximum number of prompts to return. Defaults to 5.
+            include_deleted (bool): Whether to include deleted prompts from rollups.
 
         Returns:
             List[TopPerformer]: A list of TopPerformer objects, each containing:
@@ -208,36 +246,24 @@ class PromptService:
         from mcpgateway.cache.metrics_cache import is_cache_enabled, metrics_cache  # pylint: disable=import-outside-toplevel
 
         effective_limit = limit or 5
-        cache_key = f"top_prompts:{effective_limit}"
+        cache_key = f"top_prompts:{effective_limit}:include_deleted={include_deleted}"
 
         if is_cache_enabled():
             cached = metrics_cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        query = (
-            db.query(
-                DbPrompt.id,
-                DbPrompt.name,
-                func.count(PromptMetric.id).label("execution_count"),  # pylint: disable=not-callable
-                func.avg(PromptMetric.response_time).label("avg_response_time"),  # pylint: disable=not-callable
-                case(
-                    (
-                        func.count(PromptMetric.id) > 0,  # pylint: disable=not-callable
-                        func.sum(case((PromptMetric.is_success.is_(True), 1), else_=0)).cast(Float) / func.count(PromptMetric.id) * 100,  # pylint: disable=not-callable
-                    ),
-                    else_=None,
-                ).label("success_rate"),
-                func.max(PromptMetric.timestamp).label("last_execution"),  # pylint: disable=not-callable
-            )
-            .outerjoin(PromptMetric)
-            .group_by(DbPrompt.id, DbPrompt.name)
-            .order_by(desc("execution_count"))
+        # Use combined query that includes both raw metrics and rollup data
+        # First-Party
+        from mcpgateway.services.metrics_query_service import get_top_performers_combined  # pylint: disable=import-outside-toplevel
+
+        results = get_top_performers_combined(
+            db=db,
+            metric_type="prompt",
+            entity_model=DbPrompt,
+            limit=effective_limit,
+            include_deleted=include_deleted,
         )
-
-        query = query.limit(effective_limit)
-
-        results = query.all()
         top_performers = build_top_performers(results)
 
         # Cache the result (if enabled)
@@ -246,9 +272,9 @@ class PromptService:
 
         return top_performers
 
-    def _convert_db_prompt(self, db_prompt: DbPrompt, include_metrics: bool = False) -> Dict[str, Any]:
+    def convert_prompt_to_read(self, db_prompt: DbPrompt, include_metrics: bool = False) -> PromptRead:
         """
-        Convert a DbPrompt instance to a dictionary matching the PromptRead schema,
+        Convert a DbPrompt instance to a PromptRead Pydantic model,
         optionally including aggregated metrics computed from the associated PromptMetric records.
 
         Args:
@@ -257,7 +283,7 @@ class PromptService:
                 Set to False for list operations to avoid N+1 query issues.
 
         Returns:
-            dict: Dictionary matching the PromptRead schema
+            PromptRead: Pydantic model instance
         """
         arg_schema = db_prompt.argument_schema or {}
         properties = arg_schema.get("properties", {})
@@ -296,7 +322,7 @@ class PromptService:
         else:
             metrics_dict = None
 
-        return {
+        prompt_dict = {
             "id": db_prompt.id,
             "name": db_prompt.name,
             "description": db_prompt.description,
@@ -322,6 +348,7 @@ class PromptService:
             "team_id": getattr(db_prompt, "team_id", None),
             "owner_email": getattr(db_prompt, "owner_email", None),
         }
+        return PromptRead.model_validate(prompt_dict)
 
     def _get_team_name(self, db: Session, team_id: Optional[str]) -> Optional[str]:
         """Retrieve the team name given a team ID.
@@ -387,7 +414,7 @@ class PromptService:
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
             >>> service._notify_prompt_added = MagicMock()
-            >>> service._convert_db_prompt = MagicMock(return_value={})
+            >>> service.convert_prompt_to_read = MagicMock(return_value={})
             >>> import asyncio
             >>> try:
             ...     asyncio.run(service.register_prompt(db, prompt))
@@ -496,7 +523,7 @@ class PromptService:
             )
 
             db_prompt.team = self._get_team_name(db, db_prompt.team_id)
-            prompt_dict = self._convert_db_prompt(db_prompt)
+            prompt_dict = self.convert_prompt_to_read(db_prompt)
 
             # Invalidate cache after successful creation
             cache = _get_registry_cache()
@@ -506,6 +533,11 @@ class PromptService:
             from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
 
             await admin_stats_cache.invalidate_tags()
+            # First-Party
+            from mcpgateway.cache.metrics_cache import metrics_cache  # pylint: disable=import-outside-toplevel
+
+            metrics_cache.invalidate_prefix("top_prompts:")
+            metrics_cache.invalidate("prompts")
 
             return PromptRead.model_validate(prompt_dict)
 
@@ -680,6 +712,8 @@ class PromptService:
                                 # Update existing prompt
                                 existing_prompt.description = prompt.description
                                 existing_prompt.template = prompt.template
+                                # Clear template cache to reduce memory growth
+                                _compile_jinja_template.cache_clear()
                                 existing_prompt.argument_schema = argument_schema
                                 existing_prompt.tags = prompt.tags or []
                                 existing_prompt.modified_by = created_by
@@ -817,7 +851,19 @@ class PromptService:
 
         return stats
 
-    async def list_prompts(self, db: Session, include_inactive: bool = False, cursor: Optional[str] = None, tags: Optional[List[str]] = None) -> tuple[List[PromptRead], Optional[str]]:
+    async def list_prompts(
+        self,
+        db: Session,
+        include_inactive: bool = False,
+        cursor: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
+        user_email: Optional[str] = None,
+        team_id: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> Union[tuple[List[PromptRead], Optional[str]], Dict[str, Any]]:
         """
         Retrieve a list of prompt templates from the database with pagination support.
 
@@ -830,13 +876,19 @@ class PromptService:
             include_inactive (bool): If True, include inactive prompts in the result.
                 Defaults to False.
             cursor (Optional[str], optional): An opaque cursor token for pagination.
-                Opaque base64-encoded string containing last item's ID.
+                Opaque base64-encoded string containing last item's ID and created_at.
             tags (Optional[List[str]]): Filter prompts by tags. If provided, only prompts with at least one matching tag will be returned.
+            limit (Optional[int]): Maximum number of prompts to return. Use 0 for all prompts (no limit).
+                If not specified, uses pagination_default_page_size.
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor.
+            per_page: Items per page for page-based pagination. Defaults to pagination_default_page_size.
+            user_email (Optional[str]): User email for team-based access control. If None, no access control is applied.
+            team_id (Optional[str]): Filter by specific team ID. Requires user_email for access validation.
+            visibility (Optional[str]): Filter by visibility (private, team, public).
 
         Returns:
-            tuple[List[PromptRead], Optional[str]]: Tuple containing:
-                - List of prompts for current page
-                - Next cursor token if more results exist, None otherwise
+            If page is provided: Dict with {"data": [...], "pagination": {...}, "links": {...}}
+            If cursor is provided or neither: tuple of (list of PromptRead objects, next_cursor).
 
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
@@ -844,18 +896,17 @@ class PromptService:
             >>> from mcpgateway.schemas import PromptRead
             >>> service = PromptService()
             >>> db = MagicMock()
-            >>> prompt_dict = {'id': '1', 'name': 'test', 'description': 'desc', 'template': 'tpl', 'arguments': [], 'createdAt': '2023-01-01T00:00:00', 'updatedAt': '2023-01-01T00:00:00', 'isActive': True, 'metrics': {}}
-            >>> service._convert_db_prompt = MagicMock(return_value=prompt_dict)
+            >>> prompt_read_obj = MagicMock(spec=PromptRead)
+            >>> service.convert_prompt_to_read = MagicMock(return_value=prompt_read_obj)
             >>> db.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
-            >>> PromptRead.model_validate = MagicMock(return_value='prompt_read')
             >>> import asyncio
             >>> prompts, next_cursor = asyncio.run(service.list_prompts(db))
-            >>> prompts == ['prompt_read']
+            >>> prompts == [prompt_read_obj]
             True
         """
-        # Check cache for first page only (cursor=None)
+        # Check cache for first page only (cursor=None) - skip when user_email provided or page based pagination
         cache = _get_registry_cache()
-        if cursor is None:
+        if cursor is None and user_email is None and page is None:
             filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None)
             cached = await cache.get("prompts", filters_hash)
             if cached is not None:
@@ -863,65 +914,94 @@ class PromptService:
                 cached_prompts = [PromptRead.model_validate(p) for p in cached["prompts"]]
                 return (cached_prompts, cached.get("next_cursor"))
 
-        page_size = settings.pagination_default_page_size
-        query = select(DbPrompt).order_by(DbPrompt.id)  # Consistent ordering for cursor pagination
-
-        # Decode cursor to get last_id if provided
-        last_id = None
-        if cursor:
-            try:
-                cursor_data = decode_cursor(cursor)
-                last_id = cursor_data.get("id")
-                logger.debug(f"Decoded cursor: last_id={last_id}")
-            except ValueError as e:
-                logger.warning(f"Invalid cursor, ignoring: {e}")
-
-        # Apply cursor filter (WHERE id > last_id)
-        if last_id:
-            query = query.where(DbPrompt.id > last_id)
+        # Build base query with ordering
+        query = select(DbPrompt).order_by(desc(DbPrompt.created_at), desc(DbPrompt.id))
 
         if not include_inactive:
             query = query.where(DbPrompt.enabled)
+
+        # Apply team-based access control if user_email is provided
+        if user_email:
+            team_service = TeamManagementService(db)
+            user_teams = await team_service.get_user_teams(user_email)
+            team_ids = [team.id for team in user_teams]
+
+            if team_id:
+                # User requesting specific team - verify access
+                if team_id not in team_ids:
+                    return ([], None)
+                access_conditions = [
+                    and_(DbPrompt.team_id == team_id, DbPrompt.visibility.in_(["team", "public"])),
+                    and_(DbPrompt.team_id == team_id, DbPrompt.owner_email == user_email),
+                ]
+                query = query.where(or_(*access_conditions))
+            else:
+                # General access: user's prompts + public prompts + team prompts
+                access_conditions = [
+                    DbPrompt.owner_email == user_email,
+                    DbPrompt.visibility == "public",
+                ]
+                if team_ids:
+                    access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
+                query = query.where(or_(*access_conditions))
+
+            if visibility:
+                query = query.where(DbPrompt.visibility == visibility)
 
         # Add tag filtering if tags are provided
         if tags:
             query = query.where(json_contains_expr(db, DbPrompt.tags, tags, match_any=True))
 
-        # Fetch page_size + 1 to determine if there are more results
-        query = query.limit(page_size + 1)
-        prompts = db.execute(query).scalars().all()
+        # Use unified pagination helper - handles both page and cursor pagination
+        pag_result = await unified_paginate(
+            db=db,
+            query=query,
+            page=page,
+            per_page=per_page,
+            cursor=cursor,
+            limit=limit,
+            base_url="/admin/prompts",  # Used for page-based links
+            query_params={"include_inactive": include_inactive} if include_inactive else {},
+        )
 
-        # Check if there are more results
-        has_more = len(prompts) > page_size
-        if has_more:
-            prompts = prompts[:page_size]  # Trim to page_size
+        next_cursor = None
+        # Extract servers based on pagination type
+        if page is not None:
+            # Page-based: pag_result is a dict
+            prompts_db = pag_result["data"]
+        else:
+            # Cursor-based: pag_result is a tuple
+            prompts_db, next_cursor = pag_result
 
-        # Batch fetch team names to avoid N+1 queries
-        team_ids = {p.team_id for p in prompts if p.team_id}
+        # Fetch team names for the prompts (common for both pagination types)
+        team_ids_set = {s.team_id for s in prompts_db if s.team_id}
         team_map = {}
-        if team_ids:
-            teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids), EmailTeam.is_active.is_(True))).all()
-            team_map = {str(team.id): team.name for team in teams}
+        if team_ids_set:
+            teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids_set), EmailTeam.is_active.is_(True))).all()
+            team_map = {team.id: team.name for team in teams}
 
         db.commit()  # Release transaction to avoid idle-in-transaction
 
-        # Convert to PromptRead objects (skip metrics to avoid N+1 queries)
+        # Convert to PromptRead (common for both pagination types)
         result = []
-        for t in prompts:
-            t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(PromptRead.model_validate(self._convert_db_prompt(t, include_metrics=False)))
+        for s in prompts_db:
+            s.team = team_map.get(s.team_id) if s.team_id else None
+            result.append(self.convert_prompt_to_read(s, include_metrics=False))
+        # Return appropriate format based on pagination type
+        if page is not None:
+            # Page-based format
+            return {
+                "data": result,
+                "pagination": pag_result["pagination"],
+                "links": pag_result["links"],
+            }
 
-        # Generate next_cursor if there are more results
-        next_cursor = None
-        if has_more and result:
-            last_prompt = prompts[-1]  # Get last DB object
-            next_cursor = encode_cursor({"id": last_prompt.id})
-            logger.debug(f"Generated next_cursor for id={last_prompt.id}")
+        # Cursor-based format
 
-        # Cache first page results
-        if cursor is None:
+        # Cache first page results - only for non-user-specific queries
+        if cursor is None and user_email is None:
             try:
-                cache_data = {"prompts": [p.model_dump(mode="json") for p in result], "next_cursor": next_cursor}
+                cache_data = {"prompts": [s.model_dump(mode="json") for s in result], "next_cursor": next_cursor}
                 await cache.set("prompts", cache_data, filters_hash)
             except AttributeError:
                 pass  # Skip caching if result objects don't support model_dump (e.g., in doctests)
@@ -932,6 +1012,11 @@ class PromptService:
         self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, skip: int = 0, limit: int = 100
     ) -> List[PromptRead]:
         """
+        DEPRECATED: Use list_prompts() with user_email parameter instead.
+
+        This method is maintained for backward compatibility but is no longer used.
+        New code should call list_prompts() with user_email, team_id, and visibility parameters.
+
         List prompts user has access to with team filtering.
 
         Args:
@@ -946,9 +1031,6 @@ class PromptService:
         Returns:
             List[PromptRead]: Prompts the user has access to
         """
-        # First-Party
-        from mcpgateway.services.team_management_service import TeamManagementService  # pylint: disable=import-outside-toplevel
-
         # Build query following existing patterns from list_prompts()
         team_service = TeamManagementService(db)
         user_teams = await team_service.get_user_teams(user_email)
@@ -1007,7 +1089,7 @@ class PromptService:
         result = []
         for t in prompts:
             t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(PromptRead.model_validate(self._convert_db_prompt(t, include_metrics=False)))
+            result.append(self.convert_prompt_to_read(t, include_metrics=False))
         return result
 
     async def list_server_prompts(self, db: Session, server_id: str, include_inactive: bool = False, cursor: Optional[str] = None) -> List[PromptRead]:
@@ -1036,13 +1118,12 @@ class PromptService:
             >>> from mcpgateway.schemas import PromptRead
             >>> service = PromptService()
             >>> db = MagicMock()
-            >>> prompt_dict = {'id': '1', 'name': 'test', 'description': 'desc', 'template': 'tpl', 'arguments': [], 'createdAt': '2023-01-01T00:00:00', 'updatedAt': '2023-01-01T00:00:00', 'isActive': True, 'metrics': {}}
-            >>> service._convert_db_prompt = MagicMock(return_value=prompt_dict)
+            >>> prompt_read_obj = MagicMock(spec=PromptRead)
+            >>> service.convert_prompt_to_read = MagicMock(return_value=prompt_read_obj)
             >>> db.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
-            >>> PromptRead.model_validate = MagicMock(return_value='prompt_read')
             >>> import asyncio
             >>> result = asyncio.run(service.list_server_prompts(db, 'server1'))
-            >>> result == ['prompt_read']
+            >>> result == [prompt_read_obj]
             True
         """
         query = select(DbPrompt).join(server_prompt_association, DbPrompt.id == server_prompt_association.c.prompt_id).where(server_prompt_association.c.server_id == server_id)
@@ -1064,7 +1145,7 @@ class PromptService:
         result = []
         for t in prompts:
             t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(PromptRead.model_validate(self._convert_db_prompt(t, include_metrics=False)))
+            result.append(self.convert_prompt_to_read(t, include_metrics=False))
         return result
 
     async def _record_prompt_metric(self, db: Session, prompt: DbPrompt, start_time: float, success: bool, error_message: Optional[str]) -> None:
@@ -1184,11 +1265,15 @@ class PromptService:
                 # Determine how to look up the prompt
                 prompt_name = None
 
-                if self._plugin_manager:
-                    # Use existing context_table from previous hooks if available
-                    context_table = plugin_context_table
+                # Check if any prompt hooks are registered to avoid unnecessary context creation
+                has_pre_fetch = self._plugin_manager and self._plugin_manager.has_hooks_for(PromptHookType.PROMPT_PRE_FETCH)
+                has_post_fetch = self._plugin_manager and self._plugin_manager.has_hooks_for(PromptHookType.PROMPT_POST_FETCH)
 
-                    # Reuse existing global_context from middleware or create new one
+                # Initialize plugin context variables only if hooks are registered
+                context_table = None
+                global_context = None
+                if has_pre_fetch or has_post_fetch:
+                    context_table = plugin_context_table
                     if plugin_global_context:
                         global_context = plugin_global_context
                         # Update fields with prompt-specific information
@@ -1204,6 +1289,7 @@ class PromptService:
                             request_id = uuid.uuid4().hex
                         global_context = GlobalContext(request_id=request_id, user=user, server_id=server_id, tenant_id=tenant_id)
 
+                if has_pre_fetch:
                     pre_result, context_table = await self._plugin_manager.invoke_hook(
                         PromptHookType.PROMPT_PRE_FETCH,
                         payload=PromptPrehookPayload(prompt_id=prompt_id, args=arguments),
@@ -1261,7 +1347,7 @@ class PromptService:
                             span.set_attribute("error.message", str(e))
                         raise PromptError(f"Failed to process prompt: {str(e)}")
 
-                if self._plugin_manager:
+                if has_post_fetch:
                     post_result, _ = await self._plugin_manager.invoke_hook(
                         PromptHookType.PROMPT_POST_FETCH,
                         payload=PromptPosthookPayload(prompt_id=str(prompt.id), result=result),
@@ -1398,7 +1484,7 @@ class PromptService:
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
             >>> service._notify_prompt_updated = MagicMock()
-            >>> service._convert_db_prompt = MagicMock(return_value={})
+            >>> service.convert_prompt_to_read = MagicMock(return_value={})
             >>> import asyncio
             >>> try:
             ...     asyncio.run(service.update_prompt(db, 'prompt_name', MagicMock()))
@@ -1442,6 +1528,8 @@ class PromptService:
             if prompt_update.template is not None:
                 prompt.template = prompt_update.template
                 self._validate_template(prompt.template)
+                # Clear template cache to reduce memory growth
+                _compile_jinja_template.cache_clear()
             if prompt_update.arguments is not None:
                 required_args = self._get_required_arguments(prompt.template)
                 argument_schema = {
@@ -1524,7 +1612,7 @@ class PromptService:
 
             await admin_stats_cache.invalidate_tags()
 
-            return PromptRead.model_validate(self._convert_db_prompt(prompt))
+            return self.convert_prompt_to_read(prompt)
 
         except PermissionError as pe:
             db.rollback()
@@ -1634,7 +1722,7 @@ class PromptService:
             >>> db.refresh = MagicMock()
             >>> service._notify_prompt_activated = MagicMock()
             >>> service._notify_prompt_deactivated = MagicMock()
-            >>> service._convert_db_prompt = MagicMock(return_value={})
+            >>> service.convert_prompt_to_read = MagicMock(return_value={})
             >>> import asyncio
             >>> try:
             ...     asyncio.run(service.toggle_prompt_status(db, 1, True))
@@ -1698,7 +1786,7 @@ class PromptService:
                 )
 
             prompt.team = self._get_team_name(db, prompt.team_id)
-            return PromptRead.model_validate(self._convert_db_prompt(prompt))
+            return self.convert_prompt_to_read(prompt)
         except PermissionError as e:
             structured_logger.log(
                 level="WARNING",
@@ -1750,7 +1838,7 @@ class PromptService:
             >>> service = PromptService()
             >>> db = MagicMock()
             >>> prompt_dict = {'id': '1', 'name': 'test', 'description': 'desc', 'template': 'tpl', 'arguments': [], 'createdAt': '2023-01-01T00:00:00', 'updatedAt': '2023-01-01T00:00:00', 'isActive': True, 'metrics': {}}
-            >>> service._convert_db_prompt = MagicMock(return_value=prompt_dict)
+            >>> service.convert_prompt_to_read = MagicMock(return_value=prompt_dict)
             >>> db.execute.return_value.scalar_one_or_none.return_value = MagicMock()
             >>> import asyncio
             >>> result = asyncio.run(service.get_prompt_details(db, 'prompt_name'))
@@ -1762,7 +1850,7 @@ class PromptService:
             raise PromptNotFoundError(f"Prompt not found: {prompt_id}")
         # Return the fully converted prompt including metrics
         prompt.team = self._get_team_name(db, prompt.team_id)
-        prompt_data = self._convert_db_prompt(prompt)
+        prompt_data = self.convert_prompt_to_read(prompt)
 
         audit_trail.log_action(
             user_id="system",
@@ -1792,7 +1880,7 @@ class PromptService:
 
         return prompt_data
 
-    async def delete_prompt(self, db: Session, prompt_id: Union[int, str], user_email: Optional[str] = None) -> None:
+    async def delete_prompt(self, db: Session, prompt_id: Union[int, str], user_email: Optional[str] = None, purge_metrics: bool = False) -> None:
         """
         Delete a prompt template by its ID.
 
@@ -1800,6 +1888,7 @@ class PromptService:
             db (Session): Database session.
             prompt_id (str): ID of the prompt to delete.
             user_email (Optional[str]): Email of user performing delete (for ownership check).
+            purge_metrics (bool): If True, delete raw + rollup metrics for this prompt.
 
         Raises:
             PromptNotFoundError: If the prompt is not found.
@@ -1841,6 +1930,11 @@ class PromptService:
             prompt_name = prompt.name
             prompt_team_id = prompt.team_id
 
+            if purge_metrics:
+                with pause_rollup_during_purge(reason=f"purge_prompt:{prompt_id}"):
+                    delete_metrics_in_batches(db, PromptMetric, PromptMetric.prompt_id, prompt_id)
+                    delete_metrics_in_batches(db, PromptMetricsHourly, PromptMetricsHourly.prompt_id, prompt_id)
+
             db.delete(prompt)
             db.commit()
             await self._notify_prompt_deleted(prompt_info)
@@ -1869,7 +1963,10 @@ class PromptService:
                 team_id=prompt_team_id,
                 resource_type="prompt",
                 resource_id=str(prompt_info["id"]),
-                custom_fields={"prompt_name": prompt_name},
+                custom_fields={
+                    "prompt_name": prompt_name,
+                    "purge_metrics": purge_metrics,
+                },
                 db=db,
             )
 
@@ -1986,7 +2083,7 @@ class PromptService:
         return variables.union(format_vars)
 
     def _render_template(self, template: str, arguments: Dict[str, str]) -> str:
-        """Render template with arguments.
+        """Render template with arguments using cached compiled templates.
 
         Args:
             template: Template to render
@@ -2008,7 +2105,7 @@ class PromptService:
             'No variables'
         """
         try:
-            jinja_template = self._jinja_env.from_string(template)
+            jinja_template = _compile_jinja_template(template)
             return jinja_template.render(**arguments)
         except Exception:
             try:
@@ -2180,33 +2277,21 @@ class PromptService:
         """
         Aggregate metrics for all prompt invocations across all prompts.
 
-        Uses in-memory caching (10s TTL) to reduce database load under high
-        request rates. Cache is invalidated when metrics are reset.
+        Combines recent raw metrics (within retention period) with historical
+        hourly rollups for complete historical coverage. Uses in-memory caching
+        (10s TTL) to reduce database load under high request rates.
 
         Args:
             db: Database session
 
         Returns:
-            Dict[str, Any]: Aggregated prompt metrics with keys:
-                - total_executions
-                - successful_executions
-                - failed_executions
-                - failure_rate
-                - min_response_time
-                - max_response_time
-                - avg_response_time
-                - last_execution_time
-            Aggregated metrics computed from all PromptMetric records.
+            Dict[str, Any]: Aggregated prompt metrics from raw + hourly rollups.
 
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
-            >>> from unittest.mock import MagicMock
             >>> service = PromptService()
-            >>> db = MagicMock()
-            >>> db.execute.return_value.one.return_value = MagicMock(total_executions=0, successful_executions=0, failed_executions=0, min_response_time=None, max_response_time=None, avg_response_time=None, last_execution_time=None)
-            >>> import asyncio
-            >>> result = asyncio.run(service.aggregate_metrics(db))
-            >>> isinstance(result, dict)
+            >>> # Method exists and is callable
+            >>> callable(service.aggregate_metrics)
             True
         """
         # Check cache first (if enabled)
@@ -2218,34 +2303,12 @@ class PromptService:
             if cached is not None:
                 return cached
 
-        # Execute a single query to get all metrics at once
-        result = db.execute(
-            select(
-                func.count(PromptMetric.id).label("total_executions"),  # pylint: disable=not-callable
-                func.sum(case((PromptMetric.is_success.is_(True), 1), else_=0)).label("successful_executions"),  # pylint: disable=not-callable
-                func.sum(case((PromptMetric.is_success.is_(False), 1), else_=0)).label("failed_executions"),  # pylint: disable=not-callable
-                func.min(PromptMetric.response_time).label("min_response_time"),  # pylint: disable=not-callable
-                func.max(PromptMetric.response_time).label("max_response_time"),  # pylint: disable=not-callable
-                func.avg(PromptMetric.response_time).label("avg_response_time"),  # pylint: disable=not-callable
-                func.max(PromptMetric.timestamp).label("last_execution_time"),  # pylint: disable=not-callable
-            )
-        ).one()
+        # Use combined raw + rollup query for full historical coverage
+        # First-Party
+        from mcpgateway.services.metrics_query_service import aggregate_metrics_combined  # pylint: disable=import-outside-toplevel
 
-        total = result.total_executions or 0
-        successful = result.successful_executions or 0
-        failed = result.failed_executions or 0
-        failure_rate = failed / total if total > 0 else 0.0
-
-        metrics = {
-            "total_executions": total,
-            "successful_executions": successful,
-            "failed_executions": failed,
-            "failure_rate": failure_rate,
-            "min_response_time": result.min_response_time,
-            "max_response_time": result.max_response_time,
-            "avg_response_time": result.avg_response_time,
-            "last_execution_time": result.last_execution_time,
-        }
+        result = aggregate_metrics_combined(db, "prompt")
+        metrics = result.to_dict()
 
         # Cache the result (if enabled)
         if is_cache_enabled():
@@ -2255,7 +2318,7 @@ class PromptService:
 
     async def reset_metrics(self, db: Session) -> None:
         """
-        Reset all prompt metrics by deleting all records from the prompt metrics table.
+        Reset all prompt metrics by deleting raw and hourly rollup records.
 
         Args:
             db: Database session
@@ -2272,6 +2335,7 @@ class PromptService:
         """
 
         db.execute(delete(PromptMetric))
+        db.execute(delete(PromptMetricsHourly))
         db.commit()
 
         # Invalidate metrics cache

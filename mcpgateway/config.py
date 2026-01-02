@@ -816,6 +816,14 @@ class Settings(BaseSettings):
     log_max_size_mb: int = 1  # Max file size in MB before rotation (default: 1MB)
     log_backup_count: int = 5  # Number of backup files to keep (default: 5)
 
+    # Detailed Request Logging Configuration
+    log_detailed_max_body_size: int = Field(
+        default=16384,  # 16KB - sensible default for request body logging
+        ge=1024,
+        le=1048576,  # Max 1MB
+        description="Maximum request body size to log in detailed mode (bytes). Separate from log_max_size_mb which is for file rotation.",
+    )
+
     # Log Buffer (for in-memory storage in admin UI)
     log_buffer_size_mb: float = 1.0  # Size of in-memory log buffer in MB
 
@@ -908,6 +916,14 @@ class Settings(BaseSettings):
     metrics_aggregation_window_minutes: int = Field(default=5, description="Time window for metrics aggregation (minutes)")
     metrics_aggregation_auto_start: bool = Field(default=False, description="Automatically run the log aggregation loop on application startup")
 
+    # Execution Metrics Recording
+    # Controls whether tool/resource/prompt/server/A2A execution metrics are written to the database.
+    # Disable if using external observability (ELK, Datadog, Splunk).
+    # Note: Does NOT affect log aggregation (METRICS_AGGREGATION_ENABLED) or Prometheus (ENABLE_METRICS).
+    db_metrics_recording_enabled: bool = Field(
+        default=True, description="Enable recording of execution metrics (tool/resource/prompt/server/A2A) to database. Disable if using external observability."
+    )
+
     # Metrics Buffer Configuration (for batching tool/resource/prompt metrics writes)
     metrics_buffer_enabled: bool = Field(default=True, description="Enable buffered metrics writes (reduces DB pressure under load)")
     metrics_buffer_flush_interval: int = Field(default=60, ge=5, le=300, description="Seconds between automatic metrics buffer flushes")
@@ -916,6 +932,22 @@ class Settings(BaseSettings):
     # Metrics Cache Configuration (for caching aggregate metrics queries)
     metrics_cache_enabled: bool = Field(default=True, description="Enable in-memory caching for aggregate metrics queries")
     metrics_cache_ttl_seconds: int = Field(default=10, ge=1, le=300, description="TTL for cached aggregate metrics in seconds")
+
+    # Metrics Cleanup Configuration (automatic deletion of old metrics)
+    metrics_cleanup_enabled: bool = Field(default=True, description="Enable automatic cleanup of old metrics data")
+    metrics_retention_days: int = Field(default=7, ge=1, le=365, description="Days to retain raw metrics before cleanup (fallback when rollup disabled)")
+    metrics_cleanup_interval_hours: int = Field(default=1, ge=1, le=168, description="Hours between automatic cleanup runs")
+    metrics_cleanup_batch_size: int = Field(default=10000, ge=100, le=100000, description="Batch size for metrics deletion (prevents long locks)")
+
+    # Metrics Rollup Configuration (hourly aggregation for historical queries)
+    metrics_rollup_enabled: bool = Field(default=True, description="Enable hourly metrics rollup for efficient historical queries")
+    metrics_rollup_interval_hours: int = Field(default=1, ge=1, le=24, description="Hours between rollup runs")
+    metrics_rollup_retention_days: int = Field(default=365, ge=30, le=3650, description="Days to retain hourly rollup data")
+    metrics_rollup_late_data_hours: int = Field(
+        default=1, ge=1, le=48, description="Hours to re-process on each run to catch late-arriving data (smaller = less CPU, larger = more tolerance for delayed metrics)"
+    )
+    metrics_delete_raw_after_rollup: bool = Field(default=True, description="Delete raw metrics after hourly rollup exists (recommended for production)")
+    metrics_delete_raw_after_rollup_hours: int = Field(default=1, ge=1, le=8760, description="Hours to retain raw metrics when hourly rollup exists")
 
     # Auth Cache Configuration (reduces DB queries during authentication)
     auth_cache_enabled: bool = Field(default=True, description="Enable Redis/in-memory caching for authentication data (user, team, revocation)")

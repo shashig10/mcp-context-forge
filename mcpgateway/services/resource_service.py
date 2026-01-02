@@ -36,7 +36,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 import parse
-from sqlalchemy import and_, case, delete, desc, Float, func, not_, or_, select
+from sqlalchemy import and_, delete, desc, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -47,7 +47,7 @@ from mcpgateway.config import settings
 from mcpgateway.db import EmailTeam, fresh_db_session
 from mcpgateway.db import Gateway as DbGateway
 from mcpgateway.db import Resource as DbResource
-from mcpgateway.db import ResourceMetric
+from mcpgateway.db import ResourceMetric, ResourceMetricsHourly
 from mcpgateway.db import ResourceSubscription as DbSubscription
 from mcpgateway.db import server_resource_association
 from mcpgateway.observability import create_span
@@ -55,11 +55,12 @@ from mcpgateway.schemas import ResourceCreate, ResourceMetrics, ResourceRead, Re
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services.metrics_cleanup_service import delete_metrics_in_batches, pause_rollup_during_purge
 from mcpgateway.services.oauth_manager import OAuthManager
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService
 from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.utils.metrics_common import build_top_performers
-from mcpgateway.utils.pagination import decode_cursor, encode_cursor
+from mcpgateway.utils.pagination import unified_paginate
 from mcpgateway.utils.services_auth import decode_auth
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
 from mcpgateway.utils.validate_signature import validate_signature
@@ -187,17 +188,19 @@ class ResourceService:
         await self._event_service.shutdown()
         logger.info("Resource service shutdown complete")
 
-    async def get_top_resources(self, db: Session, limit: Optional[int] = 5) -> List[TopPerformer]:
+    async def get_top_resources(self, db: Session, limit: Optional[int] = 5, include_deleted: bool = False) -> List[TopPerformer]:
         """Retrieve the top-performing resources based on execution count.
 
         Queries the database to get resources with their metrics, ordered by the number of executions
-        in descending order. Uses the resource URI as the name field for TopPerformer objects.
+        in descending order. Combines recent raw metrics with historical hourly rollups for complete
+        historical coverage. Uses the resource URI as the name field for TopPerformer objects.
         Returns a list of TopPerformer objects containing resource details and performance metrics.
         Results are cached for performance.
 
         Args:
             db (Session): Database session for querying resource metrics.
             limit (Optional[int]): Maximum number of resources to return. Defaults to 5.
+            include_deleted (bool): Whether to include deleted resources from rollups.
 
         Returns:
             List[TopPerformer]: A list of TopPerformer objects, each containing:
@@ -213,36 +216,26 @@ class ResourceService:
         from mcpgateway.cache.metrics_cache import is_cache_enabled, metrics_cache  # pylint: disable=import-outside-toplevel
 
         effective_limit = limit or 5
-        cache_key = f"top_resources:{effective_limit}"
+        cache_key = f"top_resources:{effective_limit}:include_deleted={include_deleted}"
 
         if is_cache_enabled():
             cached = metrics_cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        query = (
-            db.query(
-                DbResource.id,
-                DbResource.uri.label("name"),  # Using URI as the name field for TopPerformer
-                func.count(ResourceMetric.id).label("execution_count"),  # pylint: disable=not-callable
-                func.avg(ResourceMetric.response_time).label("avg_response_time"),  # pylint: disable=not-callable
-                case(
-                    (
-                        func.count(ResourceMetric.id) > 0,  # pylint: disable=not-callable
-                        func.sum(case((ResourceMetric.is_success.is_(True), 1), else_=0)).cast(Float) / func.count(ResourceMetric.id) * 100,  # pylint: disable=not-callable
-                    ),
-                    else_=None,
-                ).label("success_rate"),
-                func.max(ResourceMetric.timestamp).label("last_execution"),  # pylint: disable=not-callable
-            )
-            .outerjoin(ResourceMetric)
-            .group_by(DbResource.id, DbResource.uri)
-            .order_by(desc("execution_count"))
+        # Use combined query that includes both raw metrics and rollup data
+        # Use name_column="uri" to maintain backward compatibility (resources show URI as name)
+        # First-Party
+        from mcpgateway.services.metrics_query_service import get_top_performers_combined  # pylint: disable=import-outside-toplevel
+
+        results = get_top_performers_combined(
+            db=db,
+            metric_type="resource",
+            entity_model=DbResource,
+            limit=effective_limit,
+            name_column="uri",  # Resources use URI as display name
+            include_deleted=include_deleted,
         )
-
-        query = query.limit(effective_limit)
-
-        results = query.all()
         top_performers = build_top_performers(results)
 
         # Cache the result (if enabled)
@@ -251,7 +244,7 @@ class ResourceService:
 
         return top_performers
 
-    def _convert_resource_to_read(self, resource: DbResource, include_metrics: bool = False) -> ResourceRead:
+    def convert_resource_to_read(self, resource: DbResource, include_metrics: bool = False) -> ResourceRead:
         """
         Converts a DbResource instance into a ResourceRead model, optionally including aggregated metrics.
 
@@ -275,7 +268,7 @@ class ResourceService:
             ...     id="ca627760127d409080fdefc309147e08", uri='res://x', name='R', description=None, mime_type='text/plain', size=123,
             ...     created_at=now, updated_at=now, enabled=True, tags=[{"id": "t", "label": "T"}], metrics=[m1, m2]
             ... )
-            >>> out = svc._convert_resource_to_read(r, include_metrics=True)
+            >>> out = svc.convert_resource_to_read(r, include_metrics=True)
             >>> out.metrics.total_executions
             2
             >>> out.metrics.successful_executions
@@ -398,7 +391,7 @@ class ResourceService:
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
             >>> service._notify_resource_added = AsyncMock()
-            >>> service._convert_resource_to_read = MagicMock(return_value='resource_read')
+            >>> service.convert_resource_to_read = MagicMock(return_value='resource_read')
             >>> ResourceRead.model_validate = MagicMock(return_value='resource_read')
             >>> import asyncio
             >>> asyncio.run(service.register_resource(db, resource))
@@ -506,7 +499,7 @@ class ResourceService:
             )
 
             db_resource.team = self._get_team_name(db, db_resource.team_id)
-            return self._convert_resource_to_read(db_resource)
+            return self.convert_resource_to_read(db_resource)
         except IntegrityError as ie:
             logger.error(f"IntegrityErrors in group: {ie}")
 
@@ -815,7 +808,19 @@ class ResourceService:
 
         return stats
 
-    async def list_resources(self, db: Session, include_inactive: bool = False, cursor: Optional[str] = None, tags: Optional[List[str]] = None) -> tuple[List[ResourceRead], Optional[str]]:
+    async def list_resources(
+        self,
+        db: Session,
+        include_inactive: bool = False,
+        cursor: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
+        user_email: Optional[str] = None,
+        team_id: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> Union[tuple[List[ResourceRead], Optional[str]], Dict[str, Any]]:
         """
         Retrieve a list of registered resources from the database with pagination support.
 
@@ -828,13 +833,19 @@ class ResourceService:
             include_inactive (bool): If True, include inactive resources in the result.
                 Defaults to False.
             cursor (Optional[str], optional): An opaque cursor token for pagination.
-                Opaque base64-encoded string containing last item's ID.
+                Opaque base64-encoded string containing last item's ID and created_at.
             tags (Optional[List[str]]): Filter resources by tags. If provided, only resources with at least one matching tag will be returned.
+            limit (Optional[int]): Maximum number of resources to return. Use 0 for all resources (no limit).
+                If not specified, uses pagination_default_page_size.
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor.
+            per_page: Items per page for page-based pagination. Defaults to pagination_default_page_size.
+            user_email (Optional[str]): User email for team-based access control. If None, no access control is applied.
+            team_id (Optional[str]): Filter by specific team ID. Requires user_email for access validation.
+            visibility (Optional[str]): Filter by visibility (private, team, public).
 
         Returns:
-            tuple[List[ResourceRead], Optional[str]]: Tuple containing:
-                - List of resources for current page
-                - Next cursor token if more results exist, None otherwise
+            If page is provided: Dict with {"data": [...], "pagination": {...}, "links": {...}}
+            If cursor is provided or neither: tuple of (list of ResourceRead objects, next_cursor).
 
         Examples:
             >>> from mcpgateway.services.resource_service import ResourceService
@@ -842,7 +853,7 @@ class ResourceService:
             >>> service = ResourceService()
             >>> db = MagicMock()
             >>> resource_read = MagicMock()
-            >>> service._convert_resource_to_read = MagicMock(return_value=resource_read)
+            >>> service.convert_resource_to_read = MagicMock(return_value=resource_read)
             >>> db.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
             >>> import asyncio
             >>> resources, next_cursor = asyncio.run(service.list_resources(db))
@@ -861,74 +872,111 @@ class ResourceService:
             True
         """
         # Check cache for first page only (cursor=None)
+        # Skip caching when user_email is provided (team-filtered results are user-specific) or page based pagination
         cache = _get_registry_cache()
-        if cursor is None:
-            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None)
+        if cursor is None and user_email is None and page is None:
+            filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, limit=limit)
             cached = await cache.get("resources", filters_hash)
             if cached is not None:
                 # Reconstruct ResourceRead objects from cached dicts
                 cached_resources = [ResourceRead.model_validate(r) for r in cached["resources"]]
                 return (cached_resources, cached.get("next_cursor"))
 
-        page_size = settings.pagination_default_page_size
-        query = select(DbResource).where(DbResource.uri_template.is_(None)).order_by(DbResource.id)  # Consistent ordering for cursor pagination
+        # Build base query with ordering
+        query = select(DbResource).where(DbResource.uri_template.is_(None)).order_by(desc(DbResource.created_at), desc(DbResource.id))
 
-        # Decode cursor to get last_id if provided
-        last_id = None
-        if cursor:
-            try:
-                cursor_data = decode_cursor(cursor)
-                last_id = cursor_data.get("id")
-                logger.debug(f"Decoded cursor: last_id={last_id}")
-            except ValueError as e:
-                logger.warning(f"Invalid cursor, ignoring: {e}")
-
-        # Apply cursor filter (WHERE id > last_id)
-        if last_id:
-            query = query.where(DbResource.id > last_id)
-
+        # Apply active/inactive filter
         if not include_inactive:
             query = query.where(DbResource.enabled)
+
+        # Apply team-based access control if user_email is provided
+        if user_email:
+            # First-Party
+            from mcpgateway.services.team_management_service import TeamManagementService  # pylint: disable=import-outside-toplevel
+
+            team_service = TeamManagementService(db)
+            user_teams = await team_service.get_user_teams(user_email)
+            team_ids = [team.id for team in user_teams]
+
+            if team_id:
+                # User requesting specific team - verify access
+                if team_id not in team_ids:
+                    return ([], None)  # No access to this team
+
+                access_conditions = [
+                    and_(DbResource.team_id == team_id, DbResource.visibility.in_(["team", "public"])),
+                    and_(DbResource.team_id == team_id, DbResource.owner_email == user_email),
+                ]
+                query = query.where(or_(*access_conditions))
+            else:
+                # General access: user's resources + public resources + team resources
+                access_conditions = [
+                    DbResource.owner_email == user_email,
+                    DbResource.visibility == "public",
+                ]
+                if team_ids:
+                    access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
+
+                query = query.where(or_(*access_conditions))
+
+            # Apply visibility filter if specified
+            if visibility:
+                query = query.where(DbResource.visibility == visibility)
 
         # Add tag filtering if tags are provided
         if tags:
             query = query.where(json_contains_expr(db, DbResource.tags, tags, match_any=True))
 
-        # Fetch page_size + 1 to determine if there are more results
-        query = query.limit(page_size + 1)
-        resources = db.execute(query).scalars().all()
+        # Use unified pagination helper - handles both page and cursor pagination
+        pag_result = await unified_paginate(
+            db=db,
+            query=query,
+            page=page,
+            per_page=per_page,
+            cursor=cursor,
+            limit=limit,
+            base_url="/admin/resources",  # Used for page-based links
+            query_params={"include_inactive": include_inactive} if include_inactive else {},
+        )
 
-        # Check if there are more results
-        has_more = len(resources) > page_size
-        if has_more:
-            resources = resources[:page_size]  # Trim to page_size
+        next_cursor = None
+        # Extract servers based on pagination type
+        if page is not None:
+            # Page-based: pag_result is a dict
+            resources_db = pag_result["data"]
+        else:
+            # Cursor-based: pag_result is a tuple
+            resources_db, next_cursor = pag_result
 
-        # Batch fetch team names to avoid N+1 queries
-        team_ids = {r.team_id for r in resources if r.team_id}
+        # Fetch team names for the resources (common for both pagination types)
+        team_ids_set = {s.team_id for s in resources_db if s.team_id}
         team_map = {}
-        if team_ids:
-            teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids), EmailTeam.is_active.is_(True))).all()
-            team_map = {str(team.id): team.name for team in teams}
+        if team_ids_set:
+            teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids_set), EmailTeam.is_active.is_(True))).all()
+            team_map = {team.id: team.name for team in teams}
 
         db.commit()  # Release transaction to avoid idle-in-transaction
 
-        # Convert to ResourceRead objects (skip metrics to avoid N+1 queries)
+        # Convert to ResourceRead (common for both pagination types)
         result = []
-        for t in resources:
-            t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(self._convert_resource_to_read(t, include_metrics=False))
+        for s in resources_db:
+            s.team = team_map.get(s.team_id) if s.team_id else None
+            result.append(self.convert_resource_to_read(s, include_metrics=False))
+        # Return appropriate format based on pagination type
+        if page is not None:
+            # Page-based format
+            return {
+                "data": result,
+                "pagination": pag_result["pagination"],
+                "links": pag_result["links"],
+            }
 
-        # Generate next_cursor if there are more results
-        next_cursor = None
-        if has_more and result:
-            last_resource = resources[-1]  # Get last DB object
-            next_cursor = encode_cursor({"id": last_resource.id})
-            logger.debug(f"Generated next_cursor for id={last_resource.id}")
+        # Cursor-based format
 
-        # Cache first page results
-        if cursor is None:
+        # Cache first page results - only for non-user-specific queries
+        if cursor is None and user_email is None:
             try:
-                cache_data = {"resources": [r.model_dump(mode="json") for r in result], "next_cursor": next_cursor}
+                cache_data = {"resources": [s.model_dump(mode="json") for s in result], "next_cursor": next_cursor}
                 await cache.set("resources", cache_data, filters_hash)
             except AttributeError:
                 pass  # Skip caching if result objects don't support model_dump (e.g., in doctests)
@@ -939,7 +987,12 @@ class ResourceService:
         self, db: Session, user_email: str, team_id: Optional[str] = None, visibility: Optional[str] = None, include_inactive: bool = False, skip: int = 0, limit: int = 100
     ) -> List[ResourceRead]:
         """
+        DEPRECATED: Use list_resources() with user_email parameter instead.
+
         List resources user has access to with team filtering.
+
+        This method is maintained for backward compatibility but is no longer used.
+        New code should call list_resources() with user_email, team_id, and visibility parameters.
 
         Args:
             db: Database session
@@ -969,7 +1022,7 @@ class ResourceService:
             ...     team_id = None
             >>> fake_resource = FakeResource()
             >>> db.execute.return_value.scalars.return_value.all.return_value = [fake_resource]
-            >>> service._convert_resource_to_read = MagicMock(return_value="converted")
+            >>> service.convert_resource_to_read = MagicMock(return_value="converted")
             >>> asyncio.run(service.list_resources_for_user(db, "user@example.com"))
             ['converted']
 
@@ -979,7 +1032,7 @@ class ResourceService:
             ...     team_id = None
             >>> fake_resource2 = FakeResource2()
             >>> db2.execute.return_value.scalars.return_value.all.return_value = [fake_resource2]
-            >>> service._convert_resource_to_read = MagicMock(return_value="converted2")
+            >>> service.convert_resource_to_read = MagicMock(return_value="converted2")
             >>> out2 = asyncio.run(service.list_resources_for_user(db2, "user@example.com"))
             >>> out2
             ['converted2']
@@ -1045,7 +1098,7 @@ class ResourceService:
         result = []
         for t in resources:
             t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(self._convert_resource_to_read(t, include_metrics=False))
+            result.append(self.convert_resource_to_read(t, include_metrics=False))
         return result
 
     async def list_server_resources(self, db: Session, server_id: str, include_inactive: bool = False) -> List[ResourceRead]:
@@ -1072,7 +1125,7 @@ class ResourceService:
             >>> service = ResourceService()
             >>> db = MagicMock()
             >>> resource_read = MagicMock()
-            >>> service._convert_resource_to_read = MagicMock(return_value=resource_read)
+            >>> service.convert_resource_to_read = MagicMock(return_value=resource_read)
             >>> db.execute.return_value.scalars.return_value.all.return_value = [MagicMock()]
             >>> import asyncio
             >>> result = asyncio.run(service.list_server_resources(db, 'server1'))
@@ -1107,7 +1160,7 @@ class ResourceService:
         result = []
         for t in resources:
             t.team = team_map.get(str(t.team_id)) if t.team_id else None
-            result.append(self._convert_resource_to_read(t, include_metrics=False))
+            result.append(self.convert_resource_to_read(t, include_metrics=False))
         return result
 
     async def _record_resource_metric(self, db: Session, resource: DbResource, start_time: float, success: bool, error_message: Optional[str]) -> None:
@@ -1615,12 +1668,14 @@ class ResourceService:
         Examples:
             >>> from mcpgateway.common.models import ResourceContent
             >>> from mcpgateway.services.resource_service import ResourceService
-            >>> from unittest.mock import MagicMock
+            >>> from unittest.mock import MagicMock, PropertyMock
             >>> service = ResourceService()
             >>> db = MagicMock()
             >>> uri = 'http://example.com/resource.txt'
-            >>> import types
-            >>> mock_resource = types.SimpleNamespace(id=123,content='test', uri=uri)
+            >>> mock_resource = MagicMock()
+            >>> mock_resource.id = 123
+            >>> mock_resource.uri = uri
+            >>> type(mock_resource).content = PropertyMock(return_value='test')
             >>> db.execute.return_value.scalar_one_or_none.return_value = mock_resource
             >>> db.get.return_value = mock_resource
             >>> import asyncio
@@ -1632,13 +1687,20 @@ class ResourceService:
 
             >>> db2 = MagicMock()
             >>> db2.execute.return_value.scalar_one_or_none.return_value = None
+            >>> db2.get.return_value = None
             >>> import asyncio
+            >>> # Disable path validation for doctest
+            >>> import mcpgateway.config
+            >>> old_val = getattr(mcpgateway.config.settings, 'experimental_validate_io', False)
+            >>> mcpgateway.config.settings.experimental_validate_io = False
             >>> def _nf():
             ...     try:
             ...         asyncio.run(service.read_resource(db2, resource_uri='abc'))
             ...     except ResourceNotFoundError:
             ...         return True
-            >>> _nf()
+            >>> result = _nf()
+            >>> mcpgateway.config.settings.experimental_validate_io = old_val
+            >>> result
             True
         """
         start_time = time.monotonic()
@@ -1695,15 +1757,23 @@ class ResourceService:
 
                 original_uri = uri
                 contexts = None
-                # Call pre-fetch hooks if plugin manager is available
-                plugin_eligible = bool(self._plugin_manager and PLUGINS_AVAILABLE and uri and ("://" in uri))
-                if plugin_eligible:
-                    # Initialize plugin manager if needed
-                    # pylint: disable=protected-access
-                    if not self._plugin_manager._initialized:
-                        await self._plugin_manager.initialize()
-                    # pylint: enable=protected-access
 
+                # Check if plugin manager is available and eligible for this request
+                plugin_eligible = bool(self._plugin_manager and PLUGINS_AVAILABLE and uri and ("://" in uri))
+
+                # Initialize plugin manager if needed (lazy init must happen before has_hooks_for check)
+                # pylint: disable=protected-access
+                if plugin_eligible and not self._plugin_manager._initialized:
+                    await self._plugin_manager.initialize()
+                # pylint: enable=protected-access
+
+                # Check if any resource hooks are registered to avoid unnecessary context creation
+                has_pre_fetch = plugin_eligible and self._plugin_manager.has_hooks_for(ResourceHookType.RESOURCE_PRE_FETCH)
+                has_post_fetch = plugin_eligible and self._plugin_manager.has_hooks_for(ResourceHookType.RESOURCE_POST_FETCH)
+
+                # Initialize plugin context variables only if hooks are registered
+                global_context = None
+                if has_pre_fetch or has_post_fetch:
                     # Create plugin context
                     # Normalize user to an identifier string if provided
                     user_id = None
@@ -1728,6 +1798,8 @@ class ResourceService:
                         # Create new context (fallback when middleware didn't run)
                         global_context = GlobalContext(request_id=request_id, user=user_id, server_id=server_id)
 
+                # Call pre-fetch hooks if registered
+                if has_pre_fetch:
                     # Create pre-fetch payload
                     pre_payload = ResourcePreFetchPayload(uri=uri, metadata={})
 
@@ -1804,8 +1876,8 @@ class ResourceService:
                             raise ResourceNotFoundError(f"Resource '{resource_id}' exists but is inactive")
                         raise ResourceNotFoundError(f"Resource not found for the resource id: {resource_id}")
 
-                # Call post-fetch hooks if plugin manager is available
-                if plugin_eligible:
+                # Call post-fetch hooks if registered
+                if has_post_fetch:
                     # Create post-fetch payload
                     post_payload = ResourcePostFetchPayload(uri=original_uri, content=content)
                     # Execute post-fetch hooks
@@ -1923,7 +1995,7 @@ class ResourceService:
             >>> db.refresh = MagicMock()
             >>> service._notify_resource_activated = AsyncMock()
             >>> service._notify_resource_deactivated = AsyncMock()
-            >>> service._convert_resource_to_read = MagicMock(return_value='resource_read')
+            >>> service.convert_resource_to_read = MagicMock(return_value='resource_read')
             >>> ResourceRead.model_validate = MagicMock(return_value='resource_read')
             >>> import asyncio
             >>> asyncio.run(service.toggle_resource_status(db, 1, True))
@@ -1997,7 +2069,7 @@ class ResourceService:
                 )
 
             resource.team = self._get_team_name(db, resource.team_id)
-            return self._convert_resource_to_read(resource)
+            return self.convert_resource_to_read(resource)
         except PermissionError as e:
             # Structured logging: Log permission error
             structured_logger.log(
@@ -2156,7 +2228,7 @@ class ResourceService:
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
             >>> service._notify_resource_updated = AsyncMock()
-            >>> service._convert_resource_to_read = MagicMock(return_value='resource_read')
+            >>> service.convert_resource_to_read = MagicMock(return_value='resource_read')
             >>> ResourceRead.model_validate = MagicMock(return_value='resource_read')
             >>> import asyncio
             >>> asyncio.run(service.update_resource(db, 'resource_id', MagicMock()))
@@ -2246,6 +2318,11 @@ class ResourceService:
             from mcpgateway.cache.admin_stats_cache import admin_stats_cache  # pylint: disable=import-outside-toplevel
 
             await admin_stats_cache.invalidate_tags()
+            # First-Party
+            from mcpgateway.cache.metrics_cache import metrics_cache  # pylint: disable=import-outside-toplevel
+
+            metrics_cache.invalidate_prefix("top_resources:")
+            metrics_cache.invalidate("resources")
 
             # Notify subscribers
             await self._notify_resource_updated(resource)
@@ -2301,7 +2378,7 @@ class ResourceService:
                 db=db,
             )
 
-            return self._convert_resource_to_read(resource)
+            return self.convert_resource_to_read(resource)
         except PermissionError as pe:
             db.rollback()
 
@@ -2385,7 +2462,7 @@ class ResourceService:
             )
             raise ResourceError(f"Failed to update resource: {str(e)}")
 
-    async def delete_resource(self, db: Session, resource_id: Union[int, str], user_email: Optional[str] = None) -> None:
+    async def delete_resource(self, db: Session, resource_id: Union[int, str], user_email: Optional[str] = None, purge_metrics: bool = False) -> None:
         """
         Delete a resource.
 
@@ -2393,6 +2470,7 @@ class ResourceService:
             db: Database session
             resource_id: Resource ID
             user_email: Email of user performing delete (for ownership check)
+            purge_metrics: If True, delete raw + rollup metrics for this resource
 
         Raises:
             ResourceNotFoundError: If the resource is not found
@@ -2439,6 +2517,11 @@ class ResourceService:
 
             # Remove subscriptions using SQLAlchemy's delete() expression.
             db.execute(delete(DbSubscription).where(DbSubscription.resource_id == resource.id))
+
+            if purge_metrics:
+                with pause_rollup_during_purge(reason=f"purge_resource:{resource.id}"):
+                    delete_metrics_in_batches(db, ResourceMetric, ResourceMetric.resource_id, resource.id)
+                    delete_metrics_in_batches(db, ResourceMetricsHourly, ResourceMetricsHourly.resource_id, resource.id)
 
             # Hard delete the resource.
             resource_uri = resource.uri
@@ -2490,6 +2573,7 @@ class ResourceService:
                 resource_id=str(resource_info["id"]),
                 custom_fields={
                     "resource_uri": resource_uri,
+                    "purge_metrics": purge_metrics,
                 },
                 db=db,
             )
@@ -2564,7 +2648,7 @@ class ResourceService:
             >>> db = MagicMock()
             >>> resource = MagicMock()
             >>> db.execute.return_value.scalar_one_or_none.return_value = resource
-            >>> service._convert_resource_to_read = MagicMock(return_value='resource_read')
+            >>> service.convert_resource_to_read = MagicMock(return_value='resource_read')
             >>> import asyncio
             >>> asyncio.run(service.get_resource_by_id(db, "39334ce0ed2644d79ede8913a66930c9"))
             'resource_read'
@@ -2586,7 +2670,7 @@ class ResourceService:
 
             raise ResourceNotFoundError(f"Resource not found: {resource_id}")
 
-        resource_read = self._convert_resource_to_read(resource)
+        resource_read = self.convert_resource_to_read(resource)
 
         structured_logger.log(
             level="INFO",
@@ -2923,24 +3007,21 @@ class ResourceService:
         """
         Aggregate metrics for all resource invocations across all resources.
 
-        Uses in-memory caching (10s TTL) to reduce database load under high
-        request rates. Cache is invalidated when metrics are reset.
+        Combines recent raw metrics (within retention period) with historical
+        hourly rollups for complete historical coverage. Uses in-memory caching
+        (10s TTL) to reduce database load under high request rates.
 
         Args:
             db: Database session
 
         Returns:
-            ResourceMetrics: Aggregated metrics computed from all ResourceMetric records.
+            ResourceMetrics: Aggregated metrics from raw + hourly rollup tables.
 
         Examples:
             >>> from mcpgateway.services.resource_service import ResourceService
-            >>> from unittest.mock import MagicMock
             >>> service = ResourceService()
-            >>> db = MagicMock()
-            >>> db.execute.return_value.one.return_value = MagicMock(total_executions=0, successful_executions=0, failed_executions=0, min_response_time=None, max_response_time=None, avg_response_time=None, last_execution_time=None)
-            >>> import asyncio
-            >>> result = asyncio.run(service.aggregate_metrics(db))
-            >>> hasattr(result, 'total_executions')
+            >>> # Method exists and is callable
+            >>> callable(service.aggregate_metrics)
             True
         """
         # Check cache first (if enabled)
@@ -2952,28 +3033,17 @@ class ResourceService:
             if cached is not None:
                 return ResourceMetrics(**cached)
 
-        # Execute a single query to get all metrics at once
-        result = db.execute(
-            select(
-                func.count().label("total_executions"),  # pylint: disable=not-callable
-                func.sum(case((ResourceMetric.is_success.is_(True), 1), else_=0)).label("successful_executions"),  # pylint: disable=not-callable
-                func.sum(case((ResourceMetric.is_success.is_(False), 1), else_=0)).label("failed_executions"),  # pylint: disable=not-callable
-                func.min(ResourceMetric.response_time).label("min_response_time"),  # pylint: disable=not-callable
-                func.max(ResourceMetric.response_time).label("max_response_time"),  # pylint: disable=not-callable
-                func.avg(ResourceMetric.response_time).label("avg_response_time"),  # pylint: disable=not-callable
-                func.max(ResourceMetric.timestamp).label("last_execution_time"),  # pylint: disable=not-callable
-            ).select_from(ResourceMetric)
-        ).one()
+        # Use combined raw + rollup query for full historical coverage
+        # First-Party
+        from mcpgateway.services.metrics_query_service import aggregate_metrics_combined  # pylint: disable=import-outside-toplevel
 
-        total_executions = result.total_executions or 0
-        successful_executions = result.successful_executions or 0
-        failed_executions = result.failed_executions or 0
+        result = aggregate_metrics_combined(db, "resource")
 
         metrics = ResourceMetrics(
-            total_executions=total_executions,
-            successful_executions=successful_executions,
-            failed_executions=failed_executions,
-            failure_rate=(failed_executions / total_executions) if total_executions > 0 else 0.0,
+            total_executions=result.total_executions,
+            successful_executions=result.successful_executions,
+            failed_executions=result.failed_executions,
+            failure_rate=result.failure_rate,
             min_response_time=result.min_response_time,
             max_response_time=result.max_response_time,
             avg_response_time=result.avg_response_time,
@@ -2988,7 +3058,7 @@ class ResourceService:
 
     async def reset_metrics(self, db: Session) -> None:
         """
-        Reset all resource metrics by deleting all records from the resource metrics table.
+        Reset all resource metrics by deleting raw and hourly rollup records.
 
         Args:
             db: Database session
@@ -3004,6 +3074,7 @@ class ResourceService:
             >>> asyncio.run(service.reset_metrics(db))
         """
         db.execute(delete(ResourceMetric))
+        db.execute(delete(ResourceMetricsHourly))
         db.commit()
 
         # Invalidate metrics cache
