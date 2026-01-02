@@ -261,6 +261,19 @@ def _drop_index_safe(index_name: str, table_name: str) -> bool:
         return False
 
 
+def _foreign_key_exists(table_name: str, constraint_name: str) -> bool:
+    """Check if a foreign key constraint exists on the specified table."""
+    conn = op.get_bind()
+    inspector = inspect(conn)
+
+    try:
+        foreign_keys = inspector.get_foreign_keys(table_name)
+    except Exception:
+        return False
+
+    return any(fk.get("name") == constraint_name for fk in foreign_keys)
+
+
 def upgrade() -> None:
     """Add foreign key and composite indexes for improved query performance.
 
@@ -748,8 +761,11 @@ def upgrade() -> None:
         print("\n--- PostgreSQL: Adding CASCADE to team_member_history FK ---")
         try:
             # Drop the existing foreign key constraint (correct name from schema)
-            op.drop_constraint("fk_email_team_member_history_team_member_id", "email_team_member_history", type_="foreignkey")
-            print("✓ Dropped existing FK constraint: fk_email_team_member_history_team_member_id")
+            if _foreign_key_exists("email_team_member_history", "fk_email_team_member_history_team_member_id"):
+                op.drop_constraint("fk_email_team_member_history_team_member_id", "email_team_member_history", type_="foreignkey")
+                print("✓ Dropped existing FK constraint: fk_email_team_member_history_team_member_id")
+            else:
+                print("⚠️  FK constraint fk_email_team_member_history_team_member_id does not exist, skipping drop.")
 
             # Recreate with CASCADE
             op.create_foreign_key("fk_email_team_member_history_team_member_id", "email_team_member_history", "email_team_members", ["team_member_id"], ["id"], ondelete="CASCADE")
