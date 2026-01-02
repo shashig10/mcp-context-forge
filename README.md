@@ -1845,6 +1845,8 @@ MCP Gateway provides flexible logging with **stdout/stderr output by default** a
 | ----------------------- | ---------------------------------- | ----------------- | -------------------------- |
 | `LOG_LEVEL`             | Minimum log level                  | `INFO`            | `DEBUG`...`CRITICAL`       |
 | `LOG_FORMAT`            | Console log format                 | `json`            | `json`, `text`             |
+| `LOG_REQUESTS`          | Enable detailed request logging    | `false`           | `true`, `false`            |
+| `LOG_DETAILED_MAX_BODY_SIZE` | Max request body size to log (bytes) | `16384`       | `1024` - `1048576`         |
 | `LOG_TO_FILE`           | **Enable file logging**            | **`false`**       | **`true`, `false`**        |
 | `LOG_FILE`              | Log filename (when enabled)        | `null`            | `mcpgateway.log`           |
 | `LOG_FOLDER`            | Directory for log files            | `null`            | `logs`, `/var/log/gateway` |
@@ -1860,6 +1862,7 @@ MCP Gateway provides flexible logging with **stdout/stderr output by default** a
 - **Log Rotation**: When `LOG_ROTATION_ENABLED=true`, files rotate at `LOG_MAX_SIZE_MB` with `LOG_BACKUP_COUNT` backup files (e.g., `.log.1`, `.log.2`)
 - **Directory Creation**: Log folder is automatically created if it doesn't exist
 - **Centralized Service**: All modules use the unified `LoggingService` for consistent formatting
+- **Detailed Request Logging**: When `LOG_REQUESTS=true`, payload logging is truncated to `LOG_DETAILED_MAX_BODY_SIZE` and skipped for `/health`, `/healthz`, `/static`, and `/favicon.ico`
 
 **Example Configurations:**
 
@@ -1881,6 +1884,10 @@ LOG_MAX_SIZE_MB=10
 LOG_BACKUP_COUNT=3
 LOG_FOLDER=/var/log/mcpgateway
 LOG_FILE=gateway.log
+
+# Optional: Enable detailed request payload logging (truncated)
+LOG_REQUESTS=true
+LOG_DETAILED_MAX_BODY_SIZE=16384
 ```
 
 **Default Behavior:**
@@ -2021,6 +2028,37 @@ ENABLE_METRICS=false
 > 📊 **Prometheus Endpoint**: Access metrics at `GET /metrics/prometheus` (requires authentication if `AUTH_REQUIRED=true`)
 >
 > 🎯 **Grafana Integration**: Import metrics into Grafana dashboards using the configured namespace as a filter
+
+### Metrics Cleanup & Rollup
+
+Automatic management of metrics data to prevent unbounded table growth and maintain query performance.
+
+| Setting                              | Description                                      | Default  | Options     |
+| ------------------------------------ | ------------------------------------------------ | -------- | ----------- |
+| `DB_METRICS_RECORDING_ENABLED`       | Enable execution metrics recording (tool/resource/prompt/server/A2A) | `true` | bool |
+| `METRICS_CLEANUP_ENABLED`            | Enable automatic cleanup of old metrics          | `true`   | bool        |
+| `METRICS_RETENTION_DAYS`             | Days to retain raw metrics (fallback)            | `7`      | 1-365       |
+| `METRICS_CLEANUP_INTERVAL_HOURS`     | Hours between automatic cleanup runs             | `1`      | 1-168       |
+| `METRICS_CLEANUP_BATCH_SIZE`         | Batch size for deletion (prevents long locks)    | `10000`  | 100-100000  |
+| `METRICS_ROLLUP_ENABLED`             | Enable hourly metrics rollup                     | `true`   | bool        |
+| `METRICS_ROLLUP_INTERVAL_HOURS`      | Hours between rollup runs                        | `1`      | 1-24        |
+| `METRICS_ROLLUP_RETENTION_DAYS`      | Days to retain hourly rollup data                | `365`    | 30-3650     |
+| `METRICS_ROLLUP_LATE_DATA_HOURS`     | Hours to re-process for late-arriving data       | `1`      | 1-48        |
+| `METRICS_DELETE_RAW_AFTER_ROLLUP`    | Delete raw metrics after rollup exists           | `true`   | bool        |
+| `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS` | Hours to retain raw when rollup exists        | `1`      | 1-8760      |
+
+**Key Features:**
+- 📊 **Hourly rollup**: Pre-aggregated summaries with p50/p95/p99 percentiles
+- 🗑️ **Batched cleanup**: Prevents long table locks during deletion
+- 📈 **Admin API**: Manual triggers at `/api/metrics/cleanup` and `/api/metrics/rollup`
+- ⚙️ **Configurable retention**: Separate retention for raw and rollup data
+
+**Deletion behavior:**
+- Deleted tools/resources/prompts/servers are removed from Top Performers by default, but historical rollups remain for reporting.
+- To permanently erase metrics for a deleted entity, use the Admin UI delete prompt and choose **Purge metrics**, or call the delete endpoints with `?purge_metrics=true`.
+- Purge deletes use batched deletes sized by `METRICS_CLEANUP_BATCH_SIZE` to reduce long table locks on large datasets.
+
+> 🚀 **Performance**: Reduces storage by 90%+ and query latency from seconds to milliseconds for historical data
 
 ### Transport
 

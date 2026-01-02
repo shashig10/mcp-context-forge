@@ -95,6 +95,7 @@ Kubernetes: `>=1.21.0-0`
 | mcpContextForge.config.LOG_LEVEL | string | `"INFO"` |  |
 | mcpContextForge.config.LOG_MAX_SIZE_MB | string | `"1"` |  |
 | mcpContextForge.config.LOG_REQUESTS | string | `"false"` |  |
+| mcpContextForge.config.LOG_DETAILED_MAX_BODY_SIZE | string | `"16384"` |  |
 | mcpContextForge.config.LOG_ROTATION_ENABLED | string | `"false"` |  |
 | mcpContextForge.config.LOG_TO_FILE | string | `"false"` |  |
 | mcpContextForge.config.MAX_PROMPT_SIZE | string | `"102400"` |  |
@@ -118,6 +119,7 @@ Kubernetes: `>=1.21.0-0`
 | mcpContextForge.config.MCPGATEWAY_UI_ENABLED | string | `"true"` |  |
 | mcpContextForge.config.MCPGATEWAY_UI_TOOL_TEST_TIMEOUT | string | `"60000"` |  |
 | mcpContextForge.config.MESSAGE_TTL | string | `"600"` |  |
+| mcpContextForge.config.DB_METRICS_RECORDING_ENABLED | string | `"true"` | Enable execution metrics recording |
 | mcpContextForge.config.METRICS_BUFFER_ENABLED | string | `"true"` |  |
 | mcpContextForge.config.METRICS_BUFFER_FLUSH_INTERVAL | string | `"60"` |  |
 | mcpContextForge.config.METRICS_BUFFER_MAX_SIZE | string | `"1000"` |  |

@@ -131,7 +131,7 @@ class TestA2AAgentService:
         mock_db.add = MagicMock()
 
         # Mock service method to return a MagicMock (simulate ToolRead)
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Patch ToolRead.model_validate to accept the dict without error
         import mcpgateway.schemas
@@ -147,7 +147,7 @@ class TestA2AAgentService:
         # Verify
         assert mock_db.add.call_count == 2
         assert mock_db.commit.call_count == 2
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
 
     async def test_register_agent_name_conflict(self, service, mock_db, sample_agent_create):
         """Test agent registration with name conflict."""
@@ -165,38 +165,39 @@ class TestA2AAgentService:
         """Test listing all active agents."""
         # Mock database query
         mock_db.execute.return_value.scalars.return_value.all.return_value = [sample_db_agent]
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Execute
         result = await service.list_agents(mock_db, include_inactive=False)
 
         # Verify
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
         assert len(result) >= 0  # Should return mocked results
 
     async def test_list_agents_with_tags(self, service, mock_db, sample_db_agent):
         """Test listing agents filtered by tags."""
-        # Mock database query
+        # Mock database query and dialect for json_contains_expr
         mock_db.execute.return_value.scalars.return_value.all.return_value = [sample_db_agent]
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        mock_db.get_bind.return_value.dialect.name = "sqlite"
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Execute
         result = await service.list_agents(mock_db, tags=["test"])
 
         # Verify
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
 
     async def test_get_agent_success(self, service, mock_db, sample_db_agent):
         """Test successful agent retrieval by ID."""
         # Mock database query
         mock_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Execute
         result = await service.get_agent(mock_db, sample_db_agent.id)
 
         # Verify
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
 
     async def test_get_agent_not_found(self, service, mock_db):
         """Test agent retrieval with non-existent ID."""
@@ -211,13 +212,13 @@ class TestA2AAgentService:
         """Test successful agent retrieval by name."""
         # Mock database query
         mock_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Execute
         result = await service.get_agent_by_name(mock_db, sample_db_agent.name)
 
         # Verify
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
 
     async def test_update_agent_success(self, service, mock_db, sample_db_agent):
         """Test successful agent update."""
@@ -229,8 +230,8 @@ class TestA2AAgentService:
         mock_db.commit = MagicMock()
         mock_db.refresh = MagicMock()
 
-        # Mock the _db_to_schema method properly
-        with patch.object(service, "_db_to_schema") as mock_schema:
+        # Mock the convert_agent_to_read method properly
+        with patch.object(service, "convert_agent_to_read") as mock_schema:
             mock_schema.return_value = MagicMock()
 
             # Create update data
@@ -260,7 +261,7 @@ class TestA2AAgentService:
         mock_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
         mock_db.commit = MagicMock()
         mock_db.refresh = MagicMock()
-        service._db_to_schema = MagicMock(return_value=MagicMock())
+        service.convert_agent_to_read = MagicMock(return_value=MagicMock())
 
         # Execute
         result = await service.toggle_agent_status(mock_db, sample_db_agent.id, False)
@@ -268,7 +269,7 @@ class TestA2AAgentService:
         # Verify
         assert sample_db_agent.enabled == False
         mock_db.commit.assert_called_once()
-        assert service._db_to_schema.called
+        assert service.convert_agent_to_read.called
 
     async def test_delete_agent_success(self, service, mock_db, sample_db_agent):
         """Test successful agent deletion."""
@@ -281,6 +282,18 @@ class TestA2AAgentService:
         await service.delete_agent(mock_db, sample_db_agent.id)
 
         # Verify
+        mock_db.delete.assert_called_once_with(sample_db_agent)
+        mock_db.commit.assert_called_once()
+
+    async def test_delete_agent_purge_metrics(self, service, mock_db, sample_db_agent):
+        """Test agent deletion with metric purge."""
+        mock_db.execute.return_value.scalar_one_or_none.return_value = sample_db_agent
+        mock_db.delete = MagicMock()
+        mock_db.commit = MagicMock()
+
+        await service.delete_agent(mock_db, sample_db_agent.id, purge_metrics=True)
+
+        assert mock_db.execute.call_count == 3
         mock_db.delete.assert_called_once_with(sample_db_agent)
         mock_db.commit.assert_called_once()
 
@@ -401,25 +414,31 @@ class TestA2AAgentService:
 
     async def test_aggregate_metrics(self, service, mock_db):
         """Test metrics aggregation."""
-        # Mock database queries
-        # The cache uses .one() to get both total and active in a single query
+        # Mock aggregate_metrics_combined to return a proper AggregatedMetrics result
+        from mcpgateway.services.metrics_query_service import AggregatedMetrics
+
+        mock_metrics = AggregatedMetrics(
+            total_executions=100,
+            successful_executions=90,
+            failed_executions=10,
+            failure_rate=0.1,
+            min_response_time=0.5,
+            max_response_time=3.0,
+            avg_response_time=1.5,
+            last_execution_time="2025-01-01T00:00:00+00:00",
+            raw_count=60,
+            rollup_count=40,
+        )
+
+        # Mock the cache for agent counts
         mock_counts_result = MagicMock()
         mock_counts_result.total = 5
         mock_counts_result.active = 3
-
-        mock_metrics_result = MagicMock()
-        mock_metrics_result.total_interactions = 100
-        mock_metrics_result.successful_interactions = 90
-        mock_metrics_result.avg_response_time = 1.5
-        mock_metrics_result.min_response_time = 0.5
-        mock_metrics_result.max_response_time = 3.0
-
-        # First call is from cache (get_counts -> .one()), second is metrics query (.first())
         mock_db.execute.return_value.one.return_value = mock_counts_result
-        mock_db.execute.return_value.first.return_value = mock_metrics_result
 
-        # Execute
-        result = await service.aggregate_metrics(mock_db)
+        with patch("mcpgateway.services.metrics_query_service.aggregate_metrics_combined", return_value=mock_metrics):
+            # Execute
+            result = await service.aggregate_metrics(mock_db)
 
         # Verify
         assert result["total_agents"] == 5
@@ -439,7 +458,7 @@ class TestA2AAgentService:
         await service.reset_metrics(mock_db)
 
         # Verify
-        mock_db.execute.assert_called_once()
+        assert mock_db.execute.call_count == 2
         mock_db.commit.assert_called_once()
 
     async def test_reset_metrics_specific_agent(self, service, mock_db):
@@ -452,10 +471,10 @@ class TestA2AAgentService:
         await service.reset_metrics(mock_db, agent_id)
 
         # Verify
-        mock_db.execute.assert_called_once()
+        assert mock_db.execute.call_count == 2
         mock_db.commit.assert_called_once()
 
-    def test_db_to_schema_conversion(self, service, sample_db_agent):
+    def testconvert_agent_to_read_conversion(self, service, sample_db_agent):
         """
             Test database model to schema conversion with db parameter.
         """
@@ -498,7 +517,7 @@ class TestA2AAgentService:
         print(f"sample_db_agent: {sample_db_agent}")
         # Patch decode_auth to return a dummy decoded dict
         with patch("mcpgateway.schemas.decode_auth", return_value={"user": "decoded"}):
-            result = service._db_to_schema(mock_db, sample_db_agent, include_metrics=True)
+            result = service.convert_agent_to_read(mock_db, sample_db_agent, include_metrics=True)
 
         # Verify
         assert result.id == sample_db_agent.id

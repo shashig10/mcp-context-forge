@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional, Self, Union
+from typing import Any, Dict, List, Literal, Optional, Pattern, Self, Union
 from urllib.parse import urlparse
 
 # Third-Party
@@ -45,6 +45,15 @@ from mcpgateway.utils.services_auth import decode_auth, encode_auth
 from mcpgateway.validation.tags import validate_tags_field
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Precompiled regex patterns (compiled once at module load for performance)
+# ============================================================================
+# Note: Only truly static patterns are precompiled here. Settings-based patterns
+# (e.g., from settings.* or SecurityValidator.*) are NOT precompiled because tests
+# override class/settings attributes at runtime via monkeypatch.
+_HOSTNAME_RE: Pattern[str] = re.compile(r"^(https?://)?([a-zA-Z0-9.-]+)(:[0-9]+)?$")
+_SLUG_RE: Pattern[str] = re.compile(r"^[a-z0-9-]+$")
 
 
 def encode_datetime(v: datetime) -> str:
@@ -798,11 +807,11 @@ class ToolCreate(BaseModel):
             return None
         if not isinstance(v, list):
             raise ValueError("allowlist must be a list of host/scheme strings")
-        hostname_regex = re.compile(r"^(https?://)?([a-zA-Z0-9.-]+)(:[0-9]+)?$")
+        # Uses precompiled regex for hostname validation
         for host in v:
             if not isinstance(host, str):
                 raise ValueError(f"Invalid type in allowlist: {host} (must be str)")
-            if not hostname_regex.match(host):
+            if not _HOSTNAME_RE.match(host):
                 raise ValueError(f"Invalid host/scheme in allowlist: {host}")
         return v
 
@@ -1220,11 +1229,11 @@ class ToolUpdate(BaseModelWithConfigDict):
             return None
         if not isinstance(v, list):
             raise ValueError("allowlist must be a list of host/scheme strings")
-        hostname_regex = re.compile(r"^(https?://)?([a-zA-Z0-9.-]+)(:[0-9]+)?$")
+        # Uses precompiled regex for hostname validation
         for host in v:
             if not isinstance(host, str):
                 raise ValueError(f"Invalid type in allowlist: {host} (must be str)")
-            if not hostname_regex.match(host):
+            if not _HOSTNAME_RE.match(host):
                 raise ValueError(f"Invalid host/scheme in allowlist: {host}")
         return v
 
@@ -1632,6 +1641,7 @@ class ResourceCreate(BaseModel):
                 raise ValueError("Content must be UTF-8 decodable")
         else:
             text = v
+        # Runtime pattern matching (not precompiled to allow test monkeypatching)
         if re.search(SecurityValidator.DANGEROUS_HTML_PATTERN, text, re.IGNORECASE):
             raise ValueError("Content contains HTML tags that may cause display issues")
 
@@ -1760,6 +1770,7 @@ class ResourceUpdate(BaseModelWithConfigDict):
                 raise ValueError("Content must be UTF-8 decodable")
         else:
             text = v
+        # Runtime pattern matching (not precompiled to allow test monkeypatching)
         if re.search(SecurityValidator.DANGEROUS_HTML_PATTERN, text, re.IGNORECASE):
             raise ValueError("Content contains HTML tags that may cause display issues")
 
@@ -3210,6 +3221,7 @@ class RPCRequest(BaseModel):
             ValueError: When value is not safe
         """
         SecurityValidator.validate_no_xss(v, "RPC method name")
+        # Runtime pattern matching (not precompiled to allow test monkeypatching)
         if not re.match(settings.validation_tool_method_pattern, v):
             raise ValueError("Invalid method name format")
         if len(v) > settings.validation_max_method_length:
@@ -4753,6 +4765,7 @@ class EmailRegistrationRequest(BaseModel):
         email: User's email address
         password: User's password
         full_name: Optional full name for display
+        is_admin: Whether user should have admin privileges (default: False)
 
     Examples:
         >>> request = EmailRegistrationRequest(
@@ -4764,6 +4777,8 @@ class EmailRegistrationRequest(BaseModel):
         'new@example.com'
         >>> request.full_name
         'New User'
+        >>> request.is_admin
+        False
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -4771,6 +4786,7 @@ class EmailRegistrationRequest(BaseModel):
     email: EmailStr = Field(..., description="User's email address")
     password: str = Field(..., min_length=8, description="User's password")
     full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
+    is_admin: bool = Field(False, description="Grant admin privileges to user")
 
     @field_validator("password")
     @classmethod
@@ -5211,7 +5227,8 @@ class TeamCreateRequest(BaseModel):
         if v is None:
             return v
         v = v.strip().lower()
-        if not re.match(r"^[a-z0-9-]+$", v):
+        # Uses precompiled regex for slug validation
+        if not _SLUG_RE.match(v):
             raise ValueError("Slug must contain only lowercase letters, numbers, and hyphens")
         if v.startswith("-") or v.endswith("-"):
             raise ValueError("Slug cannot start or end with hyphens")
@@ -6541,6 +6558,53 @@ class PaginationParams(BaseModel):
     cursor: Optional[str] = Field(None, description="Cursor for cursor-based pagination")
     sort_by: Optional[str] = Field("created_at", description="Sort field")
     sort_order: Optional[str] = Field("desc", pattern="^(asc|desc)$", description="Sort order")
+
+
+# ============================================================================
+# Cursor Pagination Response Schemas (for main API endpoints)
+# ============================================================================
+
+
+class CursorPaginatedToolsResponse(BaseModel):
+    """Cursor-paginated response for tools list endpoint."""
+
+    tools: List["ToolRead"] = Field(..., description="List of tools for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
+
+
+class CursorPaginatedServersResponse(BaseModel):
+    """Cursor-paginated response for servers list endpoint."""
+
+    servers: List["ServerRead"] = Field(..., description="List of servers for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
+
+
+class CursorPaginatedGatewaysResponse(BaseModel):
+    """Cursor-paginated response for gateways list endpoint."""
+
+    gateways: List["GatewayRead"] = Field(..., description="List of gateways for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
+
+
+class CursorPaginatedResourcesResponse(BaseModel):
+    """Cursor-paginated response for resources list endpoint."""
+
+    resources: List["ResourceRead"] = Field(..., description="List of resources for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
+
+
+class CursorPaginatedPromptsResponse(BaseModel):
+    """Cursor-paginated response for prompts list endpoint."""
+
+    prompts: List["PromptRead"] = Field(..., description="List of prompts for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
+
+
+class CursorPaginatedA2AAgentsResponse(BaseModel):
+    """Cursor-paginated response for A2A agents list endpoint."""
+
+    agents: List["A2AAgentRead"] = Field(..., description="List of A2A agents for this page")
+    next_cursor: Optional[str] = Field(None, alias="nextCursor", description="Cursor for the next page, null if no more pages")
 
 
 # ============================================================================

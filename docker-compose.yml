@@ -17,6 +17,8 @@ volumes:                # Named volumes survive podman-compose down/up
   redisinsight_data:
   nginx_cache:
   grafanadata:
+  prometheusdata:
+  lokidata:
 
 ###############################################################################
 #  CORE SERVICE - MCP Gateway
@@ -28,7 +30,7 @@ services:
   # ──────────────────────────────────────────────────────────────────────
   nginx:
     build:
-      context: ./nginx
+      context: ./infra/nginx
       dockerfile: Dockerfile
     image: mcpgateway/nginx-cache:latest
     restart: unless-stopped
@@ -40,7 +42,7 @@ services:
         condition: service_healthy
     volumes:
       - nginx_cache:/var/cache/nginx    # Persistent cache storage
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro  # Mount config as read-only
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro  # Mount config as read-only
     # TCP kernel tuning for 3000 concurrent connections
     # Note: net.core.* sysctls are host-level and cannot be set per-container
     # Only net.ipv4.* sysctls that are network-namespace aware work here
@@ -86,9 +88,19 @@ services:
     # Environment - pick ONE database URL line, comment the rest
     # ──────────────────────────────────────────────────────────────────────
     environment:
-      # HTTP Server: granian (default, Rust-based) or gunicorn (Python-based alternative)
-      - HTTP_SERVER=gunicorn
-      # - HTTP_SERVER=gunicorn  # Alternative: use Gunicorn with Uvicorn workers
+      # ═══════════════════════════════════════════════════════════════════════════
+      # HTTP Server Selection: gunicorn vs granian
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Performance comparison (2500 concurrent users, PostgreSQL backend):
+      #   Gunicorn: ~2.7GB RAM, ~740% CPU, no backpressure (queues unbounded)
+      #   Granian:  ~4.0GB RAM, ~680% CPU, native backpressure (rejects excess with 503)
+      #
+      # Choose Gunicorn for: memory-constrained environments (32% less RAM)
+      # Choose Granian for:  load spike protection, bursty traffic (graceful degradation)
+      # Both achieve same RPS when database is the bottleneck.
+      # ═══════════════════════════════════════════════════════════════════════════
+      - HTTP_SERVER=granian    # Rust-based, native backpressure, +47% memory, -8% CPU
+      # - HTTP_SERVER=gunicorn # Python-based, battle-tested, lower memory usage
       - HOST=0.0.0.0
       - PORT=4444
       # Transport: sse, streamablehttp, http, or all (default: all)
@@ -198,31 +210,69 @@ services:
       - VALIDATION_MIDDLEWARE_ENABLED=true
       - CORRELATION_ID_ENABLED=false
       - OBSERVABILITY_ENABLED=false
-      # Database pool tuning
+      # Database pool tuning for 3000 sustained users
       # With PgBouncer (default): smaller pools since PgBouncer handles connection multiplexing
       # Direct PostgreSQL: larger pools needed, formula: (replicas × workers) × (pool + overflow) < max_connections
       #
       # WITH PgBouncer (default):
       - DB_POOL_SIZE=15
-      - DB_MAX_OVERFLOW=30
+      - DB_MAX_OVERFLOW=5              # Low overflow minimizes pool churn under pressure
       # DIRECT PostgreSQL connection (uncomment if bypassing PgBouncer):
       # - DB_POOL_SIZE=50
       # - DB_MAX_OVERFLOW=100
-      - DB_POOL_TIMEOUT=30
+      - DB_POOL_TIMEOUT=45             # Time to wait for connection before failing
       - DB_POOL_RECYCLE=300
       - DB_POOL_PRE_PING=false
-      # Tool invocation timeout - prevents hung connections
-      - TOOL_TIMEOUT=30
+      # Tool configuration for high-concurrency load testing
+      - TOOL_TIMEOUT=60               # Seconds before tool invocation times out
+      - MAX_TOOL_RETRIES=3            # Retry attempts for failed tool invocations
+      - TOOL_RATE_LIMIT=3000          # Max tool invocations per minute
+      - TOOL_CONCURRENT_LIMIT=100     # Max concurrent tool invocations
       - FEDERATION_TIMEOUT=30
       # Worker and server tuning for high-concurrency load testing
       - GUNICORN_WORKERS=16
-      # Granian high-concurrency tuning (for 1000 concurrent users)
-      # Higher backlog allows more pending connections
-      - GRANIAN_BACKLOG=8192
-      - GRANIAN_BACKPRESSURE=2048
+      # Granian high-concurrency tuning with backpressure (for 3000 concurrent users)
+      # Total capacity = GRANIAN_WORKERS × GRANIAN_BACKPRESSURE = 16 × 64 = 1024 concurrent requests
+      # Requests beyond this limit receive immediate 503 (no queuing, no OOM)
+      - GRANIAN_BACKLOG=4096
+      - GRANIAN_BACKPRESSURE=64
       - GRANIAN_HTTP1_BUFFER_SIZE=524288
+      # Note: GRANIAN_BLOCKING_THREADS must be 1 for ASGI (Granian limitation)
       # Granian workers (auto = CPU count, or set explicit number)
       - GRANIAN_WORKERS=16
+      # HTTP/2: Granian supports native HTTP/2 multiplexing, but not useful here because:
+      # - nginx sits in front and downgrades to HTTP/1.1 for upstream connections
+      # - nginx open-source doesn't support HTTP/2 to backends (only nginx Plus does)
+      # - Internal Docker network is fast enough that HTTP/2 gains are negligible
+      # To use HTTP/2, either bypass nginx or use Granian with TLS directly.
+      # - GRANIAN_HTTP=2
+
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Execution Metrics Recording
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Controls tool/resource/prompt/server/A2A execution metrics (one DB row per operation).
+      # Disable when using external observability to improve performance.
+      # Set to true if you need per-operation metrics in the database.
+      # Note: Does NOT affect log aggregation (METRICS_AGGREGATION_ENABLED) or Prometheus.
+      - DB_METRICS_RECORDING_ENABLED=true
+
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Metrics Configuration
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Raw metrics are deleted after hourly rollups exist (default: 1 hour retention).
+      # Rollups preserve all analytics (counts, p50/p95/p99) for 365 days.
+      #
+      # If using external observability (ELK, Datadog, Splunk), raw metrics are
+      # redundant - your external platform handles debugging and audit trails.
+      #
+      # Configurable settings (uncomment to override defaults):
+      # - METRICS_DELETE_RAW_AFTER_ROLLUP=true      # Delete raw after rollup (default)
+      # - METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS=1    # Raw retention when rollup exists
+      # - METRICS_CLEANUP_INTERVAL_HOURS=1          # Cleanup frequency (default: hourly)
+      # - METRICS_RETENTION_DAYS=7                  # Fallback retention (rollup disabled)
+      #
+      # For debugging without external observability, increase raw retention:
+      # - METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS=168  # Keep raw data 7 days
 
       # Phoenix Observability Integration (uncomment when using Phoenix)
       # - PHOENIX_ENDPOINT=${PHOENIX_ENDPOINT:-http://phoenix:6006}
@@ -267,7 +317,7 @@ services:
 
     deploy:
       mode: replicated
-      replicas: 2
+      replicas: 3
       resources:
         limits:
           cpus: '8'
@@ -305,13 +355,13 @@ services:
     image: postgres:18
     ports:
       - "5433:5432"      # Expose for baseline load testing (5433 to avoid conflict with local postgres)
-    # Performance tuning for high-load testing
-    # WITH PgBouncer (default): 500 connections sufficient (PgBouncer handles multiplexing)
-    # DIRECT connection mode: increase to 4000 for (2 replicas × 16 workers × 150 pool)
+    # Performance tuning for high-load testing (3000 sustained users)
+    # WITH PgBouncer (default): 700 connections provides headroom for 550 pool + system overhead
+    # DIRECT connection mode: increase to 4000 for (3 replicas × 16 workers × 80 pool)
     command:
       - "postgres"
       - "-c"
-      - "max_connections=500"     # Increase to 4000 if bypassing PgBouncer
+      - "max_connections=700"     # Must exceed PgBouncer MAX_DB_CONNECTIONS (550) + overhead
       - "-c"
       - "shared_buffers=512MB"
       - "-c"
@@ -329,23 +379,35 @@ services:
       - "-c"
       - "effective_io_concurrency=200"
       - "-c"
-      - "max_worker_processes=4"
+      - "max_worker_processes=8"           # Total background workers (must be >= max_parallel_workers)
       - "-c"
-      - "max_parallel_workers_per_gather=2"
+      - "max_parallel_workers_per_gather=4" # Max workers per query's parallel operation
       - "-c"
-      - "max_parallel_workers=4"
+      - "max_parallel_workers=8"            # Total parallel workers available system-wide
       # === HIGH-CONCURRENCY TUNING (3000 users) ===
       # CRITICAL: idle_in_transaction_session_timeout prevents connection starvation
       # Application code now properly closes transactions via get_db() commit-on-success pattern
       # This timeout is a safety net for any edge cases
       - "-c"
-      - "idle_in_transaction_session_timeout=30s"  # Kill stuck transactions after 30s
+      - "idle_in_transaction_session_timeout=60s"  # Kill stuck transactions after 60s
       - "-c"
       - "statement_timeout=60s"            # Kill runaway queries after 60s
       - "-c"
       - "synchronous_commit=off"           # Async WAL writes (2-10x faster commits)
       - "-c"
       - "commit_delay=100"                 # Batch commits within 100μs window
+      # ═══════════════════════════════════════════════════════════════════════════
+      # AUTOVACUUM TUNING - High-insert workloads (metrics tables)
+      # ═══════════════════════════════════════════════════════════════════════════
+      # High insert rates cause dead tuple accumulation. These settings help
+      # PostgreSQL keep up with table bloat from metrics writes.
+      # Uncomment if experiencing performance degradation under sustained load:
+      # - "-c"
+      # - "autovacuum_naptime=30s"              # Check more frequently (default: 60s)
+      # - "-c"
+      # - "autovacuum_vacuum_scale_factor=0.05" # Vacuum at 5% dead tuples (default: 0.2)
+      # - "-c"
+      # - "autovacuum_vacuum_cost_limit=1000"   # More vacuum work per cycle (default: 200)
       # === PG_STAT_STATEMENTS - Query performance tracking ===
       # Uncomment to enable query statistics (slight overhead, ~2-5%)
       # After enabling, run in psql:
@@ -393,8 +455,8 @@ services:
       - POSTGRES_PASSWORD=mysecretpassword
       - POSTGRES_DB=mcp
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      # - pgdata18:/var/lib/postgresql  # Enable for postgres 18+
+      # - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql  # Enable for postgres 18+
     networks: [mcpnet]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
@@ -430,27 +492,30 @@ services:
       # Pool mode: transaction (recommended), session, or statement
       # transaction: connection returned after each transaction (best for web apps)
       - POOL_MODE=transaction
-      # Client-side connection limits (from SQLAlchemy via gateway)
-      # Tuned for 4000 capacity (nginx caps at 3000 for protection)
-      - MAX_CLIENT_CONN=4000           # Max connections from application
-      - DEFAULT_POOL_SIZE=150          # Connections per user/database pair
-      - MIN_POOL_SIZE=20               # Minimum connections to keep open
-      - RESERVE_POOL_SIZE=50           # Extra connections for burst traffic
-      - RESERVE_POOL_TIMEOUT=3         # Seconds before using reserve pool (faster)
-      # Server-side connection limits (to PostgreSQL)
-      - MAX_DB_CONNECTIONS=350         # Max connections to PostgreSQL per database
-      - MAX_USER_CONNECTIONS=350       # Max connections per user
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Connection Pool Tuning for 3000 Sustained Users
+      # PgBouncer handles connection multiplexing - many app connections share fewer DB connections
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Client-side limits (from gateway workers via SQLAlchemy)
+      - MAX_CLIENT_CONN=5000           # Max app connections; must exceed (replicas × workers × pool)
+      - DEFAULT_POOL_SIZE=450          # Shared DB connections; sized for ~70 concurrent tx × 6x headroom
+      - MIN_POOL_SIZE=50               # Pre-warmed connections for instant response to load spikes
+      - RESERVE_POOL_SIZE=100          # Emergency pool for burst traffic beyond DEFAULT_POOL_SIZE
+      - RESERVE_POOL_TIMEOUT=2         # Seconds before tapping reserve pool
+      # Server-side limits (to PostgreSQL)
+      - MAX_DB_CONNECTIONS=550         # Max connections to PostgreSQL; must be < PG max_connections
+      - MAX_USER_CONNECTIONS=550       # Per-user limit; typically equals MAX_DB_CONNECTIONS
       # Connection lifecycle
-      - SERVER_LIFETIME=3600           # Max age of server connection (seconds)
-      - SERVER_IDLE_TIMEOUT=600        # Close idle server connections after (seconds)
-      # Timeout settings for high-concurrency (4000 capacity, 3000 nginx cap)
-      - QUERY_WAIT_TIMEOUT=30          # Fail fast if no connection available in 30s
-      - CLIENT_IDLE_TIMEOUT=300        # Close idle client connections after 5 min
-      - SERVER_CONNECT_TIMEOUT=5       # Timeout for connecting to PostgreSQL
+      - SERVER_LIFETIME=3600           # Recycle server connections after 1 hour (prevents stale state)
+      - SERVER_IDLE_TIMEOUT=300        # Close unused server connections after 5 min
+      # Timeout settings
+      - QUERY_WAIT_TIMEOUT=45          # Max wait for available connection before failing request
+      - CLIENT_IDLE_TIMEOUT=60         # Close idle client connections to free resources quickly
+      - SERVER_CONNECT_TIMEOUT=5       # Timeout for new connections to PostgreSQL
       # Transaction cleanup - critical for avoiding idle-in-transaction buildup
       - SERVER_RESET_QUERY=DISCARD ALL # Reset connection state when returned to pool
       - SERVER_RESET_QUERY_ALWAYS=1    # Always run reset query even after clean transactions
-      - IDLE_TRANSACTION_TIMEOUT=30    # Kill connections idle in transaction > 30s
+      - IDLE_TRANSACTION_TIMEOUT=30    # Kill transactions idle > 30s (prevents connection starvation)
       # Authentication
       - AUTH_TYPE=scram-sha-256        # Match PostgreSQL auth method
     depends_on:
@@ -574,72 +639,186 @@ services:
           memory: 1G
 
 ###############################################################################
-#  OPTIONAL MONITORING & DEBUGGING TOOLS (disabled by default)
+#  MONITORING STACK (enabled with --profile monitoring)
+#  Usage: docker compose --profile monitoring up -d
+#  Access: Grafana http://localhost:3000 (admin/changeme)
+#          Prometheus http://localhost:9090
 ###############################################################################
 
-  # # ──────────────────────────────────────────────────────────────────────
-  # # Prometheus PostgreSQL Exporter - Metrics for Prometheus/Grafana
-  # # Exposes PostgreSQL metrics at :9187/metrics
-  # # ──────────────────────────────────────────────────────────────────────
-  # postgres_exporter:
-  #   image: quay.io/prometheuscommunity/postgres-exporter:latest
-  #   restart: unless-stopped
-  #   networks: [mcpnet]
-  #   ports:
-  #     - "9187:9187"    # http://localhost:9187/metrics
-  #   environment:
-  #     - DATA_SOURCE_NAME=postgresql://postgres:mysecretpassword@postgres:5432/mcp?sslmode=disable
-  #     # Enable extra metrics collectors
-  #     - PG_EXPORTER_AUTO_DISCOVER_DATABASES=true
-  #     - PG_EXPORTER_EXTEND_QUERY_PATH=/etc/postgres_exporter/queries.yaml
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
+  # ──────────────────────────────────────────────────────────────────────
+  # Prometheus PostgreSQL Exporter - Database metrics
+  # Metrics: connections, query duration, locks, cache hit ratio
+  # ──────────────────────────────────────────────────────────────────────
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "9187:9187"    # http://localhost:9187/metrics
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp?sslmode=disable
+      - PG_EXPORTER_AUTO_DISCOVER_DATABASES=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["monitoring"]
 
-  # # ──────────────────────────────────────────────────────────────────────
-  # # Prometheus Redis Exporter - Metrics for Prometheus/Grafana
-  # # Exposes Redis metrics at :9121/metrics
-  # # ──────────────────────────────────────────────────────────────────────
-  # redis_exporter:
-  #   image: oliver006/redis_exporter:latest
-  #   restart: unless-stopped
-  #   networks: [mcpnet]
-  #   ports:
-  #     - "9121:9121"    # http://localhost:9121/metrics
-  #   environment:
-  #     - REDIS_ADDR=redis://redis:6379
-  #   depends_on:
-  #     redis:
-  #       condition: service_started
+  # ──────────────────────────────────────────────────────────────────────
+  # Prometheus Redis Exporter - Cache metrics
+  # Metrics: memory, clients, commands/sec, keyspace stats
+  # ──────────────────────────────────────────────────────────────────────
+  redis_exporter:
+    image: oliver006/redis_exporter:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "9121:9121"    # http://localhost:9121/metrics
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_started
+    profiles: ["monitoring"]
 
-  # # ──────────────────────────────────────────────────────────────────────
-  # # Prometheus + Grafana Stack - Full observability
-  # # ──────────────────────────────────────────────────────────────────────
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   restart: unless-stopped
-  #   networks: [mcpnet]
-  #   ports:
-  #     - "9090:9090"    # http://localhost:9090
-  #   volumes:
-  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-  #   command:
-  #     - '--config.file=/etc/prometheus/prometheus.yml'
-  #     - '--storage.tsdb.retention.time=7d'
+  # ──────────────────────────────────────────────────────────────────────
+  # Prometheus PgBouncer Exporter - Connection pool metrics
+  # Metrics: active/waiting clients, server connections, pool stats
+  # ──────────────────────────────────────────────────────────────────────
+  pgbouncer_exporter:
+    image: prometheuscommunity/pgbouncer-exporter:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "9127:9127"    # http://localhost:9127/metrics
+    environment:
+      - PGBOUNCER_EXPORTER_CONNECTION_STRING=postgres://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@pgbouncer:6432/pgbouncer?sslmode=disable
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    profiles: ["monitoring"]
 
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   restart: unless-stopped
-  #   networks: [mcpnet]
-  #   ports:
-  #     - "3000:3000"    # http://localhost:3000 (admin/admin)
-  #   environment:
-  #     - GF_SECURITY_ADMIN_PASSWORD=changeme
-  #     - GF_USERS_ALLOW_SIGN_UP=false
-  #   volumes:
-  #     - grafanadata:/var/lib/grafana
-  #   depends_on:
-  #     - prometheus
+  # ──────────────────────────────────────────────────────────────────────
+  # Prometheus Nginx Exporter - Proxy metrics
+  # Metrics: active connections, requests/sec, response codes
+  # Requires stub_status enabled in nginx.conf (location /nginx_status)
+  # ──────────────────────────────────────────────────────────────────────
+  nginx_exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "9113:9113"    # http://localhost:9113/metrics
+    command:
+      - '-nginx.scrape-uri=http://nginx:80/nginx_status'
+    depends_on:
+      nginx:
+        condition: service_healthy
+    profiles: ["monitoring"]
+
+  # ──────────────────────────────────────────────────────────────────────
+  # cAdvisor - Container metrics (CPU, memory, network, disk I/O)
+  # Metrics: container_cpu_usage_seconds_total, container_memory_usage_bytes
+  # Dashboard: Grafana ID 14282 (Docker and cAdvisor)
+  # ──────────────────────────────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "8085:8080"    # http://localhost:8085/metrics
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    profiles: ["monitoring"]
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Prometheus - Metrics collection and storage
+  # Scrapes: gateway, postgres, redis, nginx, cadvisor
+  # Retention: 7 days (configurable via --storage.tsdb.retention.time)
+  # ──────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    ports:
+      - "9090:9090"    # http://localhost:9090
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - postgres_exporter
+      - redis_exporter
+      - nginx_exporter
+      - cadvisor
+    profiles: ["monitoring"]
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Loki - Log aggregation system (like Prometheus, but for logs)
+  # Query logs with LogQL in Grafana
+  # ──────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    user: "0"  # Run as root to avoid permission issues
+    ports:
+      - "3100:3100"    # http://localhost:3100/ready
+    volumes:
+      - ./infra/monitoring/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - lokidata:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    profiles: ["monitoring"]
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Promtail - Log collector for Loki
+  # Collects logs from all containers via Docker socket
+  # ──────────────────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    volumes:
+      - ./infra/monitoring/loki/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+    profiles: ["monitoring"]
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Grafana - Dashboard visualization
+  # Default login: admin / changeme
+  # Recommended dashboards:
+  #   - Docker/cAdvisor: 14282
+  #   - PostgreSQL: 9628
+  #   - Redis: 763
+  #   - Nginx: 12708
+  # ──────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    networks: [mcpnet]
+    user: "0"  # Run as root to avoid permission issues with provisioning
+    ports:
+      - "3000:3000"    # http://localhost:3000
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=changeme
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./infra/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+    profiles: ["monitoring"]
 
 ###############################################################################
 #  OPTIONAL ADMIN TOOLS - handy web UIs for DB & cache (disabled by default)
@@ -756,8 +935,7 @@ services:
   ###############################################################################
   # Fast Time Server - High-performance time/timezone service for MCP
   # Note: This is an amd64-only image. On ARM platforms (Apple Silicon),
-  # emulation may not work properly. Use profiles to disable:
-  # docker compose --profile with-fast-time up -d
+  # emulation may not work properly.
   ###############################################################################
   fast_time_server:
     image: ghcr.io/ibm/fast-time-server:latest
@@ -767,7 +945,6 @@ services:
       - "8888:8080"    # Map host port 8888 to container port 8080
     # Use dual mode for both SSE (/sse) and Streamable HTTP (/http) endpoints
     command: ["-transport=dual", "-listen=0.0.0.0", "-port=8080", "-log-level=info"]
-    profiles: ["with-fast-time"]  # Optional: enable with --profile with-fast-time
 
   ###############################################################################
   # Auto-registration service - registers fast_time_server with gateway
@@ -784,7 +961,6 @@ services:
       - JWT_SECRET_KEY=my-test-key
     # This is a one-shot container that exits after registration
     restart: "no"
-    profiles: ["with-fast-time"]  # Optional: enable with --profile with-fast-time
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
