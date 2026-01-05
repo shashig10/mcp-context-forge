@@ -22,6 +22,7 @@ Examples:
 
 # Standard
 from datetime import datetime, timezone
+from functools import lru_cache
 import mimetypes
 import os
 import re
@@ -1402,12 +1403,20 @@ class ResourceService:
                         Returns:
                             httpx.AsyncClient: Configured HTTPX async client
                         """
+                        # First-Party
+                        from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
+
                         return httpx.AsyncClient(
-                            verify=ssl_context if ssl_context else True,  # pylint: disable=cell-var-from-loop
+                            verify=ssl_context if ssl_context else get_default_verify(),  # pylint: disable=cell-var-from-loop
                             follow_redirects=True,
                             headers=headers,
-                            timeout=timeout or httpx.Timeout(30.0),
+                            timeout=timeout if timeout else get_http_timeout(),
                             auth=auth,
+                            limits=httpx.Limits(
+                                max_connections=settings.httpx_max_connections,
+                                max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                                keepalive_expiry=settings.httpx_keepalive_expiry,
+                            ),
                         )
 
                     try:
@@ -2841,7 +2850,9 @@ class ResourceService:
         except Exception as e:
             raise ResourceError(f"Failed to process template: {str(e)}") from e
 
-    def _build_regex(self, template: str) -> re.Pattern:
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_regex(template: str) -> re.Pattern:
         """
         Convert a URI template into a compiled regular expression.
 
@@ -2872,6 +2883,10 @@ class ResourceService:
         Returns:
             A compiled regular expression (re.Pattern) that can be used to
             match URIs and extract parameter values.
+
+        Note:
+            Results are cached using LRU cache (maxsize=256) to avoid
+            recompiling the same template pattern repeatedly.
         """
         # Remove query parameter syntax for path matching
         template_without_query = re.sub(r"\{\?[^}]+\}", "", template)
@@ -2890,6 +2905,24 @@ class ResourceService:
                 pattern += re.escape(part)
         return re.compile(f"^{pattern}$")
 
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _compile_parse_pattern(template: str) -> parse.Parser:
+        """
+        Compile a parse pattern for URI template parameter extraction.
+
+        Args:
+            template: The template pattern (e.g. "file:///{name}/{id}").
+
+        Returns:
+            Compiled parse.Parser object.
+
+        Note:
+            Results are cached using LRU cache (maxsize=256) to avoid
+            recompiling the same template pattern repeatedly.
+        """
+        return parse.compile(template)
+
     def _extract_template_params(self, uri: str, template: str) -> Dict[str, str]:
         """
         Extract parameters from a URI based on a template.
@@ -2900,8 +2933,12 @@ class ResourceService:
 
         Returns:
             Dict of parameter names and extracted values.
+
+        Note:
+            Uses cached compiled parse patterns for better performance.
         """
-        result = parse.parse(template, uri)
+        parser = self._compile_parse_pattern(template)
+        result = parser.parse(uri)
         return result.named if result else {}
 
     def _uri_matches_template(self, uri: str, template: str) -> bool:
@@ -2914,8 +2951,10 @@ class ResourceService:
 
         Returns:
             True if the URI matches the template, otherwise False.
-        """
 
+        Note:
+            Uses cached compiled regex patterns for better performance.
+        """
         uri_path, _, _ = uri.partition("?")
         regex = self._build_regex(template)
         return bool(regex.match(uri_path))

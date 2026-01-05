@@ -148,7 +148,7 @@ except ImportError:
 
 # First-Party
 from mcpgateway.services.logging_service import LoggingService
-from mcpgateway.translate_header_utils import extract_env_vars_from_headers, parse_header_mappings
+from mcpgateway.translate_header_utils import extract_env_vars_from_headers, NormalizedMappings, parse_header_mappings
 from mcpgateway.utils.orjson_response import ORJSONResponse
 
 # Initialize logging service first
@@ -163,10 +163,12 @@ try:
 
     DEFAULT_KEEP_ALIVE_INTERVAL = settings.sse_keepalive_interval
     DEFAULT_KEEPALIVE_ENABLED = settings.sse_keepalive_enabled
+    DEFAULT_SSL_VERIFY = not settings.skip_ssl_verify
 except ImportError:
     # Fallback if config not available
     DEFAULT_KEEP_ALIVE_INTERVAL = 30
     DEFAULT_KEEPALIVE_ENABLED = True
+    DEFAULT_SSL_VERIFY = True  # Verify SSL by default when config unavailable
 
 KEEP_ALIVE_INTERVAL = DEFAULT_KEEP_ALIVE_INTERVAL  # seconds - from config or fallback to 30
 __all__ = ["main"]  # for console-script entry-point
@@ -316,7 +318,7 @@ class StdIOEndpoint:
         True
     """
 
-    def __init__(self, cmd: str, pubsub: _PubSub, env_vars: Optional[Dict[str, str]] = None, header_mappings: Optional[Dict[str, str]] = None) -> None:
+    def __init__(self, cmd: str, pubsub: _PubSub, env_vars: Optional[Dict[str, str]] = None, header_mappings: Optional[NormalizedMappings] = None) -> None:
         """Initialize a stdio endpoint for subprocess communication.
 
         Sets up the endpoint with the command to run and the pubsub system
@@ -351,7 +353,7 @@ class StdIOEndpoint:
         self._cmd = cmd
         self._pubsub = pubsub
         self._env_vars = env_vars or {}
-        self._header_mappings = header_mappings or {}
+        self._header_mappings = header_mappings
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stdin: Optional[asyncio.StreamWriter] = None
         self._pump_task: Optional[asyncio.Task[None]] = None
@@ -642,7 +644,7 @@ def _build_fastapi(
     sse_path: str = "/sse",
     message_path: str = "/message",
     cors_origins: Optional[List[str]] = None,
-    header_mappings: Optional[Dict[str, str]] = None,
+    header_mappings: Optional[NormalizedMappings] = None,
 ) -> FastAPI:
     """Build FastAPI application with SSE and message endpoints.
 
@@ -1022,7 +1024,12 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
     # Dynamic environment variable injection
     p.add_argument("--enable-dynamic-env", action="store_true", help="Enable dynamic environment variable injection from HTTP headers")
-    p.add_argument("--header-to-env", action="append", default=[], help="Map HTTP header to environment variable (format: HEADER=ENV_VAR, can be used multiple times)")
+    p.add_argument(
+        "--header-to-env",
+        action="append",
+        default=[],
+        help="Map HTTP header to environment variable (format: HEADER=ENV_VAR, can be used multiple times). Case-insensitive duplicates are rejected (e.g., Authorization and authorization cannot both be mapped).",
+    )
 
     # For streamable HTTP mode
     p.add_argument(
@@ -1050,7 +1057,7 @@ async def _run_stdio_to_sse(
     sse_path: str = "/sse",
     message_path: str = "/message",
     keep_alive: float = KEEP_ALIVE_INTERVAL,
-    header_mappings: Optional[Dict[str, str]] = None,
+    header_mappings: Optional[NormalizedMappings] = None,
 ) -> None:
     """Run stdio to SSE bridge.
 
@@ -1169,7 +1176,7 @@ async def _run_sse_to_stdio(url: str, oauth2_bearer: Optional[str] = None, timeo
     # If no stdio command provided, use simple mode (just print to stdout)
     if not stdio_command:
         LOGGER.warning("No --stdioCommand provided, running in simple mode (SSE to stdout only)")
-        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0)) as client:
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0), verify=DEFAULT_SSL_VERIFY) as client:
             await _simple_sse_pump(client, url, max_retries, initial_retry_delay)
         return
 
@@ -1326,7 +1333,7 @@ async def _run_sse_to_stdio(url: str, oauth2_bearer: Optional[str] = None, timeo
                     raise
 
     # Run both tasks concurrently
-    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0)) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0), verify=DEFAULT_SSL_VERIFY) as client:
         try:
             await asyncio.gather(read_stdout(client), pump_sse_to_stdio(client))
         except Exception as e:
@@ -1577,7 +1584,7 @@ async def _run_streamable_http_to_stdio(
     # If no stdio command provided, use simple mode (just print to stdout)
     if not stdio_command:
         LOGGER.warning("No --stdioCommand provided, running in simple mode (streamable HTTP to stdout only)")
-        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0)) as client:
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0), verify=DEFAULT_SSL_VERIFY) as client:
             await _simple_streamable_http_pump(client, url, max_retries, initial_retry_delay)
         return
 
@@ -1693,7 +1700,7 @@ async def _run_streamable_http_to_stdio(
                     raise
 
     # Run both tasks concurrently
-    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0)) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(timeout=timeout, connect=10.0), verify=DEFAULT_SSL_VERIFY) as client:
         try:
             await asyncio.gather(read_stdout(client), pump_streamable_http_to_stdio(client))
         except Exception as e:
@@ -1775,7 +1782,7 @@ async def _run_multi_protocol_server(  # pylint: disable=too-many-positional-arg
     keep_alive: float = KEEP_ALIVE_INTERVAL,
     stateless: bool = False,
     json_response: bool = False,
-    header_mappings: Optional[Dict[str, str]] = None,
+    header_mappings: Optional[NormalizedMappings] = None,
 ) -> None:
     """Run a stdio server and expose it via multiple protocols simultaneously.
 
@@ -2324,10 +2331,12 @@ def main(argv: Optional[Sequence[str]] | None = None) -> None:
     )
 
     # Parse header mappings if dynamic environment injection is enabled
-    header_mappings = None
+    # Pre-normalize mappings once at startup for O(1) lookups per request
+    header_mappings: NormalizedMappings | None = None
     if getattr(args, "enable_dynamic_env", False):
         try:
-            header_mappings = parse_header_mappings(getattr(args, "header_to_env", []))
+            raw_mappings = parse_header_mappings(getattr(args, "header_to_env", []))
+            header_mappings = NormalizedMappings(raw_mappings)
             LOGGER.info(f"Dynamic environment injection enabled with {len(header_mappings)} header mappings")
         except Exception as e:
             LOGGER.error(f"Failed to parse header mappings: {e}")

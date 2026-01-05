@@ -59,7 +59,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import selectinload, Session
 
 try:
     # Third-Party - check if redis is available
@@ -826,6 +826,9 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             db_prompts = [
                 DbPrompt(
                     name=prompt.name,
+                    original_name=prompt.name,
+                    custom_name=prompt.name,
+                    display_name=prompt.name,
                     description=prompt.description,
                     template=prompt.template if hasattr(prompt, "template") else "",
                     argument_schema={},  # Use argument_schema instead of arguments
@@ -1059,8 +1062,16 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             GatewayConnectionError: If connection or OAuth fails
         """
         try:
-            # Get the gateway
-            gateway = db.execute(select(DbGateway).where(DbGateway.id == gateway_id)).scalar_one_or_none()
+            # Get the gateway with eager loading for sync operations to avoid N+1 queries
+            gateway = db.execute(
+                select(DbGateway)
+                .options(
+                    selectinload(DbGateway.tools),
+                    selectinload(DbGateway.resources),
+                    selectinload(DbGateway.prompts),
+                )
+                .where(DbGateway.id == gateway_id)
+            ).scalar_one_or_none()
 
             if not gateway:
                 raise ValueError(f"Gateway {gateway_id} not found")
@@ -1142,7 +1153,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                     db.execute(delete(DbResource).where(DbResource.id.in_(chunk)))
 
             # Bulk delete prompts that are no longer available from the gateway
-            stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.name not in new_prompt_names]
+            stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.original_name not in new_prompt_names]
             if stale_prompt_ids:
                 # Delete child records first to avoid FK constraint violations
                 for i in range(0, len(stale_prompt_ids), 500):
@@ -1159,7 +1170,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             # Update gateway relationships to reflect deletions
             gateway.tools = [tool for tool in gateway.tools if tool.original_name in new_tool_names]
             gateway.resources = [resource for resource in gateway.resources if resource.uri in new_resource_uris]
-            gateway.prompts = [prompt for prompt in gateway.prompts if prompt.name in new_prompt_names]
+            gateway.prompts = [prompt for prompt in gateway.prompts if prompt.original_name in new_prompt_names]
 
             # Log cleanup results
             tools_removed = len(stale_tool_ids)
@@ -1518,8 +1529,16 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             ValidationError: If validation fails
         """
         try:  # pylint: disable=too-many-nested-blocks
-            # Find gateway
-            gateway = db.get(DbGateway, gateway_id)
+            # Find gateway with eager loading for sync operations to avoid N+1 queries
+            gateway = db.execute(
+                select(DbGateway)
+                .options(
+                    selectinload(DbGateway.tools),
+                    selectinload(DbGateway.resources),
+                    selectinload(DbGateway.prompts),
+                )
+                .where(DbGateway.id == gateway_id)
+            ).scalar_one_or_none()
             if not gateway:
                 raise GatewayNotFoundError(f"Gateway not found: {gateway_id}")
 
@@ -1758,7 +1777,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                             db.execute(delete(DbResource).where(DbResource.id.in_(chunk)))
 
                     # Bulk delete prompts that are no longer available from the gateway
-                    stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.name not in new_prompt_names]
+                    stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.original_name not in new_prompt_names]
                     if stale_prompt_ids:
                         # Delete child records first to avoid FK constraint violations
                         for i in range(0, len(stale_prompt_ids), 500):
@@ -1775,7 +1794,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                     gateway.capabilities = capabilities
                     gateway.tools = [tool for tool in gateway.tools if tool.original_name in new_tool_names]  # keep only still-valid rows
                     gateway.resources = [resource for resource in gateway.resources if resource.uri in new_resource_uris]  # keep only still-valid rows
-                    gateway.prompts = [prompt for prompt in gateway.prompts if prompt.name in new_prompt_names]  # keep only still-valid rows
+                    gateway.prompts = [prompt for prompt in gateway.prompts if prompt.original_name in new_prompt_names]  # keep only still-valid rows
 
                     # Log cleanup results
                     tools_removed = len(stale_tool_ids)
@@ -2076,7 +2095,16 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             PermissionError: If user doesn't own the agent.
         """
         try:
-            gateway = db.get(DbGateway, gateway_id)
+            # Get gateway with eager loading for sync operations to avoid N+1 queries
+            gateway = db.execute(
+                select(DbGateway)
+                .options(
+                    selectinload(DbGateway.tools),
+                    selectinload(DbGateway.resources),
+                    selectinload(DbGateway.prompts),
+                )
+                .where(DbGateway.id == gateway_id)
+            ).scalar_one_or_none()
             if not gateway:
                 raise GatewayNotFoundError(f"Gateway not found: {gateway_id}")
 
@@ -2150,7 +2178,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                                 db.execute(delete(DbResource).where(DbResource.id.in_(chunk)))
 
                         # Bulk delete prompts that are no longer available from the gateway
-                        stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.name not in new_prompt_names]
+                        stale_prompt_ids = [prompt.id for prompt in gateway.prompts if prompt.original_name not in new_prompt_names]
                         if stale_prompt_ids:
                             # Delete child records first to avoid FK constraint violations
                             for i in range(0, len(stale_prompt_ids), 500):
@@ -2167,7 +2195,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                         gateway.capabilities = capabilities
                         gateway.tools = [tool for tool in gateway.tools if tool.original_name in new_tool_names]  # keep only still-valid rows
                         gateway.resources = [resource for resource in gateway.resources if resource.uri in new_resource_uris]  # keep only still-valid rows
-                        gateway.prompts = [prompt for prompt in gateway.prompts if prompt.name in new_prompt_names]  # keep only still-valid rows
+                        gateway.prompts = [prompt for prompt in gateway.prompts if prompt.original_name in new_prompt_names]  # keep only still-valid rows
 
                         # Log cleanup results
                         tools_removed = len(stale_tool_ids)
@@ -2363,8 +2391,16 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             ...     pass
         """
         try:
-            # Find gateway
-            gateway = db.get(DbGateway, gateway_id)
+            # Find gateway with eager loading for deletion to avoid N+1 queries
+            gateway = db.execute(
+                select(DbGateway)
+                .options(
+                    selectinload(DbGateway.tools),
+                    selectinload(DbGateway.resources),
+                    selectinload(DbGateway.prompts),
+                )
+                .where(DbGateway.id == gateway_id)
+            ).scalar_one_or_none()
             if not gateway:
                 raise GatewayNotFoundError(f"Gateway not found: {gateway_id}")
 
@@ -2609,8 +2645,13 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                                 else:
                                     raise GatewayConnectionError(f"No valid OAuth token for user {app_user_email} and gateway {gateway.name}")
                             finally:
-                                db.commit()  # End read-only transaction cleanly before returning to pool
-                                db.close()
+                                # Ensure close() always runs even if commit() fails
+                                # Without this nested try/finally, a commit() failure (e.g., PgBouncer timeout)
+                                # would skip close(), leaving the connection in "idle in transaction" state
+                                try:
+                                    db.commit()  # End read-only transaction cleanly before returning to pool
+                                finally:
+                                    db.close()
                     except Exception as oauth_error:
                         raise GatewayConnectionError(f"Failed to obtain OAuth token for gateway {gateway.name}: {oauth_error}")
                 else:
@@ -3034,15 +3075,29 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                 Returns:
                     httpx.AsyncClient: Configured HTTPX async client
                 """
+                # First-Party
+                from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
+
                 return httpx.AsyncClient(
-                    verify=ssl_context if ssl_context else True,
+                    verify=ssl_context if ssl_context else get_default_verify(),
                     follow_redirects=True,
                     headers=headers,
-                    timeout=timeout or httpx.Timeout(30.0),
+                    timeout=timeout if timeout else get_http_timeout(),
                     auth=auth,
+                    limits=httpx.Limits(
+                        max_connections=settings.httpx_max_connections,
+                        max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                        keepalive_expiry=settings.httpx_keepalive_expiry,
+                    ),
                 )
 
-            async with httpx.AsyncClient(verify=ssl_context if ssl_context else True) as client:
+            # Use isolated client for gateway health checks (each gateway may have custom CA cert)
+            # First-Party
+            from mcpgateway.services.http_client_service import get_isolated_http_client  # pylint: disable=import-outside-toplevel
+
+            # Use admin timeout for health checks (fail fast, don't wait 120s for slow upstreams)
+            # Pass ssl_context if present, otherwise let get_isolated_http_client use skip_ssl_verify setting
+            async with get_isolated_http_client(timeout=settings.httpx_admin_read_timeout, verify=ssl_context) as client:
                 logger.debug(f"Checking health of gateway: {gateway_name} ({gateway_url})")
                 try:
                     # Handle different authentication types
@@ -3975,9 +4030,9 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
         if not prompt_names:
             return []
 
-        existing_prompts_query = select(DbPrompt).where(DbPrompt.gateway_id == gateway.id, DbPrompt.name.in_(prompt_names))
+        existing_prompts_query = select(DbPrompt).where(DbPrompt.gateway_id == gateway.id, DbPrompt.original_name.in_(prompt_names))
         existing_prompts = db.execute(existing_prompts_query).scalars().all()
-        existing_prompts_map = {prompt.name: prompt for prompt in existing_prompts}
+        existing_prompts_map = {prompt.original_name: prompt for prompt in existing_prompts}
 
         for prompt in prompts:
             if prompt is None:
@@ -4008,6 +4063,9 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                     # Create new prompt if it doesn't exist
                     db_prompt = DbPrompt(
                         name=prompt.name,
+                        original_name=prompt.name,
+                        custom_name=prompt.name,
+                        display_name=prompt.name,
                         description=prompt.description,
                         template=prompt.template if hasattr(prompt, "template") else "",
                         argument_schema={},  # Use argument_schema instead of arguments
@@ -4016,6 +4074,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                         created_via=created_via,
                         visibility=gateway.visibility,
                     )
+                    db_prompt.gateway = gateway
                     prompts_to_add.append(db_prompt)
                     logger.debug(f"Created new prompt: {prompt.name}")
             except Exception as e:
@@ -4248,16 +4307,24 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             Returns:
                 httpx.AsyncClient: Configured HTTPX async client
             """
+            # First-Party
+            from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
+
             if ca_certificate:
                 ctx = self.create_ssl_context(ca_certificate)
             else:
                 ctx = None
             return httpx.AsyncClient(
-                verify=ctx if ctx else True,
+                verify=ctx if ctx else get_default_verify(),
                 follow_redirects=True,
                 headers=headers,
-                timeout=timeout or httpx.Timeout(30.0),
+                timeout=timeout if timeout else get_http_timeout(),
                 auth=auth,
+                limits=httpx.Limits(
+                    max_connections=settings.httpx_max_connections,
+                    max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                    keepalive_expiry=settings.httpx_keepalive_expiry,
+                ),
             )
 
         # Use async with for both sse_client and ClientSession
@@ -4389,6 +4456,9 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             Returns:
                 httpx.AsyncClient: Configured HTTPX async client
             """
+            # First-Party
+            from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
+
             if ca_certificate:
                 ctx = self.create_ssl_context(ca_certificate)
             else:
@@ -4400,11 +4470,16 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
                 auth = None
 
             return httpx.AsyncClient(
-                verify=ctx if ctx else True,
+                verify=ctx if ctx else get_default_verify(),
                 follow_redirects=True,
                 headers=headers,
-                timeout=timeout or httpx.Timeout(30.0),
+                timeout=timeout if timeout else get_http_timeout(),
                 auth=auth,
+                limits=httpx.Limits(
+                    max_connections=settings.httpx_max_connections,
+                    max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                    keepalive_expiry=settings.httpx_keepalive_expiry,
+                ),
             )
 
         async with streamablehttp_client(url=server_url, headers=authentication, httpx_client_factory=get_httpx_client_factory) as (read_stream, write_stream, _get_session_id):

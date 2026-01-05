@@ -1992,6 +1992,10 @@ async def admin_list_prompts(
         >>> mock_prompt = PromptRead(
         ...     id="ca627760127d409080fdefc309147e08",
         ...     name="Test Prompt",
+        ...     original_name="Test Prompt",
+        ...     custom_name="Test Prompt",
+        ...     custom_name_slug="test-prompt",
+        ...     display_name="Test Prompt",
         ...     description="A test prompt",
         ...     template="Hello {{name}}!",
         ...     arguments=[{"name": "name", "type": "string"}],
@@ -2437,18 +2441,23 @@ async def admin_ui(
             team_service = TeamManagementService(db)
             if user_email and "@" in user_email:
                 raw_teams = await team_service.get_user_teams(user_email)
+
+                # Batch fetch all data in 2 queries instead of 2N queries (N+1 elimination)
+                team_ids = [str(team.id) for team in raw_teams]
+                member_counts = await team_service.get_member_counts_batch_cached(team_ids)
+                user_roles = team_service.get_user_roles_batch(user_email, team_ids)
+
                 user_teams = []
                 for team in raw_teams:
                     try:
-                        # Get the user's role in this team
-                        user_role = await team_service.get_user_role_in_team(user_email, team.id)
+                        team_id = str(team.id) if team.id else ""
                         team_dict = {
-                            "id": str(team.id) if team.id else "",
+                            "id": team_id,
                             "name": str(team.name) if team.name else "",
                             "type": str(getattr(team, "type", "organization")),
                             "is_personal": bool(getattr(team, "is_personal", False)),
-                            "member_count": team.get_member_count() if hasattr(team, "get_member_count") else 0,
-                            "role": user_role or "member",
+                            "member_count": member_counts.get(team_id, 0),
+                            "role": user_roles.get(team_id) or "member",
                         }
                         user_teams.append(team_dict)
                     except Exception as team_error:
@@ -3304,22 +3313,30 @@ async def _generate_unified_teams_view(team_service, current_user, root_path):  
     # Get public teams user can join
     public_teams = await team_service.discover_public_teams(current_user.email)
 
+    # Batch fetch ALL data upfront - 3 queries instead of 3N queries (N+1 elimination)
+    user_team_ids = [str(t.id) for t in user_teams]
+    public_team_ids = [str(t.id) for t in public_teams]
+    all_team_ids = user_team_ids + public_team_ids
+
+    member_counts = await team_service.get_member_counts_batch_cached(all_team_ids)
+    user_roles = team_service.get_user_roles_batch(current_user.email, user_team_ids)
+    pending_requests = team_service.get_pending_join_requests_batch(current_user.email, public_team_ids)
+
     # Combine teams with relationship information
     all_teams = []
 
     # Add user's teams (owned and member)
     for team in user_teams:
-        user_role = await team_service.get_user_role_in_team(current_user.email, team.id)
+        team_id = str(team.id)
+        user_role = user_roles.get(team_id)
         relationship = "owner" if user_role == "owner" else "member"
-        all_teams.append({"team": team, "relationship": relationship, "member_count": team.get_member_count()})
+        all_teams.append({"team": team, "relationship": relationship, "member_count": member_counts.get(team_id, 0)})
 
-    # Add public teams user can join - check for pending requests
+    # Add public teams user can join
     for team in public_teams:
-        # Check if user has a pending join request
-        user_requests = await team_service.get_user_join_requests(current_user.email, team.id)
-        pending_request = next((req for req in user_requests if req.status == "pending"), None)
-
-        relationship_data = {"team": team, "relationship": "join", "member_count": team.get_member_count(), "pending_request": pending_request}
+        team_id = str(team.id)
+        pending_request = pending_requests.get(team_id)
+        relationship_data = {"team": team, "relationship": "join", "member_count": member_counts.get(team_id, 0), "pending_request": pending_request}
         all_teams.append(relationship_data)
 
     # Generate HTML for unified team view
@@ -3500,10 +3517,14 @@ async def admin_list_teams(
         else:
             teams = await team_service.get_user_teams(current_user.email)
 
+        # Batch fetch member counts with caching (N+1 elimination)
+        team_ids = [str(team.id) for team in teams]
+        member_counts = await team_service.get_member_counts_batch_cached(team_ids)
+
         # Generate HTML for teams (traditional view)
         teams_html = ""
         for team in teams:
-            member_count = team.get_member_count()
+            member_count = member_counts.get(str(team.id), 0)
             teams_html += f"""
                 <div id="team-card-{team.id}" class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
                     <div class="flex justify-between items-start">
@@ -6580,7 +6601,7 @@ async def admin_search_prompts(
     user_teams = await team_service.get_user_teams(user_email)
     team_ids = [t.id for t in user_teams]
 
-    query = select(DbPrompt.id, DbPrompt.name, DbPrompt.description)
+    query = select(DbPrompt.id, DbPrompt.original_name, DbPrompt.display_name, DbPrompt.description)
 
     # Apply gateway filter if provided
     if gateway_id:
@@ -6607,21 +6628,34 @@ async def admin_search_prompts(
 
     query = query.where(or_(*access_conditions))
 
-    search_conditions = [func.lower(DbPrompt.name).contains(search_query), func.lower(coalesce(DbPrompt.description, "")).contains(search_query)]
+    search_conditions = [
+        func.lower(DbPrompt.original_name).contains(search_query),
+        func.lower(coalesce(DbPrompt.display_name, "")).contains(search_query),
+        func.lower(coalesce(DbPrompt.description, "")).contains(search_query),
+    ]
     query = query.where(or_(*search_conditions))
 
     query = query.order_by(
         case(
-            (func.lower(DbPrompt.name).startswith(search_query), 1),
+            (func.lower(DbPrompt.original_name).startswith(search_query), 1),
+            (func.lower(coalesce(DbPrompt.display_name, "")).startswith(search_query), 1),
             else_=2,
         ),
-        func.lower(DbPrompt.name),
+        func.lower(DbPrompt.original_name),
     ).limit(limit)
 
     results = db.execute(query).all()
     prompts = []
     for row in results:
-        prompts.append({"id": row.id, "name": row.name, "description": row.description})
+        prompts.append(
+            {
+                "id": row.id,
+                "name": row.original_name,
+                "original_name": row.original_name,
+                "display_name": row.display_name,
+                "description": row.description,
+            }
+        )
 
     return {"prompts": prompts, "count": len(prompts)}
 
@@ -8960,6 +8994,10 @@ async def admin_get_prompt(prompt_id: str, db: Session = Depends(get_db), user=D
         >>> mock_prompt_details = {
         ...     "id": "ca627760127d409080fdefc309147e08",
         ...     "name": prompt_name,
+        ...     "original_name": prompt_name,
+        ...     "custom_name": prompt_name,
+        ...     "custom_name_slug": "test-prompt",
+        ...     "display_name": "Test Prompt",
         ...     "description": "A test prompt",
         ...     "template": "Hello {{name}}!",
         ...     "arguments": [{"name": "name", "type": "string"}],
@@ -9088,6 +9126,7 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
         arguments = orjson.loads(args_json)
         prompt = PromptCreate(
             name=str(form["name"]),
+            display_name=str(form.get("display_name") or form["name"]),
             description=str(form.get("description")),
             template=str(form["template"]),
             arguments=arguments,
@@ -9224,7 +9263,8 @@ async def admin_edit_prompt(
     try:
         mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)
         prompt = PromptUpdate(
-            name=str(form["name"]),
+            custom_name=str(form.get("customName") or form.get("name")),
+            display_name=str(form.get("displayName") or form.get("display_name") or form.get("name")),
             description=str(form.get("description")),
             template=str(form["template"]),
             arguments=arguments,
@@ -13450,8 +13490,11 @@ async def get_observability_stats(request: Request, hours: int = Query(24, ge=1,
 
         return request.app.state.templates.TemplateResponse("observability_stats.html", {"request": request, "stats": stats})
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/traces", response_class=HTMLResponse)
@@ -13545,8 +13588,11 @@ async def get_observability_traces(
         root_path = request.scope.get("root_path", "")
         return request.app.state.templates.TemplateResponse("observability_traces_list.html", {"request": request, "traces": traces, "root_path": root_path})
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/trace/{trace_id}", response_class=HTMLResponse)
@@ -13574,8 +13620,11 @@ async def get_observability_trace_detail(request: Request, trace_id: str, _user=
         root_path = request.scope.get("root_path", "")
         return request.app.state.templates.TemplateResponse("observability_trace_detail.html", {"request": request, "trace": trace, "root_path": root_path})
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.post("/observability/queries", response_model=dict)
@@ -13621,8 +13670,11 @@ async def save_observability_query(
         LOGGER.error(f"Failed to save query: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/queries", response_model=list)
@@ -13665,8 +13717,11 @@ async def list_observability_queries(request: Request, user=Depends(get_current_
             for q in queries
         ]
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/queries/{query_id}", response_model=dict)
@@ -13708,8 +13763,11 @@ async def get_observability_query(request: Request, query_id: int, user=Depends(
             "use_count": query.use_count,
         }
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.put("/observability/queries/{query_id}", response_model=dict)
@@ -13777,8 +13835,11 @@ async def update_observability_query(
         LOGGER.error(f"Failed to update query: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.delete("/observability/queries/{query_id}", status_code=204)
@@ -13806,8 +13867,11 @@ async def delete_observability_query(request: Request, query_id: int, user=Depen
         db.delete(query)
         db.commit()
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.post("/observability/queries/{query_id}/use", response_model=dict)
@@ -13852,8 +13916,11 @@ async def track_query_usage(request: Request, query_id: int, user=Depends(get_cu
         LOGGER.error(f"Failed to track query usage: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/metrics/percentiles", response_model=dict)
@@ -13890,8 +13957,11 @@ async def get_latency_percentiles(
         LOGGER.error(f"Failed to calculate latency percentiles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 def _get_latency_percentiles_postgresql(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
@@ -14053,8 +14123,11 @@ async def get_timeseries_metrics(
         LOGGER.error(f"Failed to calculate timeseries metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 def _get_timeseries_metrics_postgresql(db: Session, cutoff_time: datetime, interval_minutes: int) -> dict:
@@ -14400,8 +14473,11 @@ async def get_top_slow_endpoints(
         LOGGER.error(f"Failed to get top slow endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/metrics/top-volume", response_model=dict)
@@ -14461,8 +14537,11 @@ async def get_top_volume_endpoints(
         LOGGER.error(f"Failed to get top volume endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/metrics/top-errors", response_model=dict)
@@ -14525,8 +14604,11 @@ async def get_top_error_endpoints(
         LOGGER.error(f"Failed to get top error endpoints: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/metrics/heatmap", response_model=dict)
@@ -14568,8 +14650,11 @@ async def get_latency_heatmap(
         LOGGER.error(f"Failed to generate latency heatmap: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/tools/usage", response_model=dict)
@@ -14632,8 +14717,11 @@ async def get_tool_usage(
         LOGGER.error(f"Failed to get tool usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/tools/performance", response_model=dict)
@@ -14725,8 +14813,11 @@ async def get_tool_performance(
         LOGGER.error(f"Failed to get tool performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/tools/errors", response_model=dict)
@@ -14788,8 +14879,11 @@ async def get_tool_errors(
         LOGGER.error(f"Failed to get tool error statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/tools/chains", response_model=dict)
@@ -14859,8 +14953,11 @@ async def get_tool_chains(
         LOGGER.error(f"Failed to get tool chain statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/tools/partial", response_class=HTMLResponse)
@@ -14952,8 +15049,11 @@ async def get_prompt_usage(
         LOGGER.error(f"Failed to get prompt usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/prompts/performance", response_model=dict)
@@ -15045,8 +15145,11 @@ async def get_prompt_performance(
         LOGGER.error(f"Failed to get prompt performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/prompts/errors", response_model=dict)
@@ -15100,8 +15203,11 @@ async def get_prompts_errors(
 
         return {"prompts": prompts_data, "time_range_hours": hours}
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/prompts/partial", response_class=HTMLResponse)
@@ -15193,8 +15299,11 @@ async def get_resource_usage(
         LOGGER.error(f"Failed to get resource usage statistics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/resources/performance", response_model=dict)
@@ -15286,8 +15395,11 @@ async def get_resource_performance(
         LOGGER.error(f"Failed to get resource performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/resources/errors", response_model=dict)
@@ -15341,8 +15453,11 @@ async def get_resources_errors(
 
         return {"resources": resources_data, "time_range_hours": hours}
     finally:
-        db.commit()  # Commit read-only transaction to avoid implicit rollback
-        db.close()
+        # Ensure close() always runs even if commit() fails
+        try:
+            db.commit()  # Commit read-only transaction to avoid implicit rollback
+        finally:
+            db.close()
 
 
 @admin_router.get("/observability/resources/partial", response_class=HTMLResponse)
