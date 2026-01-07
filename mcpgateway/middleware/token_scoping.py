@@ -24,7 +24,7 @@ from fastapi.security import HTTPBearer
 from mcpgateway.db import Permissions
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.utils.orjson_response import ORJSONResponse
-from mcpgateway.utils.verify_credentials import verify_jwt_token
+from mcpgateway.utils.verify_credentials import verify_jwt_token_cached
 
 # Security scheme
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -121,8 +121,8 @@ class TokenScopingMiddleware:
         token = auth_header.split(" ", 1)[1]
 
         try:
-            # Use the centralized verify_jwt_token function for consistent JWT validation
-            payload = await verify_jwt_token(token)
+            # Use the centralized verify_jwt_token_cached function for consistent JWT validation
+            payload = await verify_jwt_token_cached(token, request)
             return payload
         except HTTPException:
             # Token validation failed (expired, invalid, etc.)
@@ -347,15 +347,22 @@ class TokenScopingMiddleware:
         # Default allow for unmatched paths
         return True
 
-    def _check_team_membership(self, payload: dict) -> bool:
+    def _check_team_membership(self, payload: dict, db=None) -> bool:
         """
         Check if user still belongs to teams in the token.
 
         For public-only tokens (no teams), always returns True.
-        For team-scoped tokens, validates membership.
+        For team-scoped tokens, validates membership with caching.
+
+        Uses in-memory cache (per gateway instance, 60s TTL) to avoid repeated
+        email_team_members queries for the same user+teams combination.
+        Note: Sync path uses in-memory only for performance; Redis is not
+        consulted to avoid async overhead in the hot path.
 
         Args:
             payload: Decoded JWT payload containing teams
+            db: Optional database session. If provided, caller manages lifecycle.
+                If None, creates and manages its own session.
 
         Returns:
             bool: True if team membership is valid, False otherwise
@@ -373,32 +380,68 @@ class TokenScopingMiddleware:
             logger.warning("Token missing user email")
             return False
 
+        # Extract team IDs from token (handles both dict and string formats)
+        team_ids = [team["id"] if isinstance(team, dict) else team for team in teams]
+
+        # First-Party
+        from mcpgateway.cache.auth_cache import get_auth_cache  # pylint: disable=import-outside-toplevel
+
+        # Check cache first (synchronous in-memory lookup)
+        auth_cache = get_auth_cache()
+        cached_result = auth_cache.get_team_membership_valid_sync(user_email, team_ids)
+        if cached_result is not None:
+            if not cached_result:
+                logger.warning(f"Token invalid (cached): User {user_email} no longer member of teams")
+            return cached_result
+
+        # Cache miss - query database
         # Third-Party
-        from sqlalchemy import and_, select  # pylint: disable=import-outside-toplevel
+        from sqlalchemy import select  # pylint: disable=import-outside-toplevel
 
         # First-Party
         from mcpgateway.db import EmailTeamMember, get_db  # pylint: disable=import-outside-toplevel
 
-        db = next(get_db())
+        # Track if we own the session (and thus must clean it up)
+        owns_session = db is None
+        if owns_session:
+            db = next(get_db())
+
         try:
-            for team in teams:
-                # Extract team ID from dict or use string directly (backward compatibility)
-                team_id = team["id"] if isinstance(team, dict) else team
+            # Single query for all teams (fixes N+1 pattern)
+            memberships = (
+                db.execute(
+                    select(EmailTeamMember.team_id).where(
+                        EmailTeamMember.team_id.in_(team_ids),
+                        EmailTeamMember.user_email == user_email,
+                        EmailTeamMember.is_active.is_(True),
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
-                membership = db.execute(
-                    select(EmailTeamMember).where(and_(EmailTeamMember.team_id == team_id, EmailTeamMember.user_email == user_email, EmailTeamMember.is_active))
-                ).scalar_one_or_none()
+            # Check if user is member of ALL teams in token
+            valid_team_ids = set(memberships)
+            missing_teams = set(team_ids) - valid_team_ids
 
-                if not membership:
-                    logger.warning(f"Token invalid: User {user_email} no longer member of team {team_id}")
-                    return False
+            if missing_teams:
+                logger.warning(f"Token invalid: User {user_email} no longer member of teams: {missing_teams}")
+                # Cache negative result
+                auth_cache.set_team_membership_valid_sync(user_email, team_ids, False)
+                return False
 
+            # Cache positive result
+            auth_cache.set_team_membership_valid_sync(user_email, team_ids, True)
             return True
         finally:
-            db.commit()  # Commit read-only transaction to avoid implicit rollback
-            db.close()
+            # Only commit/close if we created the session
+            if owns_session:
+                try:
+                    db.commit()  # Commit read-only transaction to avoid implicit rollback
+                finally:
+                    db.close()
 
-    def _check_resource_team_ownership(self, request_path: str, token_teams: list) -> bool:  # pylint: disable=too-many-return-statements
+    def _check_resource_team_ownership(self, request_path: str, token_teams: list, db=None) -> bool:  # pylint: disable=too-many-return-statements
         """
         Check if the requested resource is accessible by the token.
 
@@ -423,6 +466,8 @@ class TokenScopingMiddleware:
         Args:
             request_path: The request path/URL
             token_teams: List of team IDs from the token (empty list = public-only token)
+            db: Optional database session. If provided, caller manages lifecycle.
+                If None, creates and manages its own session.
 
         Returns:
             bool: True if resource access is allowed, False otherwise
@@ -468,7 +513,11 @@ class TokenScopingMiddleware:
         # First-Party
         from mcpgateway.db import get_db, Prompt, Resource, Server, Tool  # pylint: disable=import-outside-toplevel
 
-        db = next(get_db())
+        # Track if we own the session (and thus must clean it up)
+        owns_session = db is None
+        if owns_session:
+            db = next(get_db())
+
         try:
             # Check Virtual Servers
             if resource_type == "server":
@@ -657,8 +706,12 @@ class TokenScopingMiddleware:
             # Fail securely - deny access on error
             return False
         finally:
-            db.commit()  # Commit read-only transaction to avoid implicit rollback
-            db.close()
+            # Only commit/close if we created the session
+            if owns_session:
+                try:
+                    db.commit()  # Commit read-only transaction to avoid implicit rollback
+                finally:
+                    db.close()
 
     async def __call__(self, request: Request, call_next):
         """Middleware function to check token scoping including team-level validation.
@@ -700,16 +753,41 @@ class TokenScopingMiddleware:
             if not payload:
                 return await call_next(request)
 
-            # TEAM VALIDATION: Check team membership
-            if not self._check_team_membership(payload):
-                logger.warning("Token rejected: User no longer member of associated team(s)")
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token is invalid: User is no longer a member of the associated team")
-
-            # TEAM VALIDATION: Check resource team ownership
+            # TEAM VALIDATION: Use single DB session for both team checks
+            # This reduces connection pool overhead from 2 sessions to 1 for resource endpoints
             token_teams = payload.get("teams", [])
-            if not self._check_resource_team_ownership(request.url.path, token_teams):
-                logger.warning(f"Access denied: Resource does not belong to token's teams {token_teams}")
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: You do not have permission to access this resource using the current token")
+            needs_db_session = bool(token_teams)  # Only need DB if token has teams
+
+            if needs_db_session:
+                # First-Party
+                from mcpgateway.db import get_db  # pylint: disable=import-outside-toplevel
+
+                db = next(get_db())
+                try:
+                    # Check team membership with shared session
+                    if not self._check_team_membership(payload, db=db):
+                        logger.warning("Token rejected: User no longer member of associated team(s)")
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token is invalid: User is no longer a member of the associated team")
+
+                    # Check resource team ownership with shared session
+                    if not self._check_resource_team_ownership(request.url.path, token_teams, db=db):
+                        logger.warning(f"Access denied: Resource does not belong to token's teams {token_teams}")
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: You do not have permission to access this resource using the current token")
+                finally:
+                    # Ensure session cleanup even if checks raise exceptions
+                    try:
+                        db.commit()
+                    finally:
+                        db.close()
+            else:
+                # Public-only token: no team membership check needed, but still check resource ownership
+                if not self._check_team_membership(payload):
+                    logger.warning("Token rejected: User no longer member of associated team(s)")
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token is invalid: User is no longer a member of the associated team")
+
+                if not self._check_resource_team_ownership(request.url.path, token_teams):
+                    logger.warning(f"Access denied: Resource does not belong to token's teams {token_teams}")
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: You do not have permission to access this resource using the current token")
 
             # Extract scopes from payload
             scopes = payload.get("scopes", {})

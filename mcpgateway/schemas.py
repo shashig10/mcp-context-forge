@@ -485,7 +485,12 @@ class ToolCreate(BaseModel):
             >>> from mcpgateway.schemas import ToolCreate
             >>> ToolCreate.validate_json_fields({'a': 1})
             {'a': 1}
+            >>> # Test depth within limit (11 levels, default limit is 30)
             >>> ToolCreate.validate_json_fields({'a': {'b': {'c': {'d': {'e': {'f': {'g': {'h': {'i': {'j': {'k': 1}}}}}}}}}}})
+            {'a': {'b': {'c': {'d': {'e': {'f': {'g': {'h': {'i': {'j': {'k': 1}}}}}}}}}}}
+            >>> # Test exceeding depth limit (31 levels)
+            >>> deep_31 = {'1': {'2': {'3': {'4': {'5': {'6': {'7': {'8': {'9': {'10': {'11': {'12': {'13': {'14': {'15': {'16': {'17': {'18': {'19': {'20': {'21': {'22': {'23': {'24': {'25': {'26': {'27': {'28': {'29': {'30': {'31': 'too deep'}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+            >>> ToolCreate.validate_json_fields(deep_31)
             Traceback (most recent call last):
                 ...
             ValueError: ...
@@ -1400,8 +1405,8 @@ class ToolInvocation(BaseModelWithConfigDict):
         >>> tool_inv.arguments["level1"]["level2"]["level3"]["data"]
         'value'
 
-        >>> # Invalid: Arguments too deeply nested (>10 levels)
-        >>> deep_args = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": {"j": {"k": "too deep"}}}}}}}}}}}
+        >>> # Invalid: Arguments too deeply nested (>30 levels)
+        >>> deep_args = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": {"j": {"k": {"l": {"m": {"n": {"o": {"p": {"q": {"r": {"s": {"t": {"u": {"v": {"w": {"x": {"y": {"z": {"aa": {"bb": {"cc": {"dd": {"ee": "too deep"}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
         >>> try:
         ...     ToolInvocation(name="process_data", arguments=deep_args)
         ... except ValidationError as e:
@@ -2038,7 +2043,7 @@ class PromptArgument(BaseModelWithConfigDict):
     # Use base config; example metadata removed to avoid config merging type issues in static checks
 
 
-class PromptCreate(BaseModel):
+class PromptCreate(BaseModelWithConfigDict):
     """
     Schema for creating a new prompt.
 
@@ -2050,9 +2055,11 @@ class PromptCreate(BaseModel):
         arguments (List[PromptArgument]): List of arguments for the template.
     """
 
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(**dict(BaseModelWithConfigDict.model_config), str_strip_whitespace=True)
 
     name: str = Field(..., description="Unique name for the prompt")
+    custom_name: Optional[str] = Field(None, description="Custom prompt name used for MCP invocation")
+    display_name: Optional[str] = Field(None, description="Display name for the prompt (shown in UI)")
     description: Optional[str] = Field(None, description="Prompt description")
     template: str = Field(..., description="Prompt template text")
     arguments: List[PromptArgument] = Field(default_factory=list, description="List of arguments for the template")
@@ -2088,6 +2095,36 @@ class PromptCreate(BaseModel):
             str: Value if validated as safe
         """
         return SecurityValidator.validate_name(v, "Prompt name")
+
+    @field_validator("custom_name")
+    @classmethod
+    def validate_custom_name(cls, v: Optional[str]) -> Optional[str]:
+        """Ensure custom prompt names follow MCP naming conventions.
+
+        Args:
+            v: Custom prompt name to validate.
+
+        Returns:
+            The validated custom name or None.
+        """
+        if v is None:
+            return v
+        return SecurityValidator.validate_name(v, "Prompt name")
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, v: Optional[str]) -> Optional[str]:
+        """Ensure display names render safely in UI.
+
+        Args:
+            v: Display name to validate.
+
+        Returns:
+            The validated display name or None.
+        """
+        if v is None:
+            return v
+        return SecurityValidator.sanitize_display_text(v, "Prompt display name")
 
     @field_validator("description")
     @classmethod
@@ -2187,6 +2224,8 @@ class PromptUpdate(BaseModelWithConfigDict):
     """
 
     name: Optional[str] = Field(None, description="Unique name for the prompt")
+    custom_name: Optional[str] = Field(None, description="Custom prompt name used for MCP invocation")
+    display_name: Optional[str] = Field(None, description="Display name for the prompt (shown in UI)")
     description: Optional[str] = Field(None, description="Prompt description")
     template: Optional[str] = Field(None, description="Prompt template text")
     arguments: Optional[List[PromptArgument]] = Field(None, description="List of arguments for the template")
@@ -2223,6 +2262,36 @@ class PromptUpdate(BaseModelWithConfigDict):
             str: Value if validated as safe
         """
         return SecurityValidator.validate_name(v, "Prompt name")
+
+    @field_validator("custom_name")
+    @classmethod
+    def validate_custom_name(cls, v: Optional[str]) -> Optional[str]:
+        """Ensure custom prompt names follow MCP naming conventions.
+
+        Args:
+            v: Custom prompt name to validate.
+
+        Returns:
+            The validated custom name or None.
+        """
+        if v is None:
+            return v
+        return SecurityValidator.validate_name(v, "Prompt name")
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, v: Optional[str]) -> Optional[str]:
+        """Ensure display names render safely in UI.
+
+        Args:
+            v: Display name to validate.
+
+        Returns:
+            The validated display name or None.
+        """
+        if v is None:
+            return v
+        return SecurityValidator.sanitize_display_text(v, "Prompt display name")
 
     @field_validator("description")
     @classmethod
@@ -2299,6 +2368,11 @@ class PromptRead(BaseModelWithConfigDict):
 
     id: str = Field(description="Unique ID of the prompt")
     name: str
+    original_name: str
+    custom_name: str
+    custom_name_slug: str
+    display_name: Optional[str] = Field(None, description="Display name for the prompt (shown in UI)")
+    gateway_slug: Optional[str] = None
     description: Optional[str]
     template: str
     arguments: List[PromptArgument]

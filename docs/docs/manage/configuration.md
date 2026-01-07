@@ -182,12 +182,24 @@ DATABASE_URL=mysql+pymysql://mysql:changeme@localhost:3306/mcp          # MariaD
 DATABASE_URL=postgresql+psycopg://postgres:changeme@localhost:5432/mcp  # PostgreSQL
 
 # Connection pool settings (optional)
-DB_POOL_SIZE=200
-DB_MAX_OVERFLOW=5
-DB_POOL_TIMEOUT=60
-DB_POOL_RECYCLE=3600
-DB_MAX_RETRIES=5
-DB_RETRY_INTERVAL_MS=2000
+DB_POOL_SIZE=200                   # Pool size (QueuePool only)
+DB_MAX_OVERFLOW=5                  # Max overflow connections (QueuePool only)
+DB_POOL_TIMEOUT=60                 # Wait timeout for connection
+DB_POOL_RECYCLE=3600               # Recycle connections after N seconds
+DB_MAX_RETRIES=5                   # Retry attempts on connection failure
+DB_RETRY_INTERVAL_MS=2000          # Delay between retries
+
+# Connection pool class selection
+# - "auto": NullPool with PgBouncer, QueuePool otherwise (default)
+# - "null": Always NullPool (recommended with PgBouncer)
+# - "queue": Always QueuePool (application-side pooling)
+DB_POOL_CLASS=auto
+
+# Pre-ping connections before checkout (validates connection is alive)
+# - "auto": Enabled for non-PgBouncer setups (default)
+# - "true": Always enable (adds SELECT 1 overhead but catches stale connections)
+# - "false": Always disable
+DB_POOL_PRE_PING=auto
 
 # psycopg3 auto-prepared statements (PostgreSQL only)
 # Queries executed N+ times are prepared server-side for performance
@@ -261,20 +273,24 @@ DISABLE_ACCESS_LOG=true ./run-gunicorn.sh
 
 ### Granian Production Server (Alternative)
 
-Granian is a Rust-based HTTP server available as an alternative to Gunicorn. It offers native HTTP/2 support and lower memory usage.
+Granian is a Rust-based HTTP server with native backpressure for overload protection. Under load, excess requests receive immediate 503 responses instead of queuing indefinitely.
 
 ```bash
 # Worker Configuration
 GRANIAN_WORKERS=auto              # Number of workers (auto = CPU cores, max 16)
 GRANIAN_RUNTIME_MODE=auto         # Runtime mode: auto, mt (multi-threaded), st (single-threaded)
 GRANIAN_RUNTIME_THREADS=1         # Runtime threads per worker
-GRANIAN_BLOCKING_THREADS=1        # Blocking threads per worker
+GRANIAN_BLOCKING_THREADS=1        # Blocking threads per worker (must be 1 for ASGI)
+
+# Backpressure Configuration (overload protection)
+GRANIAN_BACKLOG=4096              # OS socket backlog for pending connections
+GRANIAN_BACKPRESSURE=64           # Max concurrent requests per worker before 503
+# Total capacity = WORKERS × BACKPRESSURE (e.g., 16 × 64 = 1024 concurrent requests)
 
 # Performance Options
 GRANIAN_HTTP=auto                 # HTTP version: auto, 1, 2
 GRANIAN_LOOP=uvloop               # Event loop: uvloop, asyncio, rloop
-GRANIAN_BACKLOG=2048              # Connection backlog
-GRANIAN_BACKPRESSURE=512          # Max concurrent requests per worker
+GRANIAN_HTTP1_BUFFER_SIZE=524288  # HTTP/1 buffer size (512KB)
 GRANIAN_RESPAWN_FAILED=true       # Auto-restart failed workers
 GRANIAN_DEV_MODE=false            # Enable hot reload
 DISABLE_ACCESS_LOG=true           # Disable access logs for performance
@@ -299,11 +315,12 @@ docker run -e HTTP_SERVER=granian mcpgateway/mcpgateway
 ```
 
 !!! info "When to use Granian"
-    - Native HTTP/2 without reverse proxy
-    - Lower memory usage (~40MB vs ~80MB per worker)
-    - Simpler deployment for smaller instances
+    - **Load spike protection**: Backpressure rejects excess requests with 503 instead of queuing
+    - **Bursty traffic**: Graceful degradation under unpredictable load
+    - **Native HTTP/2**: Without reverse proxy
+    - **High concurrency**: 1000+ concurrent users
 
-    See [ADR-0025](../architecture/adr/025-granian-http-server.md) for detailed comparison.
+    See [ADR-0025](../architecture/adr/025-granian-http-server.md) for detailed comparison and [Tuning Guide](tuning.md#backpressure-for-overload-protection) for backpressure configuration.
 
 ### Authentication & Security
 
@@ -490,6 +507,94 @@ When `ADMIN_STATS_CACHE_ENABLED=true` (default), admin dashboard statistics are 
 - **Observability**: Cached for `ADMIN_STATS_CACHE_OBSERVABILITY_TTL` seconds (default: 30)
 
 See [ADR-029](../architecture/adr/029-registry-admin-stats-caching.md) for implementation details.
+
+### Session Registry Polling (Database Backend)
+
+When using `CACHE_TYPE=database`, sessions poll the database to check for incoming messages. Adaptive backoff reduces database load by ~90% during idle periods while maintaining responsiveness when messages arrive.
+
+```bash
+# Adaptive backoff polling configuration
+POLL_INTERVAL=1.0          # Initial polling interval in seconds (default: 1.0)
+MAX_INTERVAL=5.0           # Maximum polling interval cap in seconds (default: 5.0)
+BACKOFF_FACTOR=1.5         # Multiplier for exponential backoff (default: 1.5)
+```
+
+**How Adaptive Backoff Works:**
+
+1. Polling starts at `POLL_INTERVAL` (1.0s by default)
+2. When no message is found, interval increases by `BACKOFF_FACTOR` (1.5×)
+3. Interval continues growing until it reaches `MAX_INTERVAL` (5.0s cap)
+4. When a message arrives, interval immediately resets to `POLL_INTERVAL`
+
+**Example Progression:**
+
+```
+1.0s → 1.5s → 2.25s → 3.375s → 5.0s (capped) → 5.0s → ...
+         ↓ message arrives
+         1.0s (reset)
+```
+
+**Tuning Guide:**
+
+| Use Case | POLL_INTERVAL | MAX_INTERVAL | BACKOFF_FACTOR |
+|----------|---------------|--------------|----------------|
+| Real-time (<1s latency) | 0.1-0.5 | 2.0-5.0 | 1.5 |
+| Standard (default) | 1.0 | 5.0 | 1.5 |
+| Batch workloads | 1.0-2.0 | 10.0-30.0 | 2.0 |
+| Minimal DB load | 2.0 | 30.0 | 2.0 |
+
+**Per-Session Database Impact:**
+
+| Configuration | Idle Queries/Min | Active Queries/Min |
+|---------------|------------------|-------------------|
+| Default (1.0s/5.0s) | 12 | 60 |
+| Aggressive (0.1s/2.0s) | 30-600 | 600 |
+| Conservative (2.0s/30.0s) | 2 | 30 |
+
+!!! tip "Redis Eliminates Polling"
+    With `CACHE_TYPE=redis`, sessions use Redis Pub/Sub for instant message delivery with zero polling overhead. Redis is recommended for production deployments with many concurrent sessions.
+
+### HTTPX Client Connection Pool
+
+MCP Gateway uses HTTP client connection pooling for outbound requests, providing ~20x better performance than per-request clients by reusing TCP connections. These settings affect federation, health checks, A2A agent calls, SSO, MCP server connections, and catalog operations.
+
+!!! note "Shared vs Factory Clients"
+    Most requests use a shared singleton client for optimal connection reuse. SSE/streaming MCP connections use factory-created clients with the same settings, as they require dedicated long-lived connections for proper lifecycle management.
+
+```bash
+# Connection Pool Limits
+HTTPX_MAX_CONNECTIONS=200              # Total connections in pool (10-1000, default: 200)
+HTTPX_MAX_KEEPALIVE_CONNECTIONS=100    # Keepalive connections (1-500, default: 100)
+HTTPX_KEEPALIVE_EXPIRY=30.0            # Idle connection expiry in seconds (5.0-300.0)
+
+# Timeout Configuration
+HTTPX_CONNECT_TIMEOUT=5.0              # TCP connection timeout in seconds (default: 5, fast for LAN)
+HTTPX_READ_TIMEOUT=120.0               # Response read timeout in seconds (default: 120, high for slow tools)
+HTTPX_WRITE_TIMEOUT=30.0               # Request write timeout in seconds (default: 30)
+HTTPX_POOL_TIMEOUT=10.0                # Wait for available connection in seconds (default: 10, fail fast)
+
+# Protocol Configuration
+HTTPX_HTTP2_ENABLED=false              # Enable HTTP/2 (requires server support)
+
+# Admin Operations Timeout
+HTTPX_ADMIN_READ_TIMEOUT=30.0          # Admin UI operations timeout (default: 30, fail fast)
+```
+
+**Sizing Guidelines:**
+
+| Deployment Size | `HTTPX_MAX_CONNECTIONS` | `HTTPX_MAX_KEEPALIVE_CONNECTIONS` | Notes |
+|----------------|------------------------|----------------------------------|-------|
+| Development    | 50                     | 25                               | Minimal footprint |
+| Production     | 200                    | 100                              | Default, handles typical load |
+| High-traffic   | 300-500                | 150-250                          | Heavy federation/A2A usage |
+
+**Formula:** `HTTPX_MAX_CONNECTIONS = concurrent_outbound_requests × 1.5`
+
+!!! tip "Connection Pool vs Per-Request Clients"
+    The shared connection pool eliminates TCP handshake and TLS negotiation overhead for each request. In benchmarks, this provides ~20x improvement in throughput compared to creating a new client per request.
+
+!!! warning "HTTP/2 Support"
+    HTTP/2 (`HTTPX_HTTP2_ENABLED=true`) enables multiplexing over a single connection but requires upstream servers to support HTTP/2. Leave disabled unless all upstream services support HTTP/2.
 
 ### Logging Settings
 
@@ -850,10 +955,12 @@ spec:
 
 ```bash
 # Database connection pool
-DB_POOL_SIZE=200
-DB_MAX_OVERFLOW=5
-DB_POOL_TIMEOUT=60
-DB_POOL_RECYCLE=3600
+DB_POOL_CLASS=auto               # auto, null (PgBouncer), or queue
+DB_POOL_SIZE=200                 # Pool size (QueuePool only)
+DB_MAX_OVERFLOW=5                # Overflow connections (QueuePool only)
+DB_POOL_TIMEOUT=60               # Connection wait timeout
+DB_POOL_RECYCLE=3600             # Recycle connections (seconds)
+DB_POOL_PRE_PING=auto            # Validate connections: auto, true, false
 
 # Tool execution
 TOOL_TIMEOUT=120

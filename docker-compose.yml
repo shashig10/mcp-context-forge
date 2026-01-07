@@ -124,19 +124,19 @@ services:
       - REDIS_HEALTH_CHECK_INTERVAL=30
       # Auth Cache Configuration (reduces DB queries per auth request from 3-4 to 0-1)
       - AUTH_CACHE_ENABLED=true
-      - AUTH_CACHE_USER_TTL=60
+      - AUTH_CACHE_USER_TTL=300
       - AUTH_CACHE_REVOCATION_TTL=30
-      - AUTH_CACHE_TEAM_TTL=60
-      - AUTH_CACHE_ROLE_TTL=60
+      - AUTH_CACHE_TEAM_TTL=300
+      - AUTH_CACHE_ROLE_TTL=300
       - AUTH_CACHE_BATCH_QUERIES=true
       # Registry Cache Configuration (reduces DB queries for list endpoints)
       - REGISTRY_CACHE_ENABLED=true
-      - REGISTRY_CACHE_TOOLS_TTL=20
-      - REGISTRY_CACHE_PROMPTS_TTL=15
-      - REGISTRY_CACHE_RESOURCES_TTL=15
-      - REGISTRY_CACHE_AGENTS_TTL=20
-      - REGISTRY_CACHE_SERVERS_TTL=20
-      - REGISTRY_CACHE_GATEWAYS_TTL=20
+      - REGISTRY_CACHE_TOOLS_TTL=60
+      - REGISTRY_CACHE_PROMPTS_TTL=60
+      - REGISTRY_CACHE_RESOURCES_TTL=60
+      - REGISTRY_CACHE_AGENTS_TTL=60
+      - REGISTRY_CACHE_SERVERS_TTL=60
+      - REGISTRY_CACHE_GATEWAYS_TTL=60
       - REGISTRY_CACHE_CATALOG_TTL=300
       # Admin Stats Cache Configuration (reduces aggregate queries for dashboard)
       - ADMIN_STATS_CACHE_ENABLED=true
@@ -210,36 +210,58 @@ services:
       - VALIDATION_MIDDLEWARE_ENABLED=true
       - CORRELATION_ID_ENABLED=false
       - OBSERVABILITY_ENABLED=false
-      # Database pool tuning for 3000 sustained users
-      # With PgBouncer (default): smaller pools since PgBouncer handles connection multiplexing
-      # Direct PostgreSQL: larger pools needed, formula: (replicas × workers) × (pool + overflow) < max_connections
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Database Connection Pool Configuration
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Pool class options:
+      #   - "null": NullPool - no application pooling, PgBouncer handles all pooling (recommended)
+      #   - "queue": QueuePool - application-side pooling (use with direct PostgreSQL)
+      #   - "auto": Automatic - NullPool if PgBouncer detected in URL, else QueuePool
       #
-      # WITH PgBouncer (default):
-      - DB_POOL_SIZE=15
-      - DB_MAX_OVERFLOW=5              # Low overflow minimizes pool churn under pressure
-      # DIRECT PostgreSQL connection (uncomment if bypassing PgBouncer):
-      # - DB_POOL_SIZE=50
-      # - DB_MAX_OVERFLOW=100
-      - DB_POOL_TIMEOUT=45             # Time to wait for connection before failing
-      - DB_POOL_RECYCLE=300
-      - DB_POOL_PRE_PING=false
+      # WITH PgBouncer (default in docker-compose):
+      # Option A: NullPool - safest, eliminates stale connection errors, ~10% slower
+      # - DB_POOL_CLASS=null
+      # Option B: QueuePool + pre_ping - better performance, validates before use
+      - DB_POOL_CLASS=queue
+      - DB_POOL_PRE_PING=true          # Validate connections before use (SELECT 1)
+      - DB_POOL_SIZE=20                # Pool size per worker
+      - DB_MAX_OVERFLOW=10             # Extra connections under load
+      - DB_POOL_TIMEOUT=60             # Time to wait for connection before failing
+      - DB_POOL_RECYCLE=60             # Recycle before PgBouncer CLIENT_IDLE_TIMEOUT (half of 120s)
       # Tool configuration for high-concurrency load testing
       - TOOL_TIMEOUT=60               # Seconds before tool invocation times out
       - MAX_TOOL_RETRIES=3            # Retry attempts for failed tool invocations
       - TOOL_RATE_LIMIT=3000          # Max tool invocations per minute
       - TOOL_CONCURRENT_LIMIT=100     # Max concurrent tool invocations
       - FEDERATION_TIMEOUT=30
+      # ═══════════════════════════════════════════════════════════════════════════
+      # HTTPX Client Connection Pool Configuration
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Shared HTTP client for all outbound requests (federation, health checks,
+      # A2A, SSO, catalog). Provides ~20x better performance than per-request clients.
+      - HTTPX_MAX_CONNECTIONS=200           # Total connections in pool (default: 200)
+      - HTTPX_MAX_KEEPALIVE_CONNECTIONS=100 # Keepalive connections (default: 100)
+      - HTTPX_KEEPALIVE_EXPIRY=30.0         # Idle connection expiry (seconds)
+      - HTTPX_CONNECT_TIMEOUT=5.0           # TCP connection timeout (seconds)
+      - HTTPX_READ_TIMEOUT=120.0            # Response read timeout (seconds, high for slow tools)
+      - HTTPX_WRITE_TIMEOUT=30.0            # Request write timeout (seconds)
+      - HTTPX_POOL_TIMEOUT=10.0             # Wait for available connection (seconds)
+      - HTTPX_HTTP2_ENABLED=false           # HTTP/2 support (requires server support)
+      - HTTPX_ADMIN_READ_TIMEOUT=30.0       # Admin UI/health check timeout (seconds)
       # Worker and server tuning for high-concurrency load testing
       - GUNICORN_WORKERS=16
-      # Granian high-concurrency tuning with backpressure (for 3000 concurrent users)
-      # Total capacity = GRANIAN_WORKERS × GRANIAN_BACKPRESSURE = 16 × 64 = 1024 concurrent requests
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Granian Backpressure Configuration (used when HTTP_SERVER=granian)
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Backpressure provides overload protection by rejecting excess requests with
+      # immediate 503 responses instead of queuing them (which can cause OOM/timeouts).
+      # Total capacity = GRANIAN_WORKERS × GRANIAN_BACKPRESSURE = 16 × 64 = 1024 concurrent
       # Requests beyond this limit receive immediate 503 (no queuing, no OOM)
+      - GRANIAN_WORKERS=16
       - GRANIAN_BACKLOG=4096
       - GRANIAN_BACKPRESSURE=64
       - GRANIAN_HTTP1_BUFFER_SIZE=524288
-      # Note: GRANIAN_BLOCKING_THREADS must be 1 for ASGI (Granian limitation)
-      # Granian workers (auto = CPU count, or set explicit number)
-      - GRANIAN_WORKERS=16
+      - GRANIAN_RESPAWN_FAILED=true
       # HTTP/2: Granian supports native HTTP/2 multiplexing, but not useful here because:
       # - nginx sits in front and downgrades to HTTP/1.1 for upstream connections
       # - nginx open-source doesn't support HTTP/2 to backends (only nginx Plus does)
@@ -356,12 +378,12 @@ services:
     ports:
       - "5433:5432"      # Expose for baseline load testing (5433 to avoid conflict with local postgres)
     # Performance tuning for high-load testing (3000 sustained users)
-    # WITH PgBouncer (default): 700 connections provides headroom for 550 pool + system overhead
+    # WITH PgBouncer (default): 800 connections provides headroom for 700 pool + system overhead
     # DIRECT connection mode: increase to 4000 for (3 replicas × 16 workers × 80 pool)
     command:
       - "postgres"
       - "-c"
-      - "max_connections=700"     # Must exceed PgBouncer MAX_DB_CONNECTIONS (550) + overhead
+      - "max_connections=800"     # Must exceed PgBouncer MAX_DB_CONNECTIONS (700) + overhead
       - "-c"
       - "shared_buffers=512MB"
       - "-c"
@@ -389,9 +411,9 @@ services:
       # Application code now properly closes transactions via get_db() commit-on-success pattern
       # This timeout is a safety net for any edge cases
       - "-c"
-      - "idle_in_transaction_session_timeout=60s"  # Kill stuck transactions after 60s
+      - "idle_in_transaction_session_timeout=120s"  # Kill stuck transactions after 120s (aligned with PgBouncer)
       - "-c"
-      - "statement_timeout=60s"            # Kill runaway queries after 60s
+      - "statement_timeout=120s"           # Kill runaway queries after 120s
       - "-c"
       - "synchronous_commit=off"           # Async WAL writes (2-10x faster commits)
       - "-c"
@@ -498,24 +520,24 @@ services:
       # ═══════════════════════════════════════════════════════════════════════════
       # Client-side limits (from gateway workers via SQLAlchemy)
       - MAX_CLIENT_CONN=5000           # Max app connections; must exceed (replicas × workers × pool)
-      - DEFAULT_POOL_SIZE=450          # Shared DB connections; sized for ~70 concurrent tx × 6x headroom
-      - MIN_POOL_SIZE=50               # Pre-warmed connections for instant response to load spikes
-      - RESERVE_POOL_SIZE=100          # Emergency pool for burst traffic beyond DEFAULT_POOL_SIZE
+      - DEFAULT_POOL_SIZE=600          # Shared DB connections; sized for ~70 concurrent tx × 8x headroom
+      - MIN_POOL_SIZE=100              # Pre-warmed connections for instant response to load spikes
+      - RESERVE_POOL_SIZE=150          # Emergency pool for burst traffic beyond DEFAULT_POOL_SIZE
       - RESERVE_POOL_TIMEOUT=2         # Seconds before tapping reserve pool
       # Server-side limits (to PostgreSQL)
-      - MAX_DB_CONNECTIONS=550         # Max connections to PostgreSQL; must be < PG max_connections
-      - MAX_USER_CONNECTIONS=550       # Per-user limit; typically equals MAX_DB_CONNECTIONS
+      - MAX_DB_CONNECTIONS=700         # Max connections to PostgreSQL; must be < PG max_connections
+      - MAX_USER_CONNECTIONS=700       # Per-user limit; typically equals MAX_DB_CONNECTIONS
       # Connection lifecycle
       - SERVER_LIFETIME=3600           # Recycle server connections after 1 hour (prevents stale state)
-      - SERVER_IDLE_TIMEOUT=300        # Close unused server connections after 5 min
+      - SERVER_IDLE_TIMEOUT=600        # Close unused server connections after 10 min
       # Timeout settings
-      - QUERY_WAIT_TIMEOUT=45          # Max wait for available connection before failing request
-      - CLIENT_IDLE_TIMEOUT=60         # Close idle client connections to free resources quickly
+      - QUERY_WAIT_TIMEOUT=60          # Max wait for available connection before failing request
+      - CLIENT_IDLE_TIMEOUT=300        # Close idle client connections (aligned with pool_recycle)
       - SERVER_CONNECT_TIMEOUT=5       # Timeout for new connections to PostgreSQL
       # Transaction cleanup - critical for avoiding idle-in-transaction buildup
       - SERVER_RESET_QUERY=DISCARD ALL # Reset connection state when returned to pool
       - SERVER_RESET_QUERY_ALWAYS=1    # Always run reset query even after clean transactions
-      - IDLE_TRANSACTION_TIMEOUT=30    # Kill transactions idle > 30s (prevents connection starvation)
+      - IDLE_TRANSACTION_TIMEOUT=120   # Kill transactions idle > 120s (prevents connection starvation)
       # Authentication
       - AUTH_TYPE=scram-sha-256        # Match PostgreSQL auth method
     depends_on:

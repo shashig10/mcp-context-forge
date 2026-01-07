@@ -486,9 +486,14 @@ class ToolService:
         tool_dict = tool.__dict__.copy()
         tool_dict.pop("_sa_instance_state", None)
 
-        tool_dict["metrics"] = tool.metrics_summary if include_metrics else None
-
-        tool_dict["execution_count"] = tool.execution_count if include_metrics else None
+        # Compute metrics in a single pass (matches server/resource/prompt service pattern)
+        if include_metrics:
+            metrics = tool.metrics_summary  # Single-pass computation
+            tool_dict["metrics"] = metrics
+            tool_dict["execution_count"] = metrics["total_executions"]
+        else:
+            tool_dict["metrics"] = None
+            tool_dict["execution_count"] = None
 
         tool_dict["request_type"] = tool.request_type
         tool_dict["annotations"] = tool.annotations or {}
@@ -1501,8 +1506,8 @@ class ToolService:
                 cached_tools = [ToolRead.model_validate(t) for t in cached["tools"]]
                 return (cached_tools, cached.get("next_cursor"))
 
-        # Build base query with ordering
-        query = select(DbTool).order_by(desc(DbTool.created_at), desc(DbTool.id))
+        # Build base query with ordering and eager load gateway to avoid N+1
+        query = select(DbTool).options(joinedload(DbTool.gateway)).order_by(desc(DbTool.created_at), desc(DbTool.id))
 
         # Apply active/inactive filter
         if not include_inactive:
@@ -1738,7 +1743,8 @@ class ToolService:
         user_teams = await team_service.get_user_teams(user_email)
         team_ids = [team.id for team in user_teams]
 
-        query = select(DbTool)
+        # Eager load gateway to avoid N+1 when accessing gateway_slug
+        query = select(DbTool).options(joinedload(DbTool.gateway))
 
         # Apply active/inactive filter
         if not include_inactive:
@@ -2507,16 +2513,24 @@ class ToolService:
                                 valid = validate_signature(gateway_ca_cert.encode(), gateway_ca_cert_sig, public_key_pem)
                             else:
                                 valid = True
+                        # First-Party
+                        from mcpgateway.services.http_client_service import get_default_verify, get_http_timeout  # pylint: disable=import-outside-toplevel
+
                         if valid:
                             ctx = create_ssl_context(gateway_ca_cert)
                         else:
                             ctx = None
                         return httpx.AsyncClient(
-                            verify=ctx if ctx else True,
+                            verify=ctx if ctx else get_default_verify(),
                             follow_redirects=True,
                             headers=headers,
-                            timeout=timeout or httpx.Timeout(30.0),
+                            timeout=timeout if timeout else get_http_timeout(),
                             auth=auth,
+                            limits=httpx.Limits(
+                                max_connections=settings.httpx_max_connections,
+                                max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                                keepalive_expiry=settings.httpx_keepalive_expiry,
+                            ),
                         )
 
                     async def connect_to_sse_server(server_url: str, headers: dict = headers):
@@ -2530,7 +2544,7 @@ class ToolService:
                             ToolResult: Result of tool call
 
                         Raises:
-                            Exception: On connection or communication errors
+                            BaseException: On connection or communication errors
                         """
                         # Get correlation ID for distributed tracing
                         correlation_id = get_correlation_id()
@@ -2567,7 +2581,13 @@ class ToolService:
                             )
 
                             return tool_call_result
-                        except Exception as e:
+                        except BaseException as e:
+                            # Extract root cause from ExceptionGroup (Python 3.11+)
+                            # MCP SDK uses TaskGroup which wraps exceptions in ExceptionGroup
+                            root_cause = e
+                            if isinstance(e, BaseExceptionGroup):
+                                while isinstance(root_cause, BaseExceptionGroup) and root_cause.exceptions:
+                                    root_cause = root_cause.exceptions[0]
                             # Log failed MCP call (using local variables)
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
@@ -2576,7 +2596,7 @@ class ToolService:
                                 component="tool_service",
                                 correlation_id=correlation_id,
                                 duration_ms=mcp_duration_ms,
-                                error_details={"error_type": type(e).__name__, "error_message": str(e)},
+                                error_details={"error_type": type(root_cause).__name__, "error_message": str(root_cause)},
                                 metadata={"event": "mcp_call_failed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "sse"},
                             )
                             raise
@@ -2592,7 +2612,7 @@ class ToolService:
                             ToolResult: Result of tool call
 
                         Raises:
-                            Exception: On connection or communication errors
+                            BaseException: On connection or communication errors
                         """
                         # Get correlation ID for distributed tracing
                         correlation_id = get_correlation_id()
@@ -2614,48 +2634,20 @@ class ToolService:
                         try:
                             if "bedrock-agentcore" in server_url:
                                 auth = SigV4MCPAuth("eu-central-1")
-                                # auth  = SigV4Auth
                                 async with streamablehttp_client(url=server_url, headers=headers,auth=auth,
                                                                  httpx_client_factory=get_httpx_client_factory) as (
                                         read_stream, write_stream, _get_session_id):
                                     async with ClientSession(read_stream, write_stream) as session:
                                         await session.initialize()
                                         tool_call_result = await session.call_tool(tool.original_name, arguments)
-
-                                # Log successful MCP call
-                                mcp_duration_ms = (time.time() - mcp_start_time) * 1000
-                                structured_logger.log(
-                                    level="INFO",
-                                    message=f"MCP tool call completed: {tool_original_name}",
-                                    component="tool_service",
-                                    correlation_id=correlation_id,
-                                    duration_ms=mcp_duration_ms,
-                                    metadata={"event": "mcp_call_completed", "tool_name": tool_original_name,
-                                              "tool_id": tool_id, "transport": "streamablehttp", "success": True},
-                                )
-
-                                return tool_call_result
-
                             else:
-                                async with streamablehttp_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as (read_stream, write_stream, _get_session_id):
+                                async with streamablehttp_client(url=server_url, headers=headers,
+                                                                 httpx_client_factory=get_httpx_client_factory) as (
+                                        read_stream, write_stream, _get_session_id):
                                     async with ClientSession(read_stream, write_stream) as session:
                                         await session.initialize()
-                                        tool_call_result = await session.call_tool(tool.original_name, arguments)
+                                        tool_call_result = await session.call_tool(tool_name_original, arguments)
 
-                                # Log successful MCP call
-                                mcp_duration_ms = (time.time() - mcp_start_time) * 1000
-                                structured_logger.log(
-                                    level="INFO",
-                                    message=f"MCP tool call completed: {tool_original_name}",
-                                    component="tool_service",
-                                    correlation_id=correlation_id,
-                                    duration_ms=mcp_duration_ms,
-                                    metadata={"event": "mcp_call_completed", "tool_name": tool_original_name, "tool_id": tool_id, "transport": "streamablehttp", "success": True},
-                                )
-                            async with streamablehttp_client(url=server_url, headers=headers, httpx_client_factory=get_httpx_client_factory) as (read_stream, write_stream, _get_session_id):
-                                async with ClientSession(read_stream, write_stream) as session:
-                                    await session.initialize()
-                                    tool_call_result = await session.call_tool(tool_name_original, arguments)
                             # Log successful MCP call
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
@@ -2668,7 +2660,13 @@ class ToolService:
                             )
 
                             return tool_call_result
-                        except Exception as e:
+                        except BaseException as e:
+                            # Extract root cause from ExceptionGroup (Python 3.11+)
+                            # MCP SDK uses TaskGroup which wraps exceptions in ExceptionGroup
+                            root_cause = e
+                            if isinstance(e, BaseExceptionGroup):
+                                while isinstance(root_cause, BaseExceptionGroup) and root_cause.exceptions:
+                                    root_cause = root_cause.exceptions[0]
                             # Log failed MCP call
                             mcp_duration_ms = (time.time() - mcp_start_time) * 1000
                             structured_logger.log(
@@ -2677,7 +2675,7 @@ class ToolService:
                                 component="tool_service",
                                 correlation_id=correlation_id,
                                 duration_ms=mcp_duration_ms,
-                                error_details={"error_type": type(e).__name__, "error_message": str(e)},
+                                error_details={"error_type": type(root_cause).__name__, "error_message": str(root_cause)},
                                 metadata={"event": "mcp_call_failed", "tool_name": tool_name_original, "tool_id": tool_id, "transport": "streamablehttp"},
                             )
                             raise
@@ -2753,12 +2751,18 @@ class ToolService:
                 return tool_result
             except (PluginError, PluginViolationError):
                 raise
-            except Exception as e:
-                error_message = str(e)
+            except BaseException as e:
+                # Extract root cause from ExceptionGroup (Python 3.11+)
+                # MCP SDK uses TaskGroup which wraps exceptions in ExceptionGroup
+                root_cause = e
+                if isinstance(e, BaseExceptionGroup):
+                    while isinstance(root_cause, BaseExceptionGroup) and root_cause.exceptions:
+                        root_cause = root_cause.exceptions[0]
+                error_message = str(root_cause)
                 # Set span error status
                 if span:
                     span.set_attribute("error", True)
-                    span.set_attribute("error.message", str(e))
+                    span.set_attribute("error.message", error_message)
                 raise ToolInvocationError(f"Tool invocation failed: {error_message}")
             finally:
                 # Calculate duration
@@ -3529,28 +3533,31 @@ class ToolService:
             logger.info(f"invoke tool Using custom A2A format for A2A agent '{parameters}'")
             request_data = {"interaction_type": parameters.get("interaction_type", "query"), "parameters": params, "protocol_version": agent.protocol_version}
         logger.info(f"invoke tool request_data prepared: {request_data}")
-        # Make HTTP request to the agent endpoint
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {"Content-Type": "application/json"}
+        # Make HTTP request to the agent endpoint using shared HTTP client
+        # First-Party
+        from mcpgateway.services.http_client_service import get_http_client  # pylint: disable=import-outside-toplevel
 
-            # Add authentication if configured
-            if agent.auth_type == "api_key" and agent.auth_value:
-                headers["Authorization"] = f"Bearer {agent.auth_value}"
-            elif agent.auth_type == "bearer" and agent.auth_value:
-                headers["Authorization"] = f"Bearer {agent.auth_value}"
+        client = await get_http_client()
+        headers = {"Content-Type": "application/json"}
 
-            if "bedrock-agentcore" in agent.endpoint_url:
-                # Use AWS SigV4 authentication for Bedrock AgentCore endpoints
-                from mcpgateway.services.aws_sigv4 import SigV4MCPAuth  # Import here to avoid circular dependency
+        # Add authentication if configured
+        if agent.auth_type == "api_key" and agent.auth_value:
+            headers["Authorization"] = f"Bearer {agent.auth_value}"
+        elif agent.auth_type == "bearer" and agent.auth_value:
+            headers["Authorization"] = f"Bearer {agent.auth_value}"
 
-                # region = agent.annotations.get("aws_region") if agent.annotations else None
-                auth = SigV4MCPAuth("eu-central-1")
-                client.auth = auth
-                http_response = await client.post(agent.endpoint_url, json=request_data, headers=headers)
-            else:
-                http_response = await client.post(agent.endpoint_url, json=request_data, headers=headers)
+        if "bedrock-agentcore" in agent.endpoint_url:
+            # Use AWS SigV4 authentication for Bedrock AgentCore endpoints
+            from mcpgateway.services.aws_sigv4 import SigV4MCPAuth  # Import here to avoid circular dependency
 
-            if http_response.status_code == 200:
-                return http_response.json()
+            # region = agent.annotations.get("aws_region") if agent.annotations else None
+            auth = SigV4MCPAuth("eu-central-1")
+            client.auth = auth
+            http_response = await client.post(agent.endpoint_url, json=request_data, headers=headers)
+        else:
+            http_response = await client.post(agent.endpoint_url, json=request_data, headers=headers)
 
-            raise Exception(f"HTTP {http_response.status_code}: {http_response.text}")
+        if http_response.status_code == 200:
+            return http_response.json()
+
+        raise Exception(f"HTTP {http_response.status_code}: {http_response.text}")
