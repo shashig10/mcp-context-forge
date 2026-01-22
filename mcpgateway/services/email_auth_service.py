@@ -21,24 +21,42 @@ Examples:
 """
 
 # Standard
+import base64
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 from typing import Optional
+import warnings
 
 # Third-Party
-from sqlalchemy import delete, func, select
+import orjson
+from sqlalchemy import and_, delete, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 # First-Party
 from mcpgateway.config import settings
-from mcpgateway.db import EmailAuthEvent, EmailUser
+from mcpgateway.db import EmailAuthEvent, EmailTeam, EmailTeamMember, EmailUser, utc_now
+from mcpgateway.schemas import PaginationLinks, PaginationMeta
 from mcpgateway.services.argon2_service import Argon2PasswordService
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.utils.pagination import unified_paginate
 
 # Initialize logging
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
+
+_GET_ALL_USERS_LIMIT = 10000
+
+
+@dataclass(frozen=True)
+class UsersListResult:
+    """Result for list_users queries."""
+
+    data: list[EmailUser]
+    next_cursor: Optional[str] = None
+    pagination: Optional[PaginationMeta] = None
+    links: Optional[PaginationLinks] = None
 
 
 class EmailValidationError(Exception):
@@ -105,6 +123,8 @@ class EmailAuthService:
         ...     service = EmailAuthService(db)
         ...     # Service is ready to use
     """
+
+    get_all_users_deprecated_warned = False
 
     def __init__(self, db: Session):
         """Initialize the email authentication service.
@@ -227,6 +247,10 @@ class EmailAuthService:
         if not password:
             raise PasswordValidationError("Password is required")
 
+        # Respect global toggle for password policy
+        if not getattr(settings, "password_policy_enabled", True):
+            return True
+
         # Get password policy settings
         min_length = getattr(settings, "password_min_length", 8)
         require_uppercase = getattr(settings, "password_require_uppercase", False)
@@ -318,8 +342,8 @@ class EmailAuthService:
         # Hash the password
         password_hash = self.password_service.hash_password(password)
 
-        # Create new user
-        user = EmailUser(email=email, password_hash=password_hash, full_name=full_name, is_admin=is_admin, auth_provider=auth_provider)
+        # Create new user (record password change timestamp)
+        user = EmailUser(email=email, password_hash=password_hash, full_name=full_name, is_admin=is_admin, auth_provider=auth_provider, password_changed_at=utc_now())
 
         try:
             self.db.add(user)
@@ -478,7 +502,7 @@ class EmailAuthService:
         self.validate_password(new_password)
 
         # Check if new password is same as old (optional policy)
-        if self.password_service.verify_password(new_password, user.password_hash):
+        if getattr(settings, "password_prevent_reuse", True) and self.password_service.verify_password(new_password, user.password_hash):
             raise PasswordValidationError("New password must be different from current password")
 
         success = False
@@ -486,6 +510,13 @@ class EmailAuthService:
             # Hash new password and update
             new_password_hash = self.password_service.hash_password(new_password)
             user.password_hash = new_password_hash
+            # Clear the flag that requires the user to change password
+            user.password_change_required = False
+            # Record the password change timestamp
+            try:
+                user.password_changed_at = utc_now()
+            except Exception as exc:
+                logger.debug("Failed to set password_changed_at for %s: %s", email, exc)
 
             self.db.commit()
             success = True
@@ -498,7 +529,14 @@ class EmailAuthService:
                 # First-Party
                 from mcpgateway.cache.auth_cache import auth_cache  # pylint: disable=import-outside-toplevel
 
-                asyncio.create_task(auth_cache.invalidate_user(email))
+                # Ensure cache invalidation runs before returning to avoid stale
+                # auth context being used by subsequent requests. Use a timeout
+                # to prevent blocking if Redis is slow or unresponsive.
+                # Shield the task to prevent cancellation on timeout - allows Redis
+                # operations to complete in background even if we stop waiting.
+                await asyncio.wait_for(asyncio.shield(auth_cache.invalidate_user(email)), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Auth cache invalidation timed out for {email} - continuing in background")
             except Exception as cache_error:
                 logger.debug(f"Failed to invalidate auth cache on password change: {cache_error}")
 
@@ -549,6 +587,10 @@ class EmailAuthService:
             # Check if password needs update (verify current password first)
             if not self.password_service.verify_password(password, existing_admin.password_hash):
                 existing_admin.password_hash = self.password_service.hash_password(password)
+                try:
+                    existing_admin.password_changed_at = utc_now()
+                except Exception as exc:
+                    logger.debug("Failed to set password_changed_at for existing admin %s: %s", email, exc)
 
             # Ensure admin status
             existing_admin.is_admin = True
@@ -575,43 +617,332 @@ class EmailAuthService:
             user.reset_failed_attempts()  # This also updates last_login
             self.db.commit()
 
-    async def list_users(self, limit: int = 100, offset: int = 0) -> list[EmailUser]:
-        """List all users with pagination.
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE wildcards for prefix search.
+
+        Args:
+            value: Raw value to escape for LIKE matching.
+
+        Returns:
+            Escaped string safe for LIKE patterns.
+        """
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    async def list_users(
+        self,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
+        search: Optional[str] = None,
+    ) -> UsersListResult:
+        """List all users with cursor or page-based pagination support and optional search.
+
+        This method supports both cursor-based (for API endpoints with large datasets)
+        and page-based (for admin UI with page numbers) pagination, with optional
+        search filtering by email or full name.
 
         Note: This method returns ORM objects and cannot be cached since callers
         depend on ORM attributes and methods (e.g., EmailUserResponse.from_email_user).
 
         Args:
-            limit: Maximum number of users to return
-            offset: Number of users to skip
+            limit: Maximum number of users to return (for cursor-based pagination)
+            cursor: Opaque cursor token for cursor-based pagination
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor.
+            per_page: Items per page for page-based pagination
+            search: Optional search term to filter by email or full name (case-insensitive)
 
         Returns:
-            List of EmailUser objects
+            UsersListResult with data and optional pagination metadata.
 
         Examples:
-            # users = await service.list_users(limit=10)
-            # len(users) <= 10     # Returns: True
+            # Cursor-based pagination (for APIs)
+            # result = await service.list_users(cursor=None, limit=50)
+            # len(result.data) <= 50     # Returns: True
+
+            # Page-based pagination (for admin UI)
+            # result = await service.list_users(page=1, per_page=10)
+            # result.data       # Returns: list of users
+            # result.pagination # Returns: pagination metadata
+
+            # Search users
+            # users = await service.list_users(search="john", page=1, per_page=10)
+            # All users with "john" in email or name
         """
         try:
-            stmt = select(EmailUser).offset(offset).limit(limit)
-            result = self.db.execute(stmt)
+            # Build base query with ordering by created_at, email for consistent pagination
+            # Note: EmailUser uses email as primary key, not id
+            query = select(EmailUser).order_by(desc(EmailUser.created_at), desc(EmailUser.email))
+
+            # Apply search filter if provided (prefix search for better index usage)
+            if search and search.strip():
+                search_term = f"{self._escape_like(search.strip())}%"
+                # NOTE: For large Postgres datasets, consider citext or functional indexes for case-insensitive search.
+                query = query.where(
+                    or_(
+                        EmailUser.email.ilike(search_term, escape="\\"),
+                        EmailUser.full_name.ilike(search_term, escape="\\"),
+                    )
+                )
+
+            # Page-based pagination: use unified_paginate
+            if page is not None:
+                pag_result = await unified_paginate(
+                    db=self.db,
+                    query=query,
+                    page=page,
+                    per_page=per_page,
+                    cursor=None,
+                    limit=None,
+                    base_url="/admin/users",
+                    query_params={},
+                )
+                return UsersListResult(data=pag_result["data"], pagination=pag_result["pagination"], links=pag_result["links"])
+
+            # Cursor-based pagination: custom implementation for EmailUser
+            # EmailUser uses email as PK (not id), so we need custom cursor using (created_at, email)
+            page_size = limit if limit and limit > 0 else settings.pagination_default_page_size
+            if limit == 0:
+                page_size = None  # No limit
+
+            # Decode cursor and apply keyset filter if provided
+            if cursor:
+                try:
+                    cursor_json = base64.urlsafe_b64decode(cursor.encode()).decode()
+                    cursor_data = orjson.loads(cursor_json)
+                    last_email = cursor_data.get("email")
+                    created_str = cursor_data.get("created_at")
+                    if last_email and created_str:
+                        last_created = datetime.fromisoformat(created_str)
+                        # Apply keyset filter (assumes DESC order on created_at, email)
+                        query = query.where(
+                            or_(
+                                EmailUser.created_at < last_created,
+                                and_(EmailUser.created_at == last_created, EmailUser.email < last_email),
+                            )
+                        )
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Invalid cursor for user pagination, ignoring: {e}")
+
+            # Fetch page_size + 1 to determine if there are more results
+            if page_size is not None:
+                query = query.limit(page_size + 1)
+            result = self.db.execute(query)
             users = list(result.scalars().all())
-            return users
+
+            if page_size is None:
+                return UsersListResult(data=users, next_cursor=None)
+
+            # Check if there are more results
+            has_more = len(users) > page_size
+            if has_more:
+                users = users[:page_size]
+
+            # Generate next cursor using (created_at, email) for EmailUser
+            next_cursor = None
+            if has_more and users:
+                last_user = users[-1]
+                cursor_data = {
+                    "created_at": last_user.created_at.isoformat() if last_user.created_at else None,
+                    "email": last_user.email,
+                }
+                next_cursor = base64.urlsafe_b64encode(orjson.dumps(cursor_data)).decode()
+
+            return UsersListResult(data=users, next_cursor=next_cursor)
+
         except Exception as e:
             logger.error(f"Error listing users: {e}")
-            return []
+            # Return appropriate empty response based on pagination mode
+            if page is not None:
+                fallback_per_page = per_page or 50
+                return UsersListResult(
+                    data=[],
+                    pagination=PaginationMeta(page=page, per_page=fallback_per_page, total_items=0, total_pages=0, has_next=False, has_prev=False),
+                    links=PaginationLinks(  # pylint: disable=kwarg-superseded-by-positional-arg
+                        self=f"/admin/users?page=1&per_page={fallback_per_page}",
+                        first=f"/admin/users?page=1&per_page={fallback_per_page}",
+                        last=f"/admin/users?page=1&per_page={fallback_per_page}",
+                    ),
+                )
+
+            if cursor is not None:
+                return UsersListResult(data=[], next_cursor=None)
+
+            return UsersListResult(data=[])
+
+    async def list_users_not_in_team(
+        self,
+        team_id: str,
+        cursor: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        per_page: Optional[int] = None,
+        search: Optional[str] = None,
+    ) -> UsersListResult:
+        """List users who are NOT members of the specified team with cursor or page-based pagination.
+
+        Uses a NOT IN subquery to efficiently exclude team members.
+
+        Args:
+            team_id: ID of the team to exclude members from
+            cursor: Opaque cursor token for cursor-based pagination
+            limit: Maximum number of users to return (for cursor-based, default: 50)
+            page: Page number for page-based pagination (1-indexed). Mutually exclusive with cursor.
+            per_page: Items per page for page-based pagination (default: 30)
+            search: Optional search term to filter by email or full name
+
+        Returns:
+            UsersListResult with data and either cursor or pagination metadata
+
+        Examples:
+            # Page-based (admin UI)
+            # result = await service.list_users_not_in_team("team-123", page=1, per_page=30)
+            # result.pagination # Returns: pagination metadata
+
+            # Cursor-based (API)
+            # result = await service.list_users_not_in_team("team-123", cursor=None, limit=50)
+            # result.next_cursor # Returns: next cursor token
+        """
+        try:
+            # Build base query
+            query = select(EmailUser)
+
+            # Apply search filter if provided
+            if search and search.strip():
+                search_term = f"{self._escape_like(search.strip())}%"
+                query = query.where(
+                    or_(
+                        EmailUser.email.ilike(search_term, escape="\\"),
+                        EmailUser.full_name.ilike(search_term, escape="\\"),
+                    )
+                )
+
+            # Exclude team members using NOT IN subquery
+            member_emails_subquery = select(EmailTeamMember.user_email).where(EmailTeamMember.team_id == team_id, EmailTeamMember.is_active.is_(True))
+            query = query.where(EmailUser.is_active.is_(True), ~EmailUser.email.in_(member_emails_subquery))
+
+            # PAGE-BASED PAGINATION (Admin UI) - use unified_paginate
+            if page is not None:
+                query = query.order_by(EmailUser.full_name, EmailUser.email)
+                pag_result = await unified_paginate(
+                    db=self.db,
+                    query=query,
+                    page=page,
+                    per_page=per_page or 30,
+                    cursor=None,
+                    limit=None,
+                    base_url=f"/admin/teams/{team_id}/non-members",
+                    query_params={},
+                )
+                return UsersListResult(data=pag_result["data"], pagination=pag_result["pagination"], links=pag_result["links"])
+
+            # CURSOR-BASED PAGINATION - custom implementation using (created_at, email)
+            # unified_paginate uses (created_at, id) but EmailUser uses email as PK
+            query = query.order_by(desc(EmailUser.created_at), desc(EmailUser.email))
+
+            # Decode cursor and apply keyset filter
+            if cursor:
+                try:
+                    cursor_json = base64.urlsafe_b64decode(cursor.encode()).decode()
+                    cursor_data = orjson.loads(cursor_json)
+                    last_email = cursor_data.get("email")
+                    created_str = cursor_data.get("created_at")
+                    if last_email and created_str:
+                        last_created = datetime.fromisoformat(created_str)
+                        # Keyset filter: (created_at < last) OR (created_at = last AND email < last_email)
+                        query = query.where(
+                            or_(
+                                EmailUser.created_at < last_created,
+                                and_(EmailUser.created_at == last_created, EmailUser.email < last_email),
+                            )
+                        )
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Invalid cursor for non-members list, ignoring: {e}")
+
+            # Fetch limit + 1 to check for more results
+            page_size = limit or 50
+            query = query.limit(page_size + 1)
+            users = list(self.db.execute(query).scalars().all())
+
+            # Check if there are more results
+            has_more = len(users) > page_size
+            if has_more:
+                users = users[:page_size]
+
+            # Generate next cursor using (created_at, email)
+            next_cursor = None
+            if has_more and users:
+                last_user = users[-1]
+                cursor_data = {
+                    "created_at": last_user.created_at.isoformat() if last_user.created_at else None,
+                    "email": last_user.email,
+                }
+                next_cursor = base64.urlsafe_b64encode(orjson.dumps(cursor_data)).decode()
+
+            self.db.commit()
+            return UsersListResult(data=users, next_cursor=next_cursor)
+
+        except Exception as e:
+            logger.error(f"Error listing non-members for team {team_id}: {e}")
+
+            # Return appropriate empty response based on mode
+            if page is not None:
+                return UsersListResult(
+                    data=[],
+                    pagination=PaginationMeta(page=page, per_page=per_page or 30, total_items=0, total_pages=0, has_next=False, has_prev=False),
+                    links=PaginationLinks(  # pylint: disable=kwarg-superseded-by-positional-arg
+                        self=f"/admin/teams/{team_id}/non-members?page=1&per_page={per_page or 30}",
+                        first=f"/admin/teams/{team_id}/non-members?page=1&per_page={per_page or 30}",
+                        last=f"/admin/teams/{team_id}/non-members?page=1&per_page={per_page or 30}",
+                    ),
+                )
+
+            return UsersListResult(data=[], next_cursor=None)
 
     async def get_all_users(self) -> list[EmailUser]:
         """Get all users without pagination.
 
+        .. deprecated:: 1.0
+            Use :meth:`list_users` with proper pagination instead.
+            This method has a hardcoded limit of 10,000 users and will not return
+            more than that. For production systems with many users, use paginated
+            access with search/filtering.
+
         Returns:
-            List of all EmailUser objects
+            List of up to 10,000 EmailUser objects
+
+        Raises:
+            ValueError: If total users exceed 10,000
 
         Examples:
             # users = await service.get_all_users()
             # isinstance(users, list)  # Returns: True
+
+        Warning:
+            This method is deprecated and will be removed in a future version.
+            Use list_users() with pagination instead:
+
+            # For small datasets
+            users = await service.list_users(page=1, per_page=1000).data
+
+            # For searching
+            users = await service.list_users(search="john", page=1, per_page=10).data
         """
-        return await self.list_users(limit=10000)  # Large limit to get all users
+        if not self.__class__.get_all_users_deprecated_warned:
+            warnings.warn(
+                "get_all_users() is deprecated and limited to 10,000 users. " + "Use list_users() with pagination instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.__class__.get_all_users_deprecated_warned = True
+
+        total_users = await self.count_users()
+        if total_users > _GET_ALL_USERS_LIMIT:
+            raise ValueError("get_all_users() supports up to 10,000 users. Use list_users() pagination instead.")
+
+        result = await self.list_users(limit=_GET_ALL_USERS_LIMIT)
+        return result.data  # Large limit to get all users
 
     async def count_users(self) -> int:
         """Count total number of users.
@@ -687,6 +1018,8 @@ class EmailAuthService:
                 if not self.validate_password(password):
                     raise ValueError("Password does not meet security requirements")
                 user.password_hash = self.password_service.hash_password(password)
+                user.password_change_required = False  # Clear password change requirement
+                user.password_changed_at = utc_now()  # Update password change timestamp
 
             user.updated_at = datetime.now(timezone.utc)
 
@@ -787,9 +1120,6 @@ class EmailAuthService:
                 raise ValueError(f"User {email} not found")
 
             # Check if user owns any teams
-            # First-Party
-            from mcpgateway.db import EmailTeam, EmailTeamMember  # pylint: disable=import-outside-toplevel
-
             teams_owned_stmt = select(EmailTeam).where(EmailTeam.created_by == email)
             teams_owned = self.db.execute(teams_owned_stmt).scalars().all()
 

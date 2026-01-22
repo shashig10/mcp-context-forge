@@ -1,6 +1,73 @@
 /* global marked, DOMPurify */
 const MASKED_AUTH_VALUE = "*****";
 
+// ===================================================================
+// GLOBAL CHART.JS INSTANCE REGISTRY
+// ===================================================================
+// Centralized chart management to prevent "Canvas is already in use" errors
+window.chartRegistry = {
+    charts: new Map(),
+
+    register(id, chart) {
+        // Destroy existing chart with same ID before registering new one
+        if (this.charts.has(id)) {
+            this.destroy(id);
+        }
+        this.charts.set(id, chart);
+        console.log(`Chart registered: ${id}`);
+    },
+
+    destroy(id) {
+        const chart = this.charts.get(id);
+        if (chart) {
+            try {
+                chart.destroy();
+                console.log(`Chart destroyed: ${id}`);
+            } catch (e) {
+                console.warn(`Failed to destroy chart ${id}:`, e);
+            }
+            this.charts.delete(id);
+        }
+    },
+
+    destroyAll() {
+        console.log(`Destroying all charts (${this.charts.size} total)`);
+        this.charts.forEach((chart, id) => {
+            this.destroy(id);
+        });
+    },
+
+    destroyByPrefix(prefix) {
+        const toDestroy = [];
+        this.charts.forEach((chart, id) => {
+            if (id.startsWith(prefix)) {
+                toDestroy.push(id);
+            }
+        });
+        console.log(
+            `Destroying ${toDestroy.length} charts with prefix: ${prefix}`,
+        );
+        toDestroy.forEach((id) => this.destroy(id));
+    },
+
+    has(id) {
+        return this.charts.has(id);
+    },
+
+    get(id) {
+        return this.charts.get(id);
+    },
+
+    size() {
+        return this.charts.size;
+    },
+};
+
+// Cleanup all charts on page unload
+window.addEventListener("beforeunload", () => {
+    window.chartRegistry.destroyAll();
+});
+
 // Add three fields to passthrough section on Advanced button click
 function handleAddPassthrough() {
     const passthroughContainer = safeGetElement("passthrough-container");
@@ -123,21 +190,97 @@ document.addEventListener("DOMContentLoaded", function () {
         });
     }
 
-    // Initialize search functionality for all entity types
-    initializeSearchInputs();
+    // Initialize search functionality for all entity types (immediate, no debounce)
+    initializeSearchInputsMemoized();
+    initializePasswordValidation();
+    initializeAddMembersForms();
 
-    // Re-initialize search inputs when HTMX content loads
-    document.body.addEventListener("htmx:afterSwap", function (event) {
-        setTimeout(() => {
-            initializeSearchInputs();
-        }, 200);
+    // Event delegation for team member search - server-side search for unified view
+    // This handler is initialized here for early binding, but the actual search logic
+    // is in performUserSearch() which is attached when the form is initialized
+    const teamSearchTimeouts = {};
+    const teamMemberDataCache = {};
+
+    document.body.addEventListener("input", async function (event) {
+        const target = event.target;
+        if (target.id && target.id.startsWith("user-search-")) {
+            const teamId = target.id.replace("user-search-", "");
+            const listContainer = document.getElementById(
+                `team-members-list-${teamId}`,
+            );
+
+            if (!listContainer) return;
+
+            const query = target.value.trim();
+
+            // Clear previous timeout for this team
+            if (teamSearchTimeouts[teamId]) {
+                clearTimeout(teamSearchTimeouts[teamId]);
+            }
+
+            // Get team member data from cache or script tag
+            if (!teamMemberDataCache[teamId]) {
+                const teamMemberDataScript = document.getElementById(
+                    `team-member-data-${teamId}`,
+                );
+                if (teamMemberDataScript) {
+                    try {
+                        teamMemberDataCache[teamId] = JSON.parse(
+                            teamMemberDataScript.textContent || "{}",
+                        );
+                        console.log(
+                            `[Team ${teamId}] Loaded team member data for ${Object.keys(teamMemberDataCache[teamId]).length} members`,
+                        );
+                    } catch (e) {
+                        console.error(
+                            `[Team ${teamId}] Failed to parse team member data:`,
+                            e,
+                        );
+                        teamMemberDataCache[teamId] = {};
+                    }
+                } else {
+                    teamMemberDataCache[teamId] = {};
+                }
+            }
+
+            // Debounce server call
+            teamSearchTimeouts[teamId] = setTimeout(async () => {
+                await performUserSearch(
+                    teamId,
+                    query,
+                    listContainer,
+                    teamMemberDataCache[teamId],
+                );
+            }, 300);
+        }
     });
 
-    // Also listen for htmx:load event
-    document.body.addEventListener("htmx:load", function (event) {
-        setTimeout(() => {
-            initializeSearchInputs();
-        }, 200);
+    // Re-initialize search inputs when HTMX content loads
+    // Only re-initialize if the swap affects search-related content
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+        const target = event.detail.target;
+        const relevantPanels = [
+            "catalog-panel",
+            "gateways-panel",
+            "tools-panel",
+            "resources-panel",
+            "prompts-panel",
+            "a2a-agents-panel",
+        ];
+
+        if (
+            target &&
+            relevantPanels.some(
+                (panelId) =>
+                    target.id === panelId || target.closest(`#${panelId}`),
+            )
+        ) {
+            console.log(
+                `📝 HTMX swap detected in ${target.id}, resetting search state`,
+            );
+            resetSearchInputsState();
+            initializeSearchInputsDebounced();
+        }
     });
 
     // Initialize search when switching tabs
@@ -146,9 +289,9 @@ document.addEventListener("DOMContentLoaded", function () {
             event.target.matches('[onclick*="showTab"]') ||
             event.target.closest('[onclick*="showTab"]')
         ) {
-            setTimeout(() => {
-                initializeSearchInputs();
-            }, 300);
+            console.log("🔄 Tab switch detected, resetting search state");
+            resetSearchInputsState();
+            initializeSearchInputsDebounced();
         }
     });
 });
@@ -187,6 +330,50 @@ function escapeHtml(unsafe) {
         .replace(/'/g, "&#039;")
         .replace(/`/g, "&#x60;")
         .replace(/\//g, "&#x2F;"); // Extra protection against script injection
+}
+
+/**
+ * Extract a human-readable error message from an API error response.
+ * Handles both string errors and Pydantic validation error arrays.
+ * @param {Object} error - The parsed JSON error response
+ * @param {string} fallback - Fallback message if no detail found
+ * @returns {string} Human-readable error message
+ */
+function extractApiError(error, fallback = "An error occurred") {
+    if (!error || !error.detail) {
+        return fallback;
+    }
+    if (typeof error.detail === "string") {
+        return error.detail;
+    }
+    if (Array.isArray(error.detail)) {
+        // Pydantic validation errors - extract messages
+        return error.detail
+            .map((err) => err.msg || JSON.stringify(err))
+            .join("; ");
+    }
+    return fallback;
+}
+
+/**
+ * Safely parse an error response, handling both JSON and plain text bodies.
+ * @param {Response} response - The fetch Response object
+ * @param {string} fallback - Fallback message if parsing fails
+ * @returns {Promise<string>} Human-readable error message
+ */
+async function parseErrorResponse(response, fallback = "An error occurred") {
+    try {
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+            const error = await response.json();
+            return extractApiError(error, fallback);
+        }
+        // Non-JSON response - try to get text
+        const text = await response.text();
+        return text || fallback;
+    } catch {
+        return fallback;
+    }
 }
 
 /**
@@ -247,7 +434,7 @@ function validatePassthroughHeader(name, value) {
  */
 function validateInputName(name, type = "input") {
     if (!name || typeof name !== "string") {
-        return { valid: false, error: `${type} name is required` };
+        return { valid: false, error: `${type} is required` };
     }
 
     // Remove any HTML tags
@@ -266,20 +453,20 @@ function validateInputName(name, type = "input") {
         if (pattern.test(name)) {
             return {
                 valid: false,
-                error: `${type} name contains invalid characters`,
+                error: `${type} contains invalid characters`,
             };
         }
     }
 
     // Length validation
     if (cleaned.length < 1) {
-        return { valid: false, error: `${type} name cannot be empty` };
+        return { valid: false, error: `${type} cannot be empty` };
     }
 
     if (cleaned.length > window.MAX_NAME_LENGTH) {
         return {
             valid: false,
-            error: `${type} name must be ${window.MAX_NAME_LENGTH} characters or less`,
+            error: `${type} must be ${window.MAX_NAME_LENGTH} characters or less`,
         };
     }
 
@@ -322,9 +509,9 @@ function extractContent(content, fallback = "") {
 /**
  * SECURITY: Validate URL inputs
  */
-function validateUrl(url) {
+function validateUrl(url, label = "") {
     if (!url || typeof url !== "string") {
-        return { valid: false, error: "URL is required" };
+        return { valid: false, error: `${label || "URL"} is required` };
     }
 
     try {
@@ -378,6 +565,125 @@ function safeSetInnerHTML(element, htmlContent, isTrusted = false) {
 
 // ===================================================================
 // UTILITY FUNCTIONS - Define these FIRST before anything else
+
+// ===================================================================
+// MEMOIZATION UTILITY - Generic pattern for initialization functions
+// ===================================================================
+
+/**
+ * Creates a memoized version of an initialization function with debouncing.
+ * Returns an object with the memoized function and a reset function.
+ *
+ * @param {Function} fn - The initialization function to memoize
+ * @param {number} debounceMs - Debounce delay in milliseconds (default: 300)
+ * @param {string} name - Name for logging purposes
+ * @returns {Object} Object with { init, debouncedInit, reset } functions
+ *
+ * @example
+ * const { init: initSearch, reset: resetSearch } = createMemoizedInit(
+ *     initializeSearchInputs,
+ *     300,
+ *     'SearchInputs'
+ * );
+ *
+ * // Use the memoized version
+ * initSearch();
+ *
+ * // Reset when needed (e.g., tab switch)
+ * resetSearch();
+ * initSearch();
+ */
+function createMemoizedInit(fn, debounceMs = 300, name = "Init") {
+    // Closure variables (private state)
+    let initialized = false;
+    let initializing = false;
+    let debounceTimeout = null;
+
+    /**
+     * Memoized initialization function with guards and debouncing
+     */
+    const memoizedInit = function (...args) {
+        // Guard: Prevent re-initialization if already initialized
+        if (initialized) {
+            console.log(`✓ ${name} already initialized, skipping...`);
+            return Promise.resolve();
+        }
+
+        // Guard: Prevent concurrent initialization
+        if (initializing) {
+            console.log(
+                `⏳ ${name} initialization already in progress, skipping...`,
+            );
+            return Promise.resolve();
+        }
+
+        // Clear any pending debounced call
+        if (debounceTimeout) {
+            clearTimeout(debounceTimeout);
+            debounceTimeout = null;
+        }
+
+        // Mark as initializing
+        initializing = true;
+        console.log(`🔍 Initializing ${name}...`);
+
+        try {
+            // Call the actual initialization function
+            const result = fn.apply(this, args);
+
+            // Mark as initialized
+            initialized = true;
+            console.log(`✅ ${name} initialization complete`);
+
+            return Promise.resolve(result);
+        } catch (error) {
+            console.error(`❌ Error initializing ${name}:`, error);
+            // Don't mark as initialized on error, allow retry
+            return Promise.reject(error);
+        } finally {
+            initializing = false;
+        }
+    };
+
+    /**
+     * Debounced version of the memoized init function
+     */
+    const debouncedInit = function (...args) {
+        // Clear any existing timeout
+        if (debounceTimeout) {
+            clearTimeout(debounceTimeout);
+        }
+
+        // Set new timeout
+        debounceTimeout = setTimeout(() => {
+            memoizedInit.apply(this, args);
+            debounceTimeout = null;
+        }, debounceMs);
+    };
+
+    /**
+     * Reset the initialization state
+     * Call this when you need to re-initialize (e.g., after destroying elements)
+     */
+    const reset = function () {
+        // Clear any pending debounced call
+        if (debounceTimeout) {
+            clearTimeout(debounceTimeout);
+            debounceTimeout = null;
+        }
+
+        initialized = false;
+        initializing = false;
+        console.log(`🔄 ${name} state reset`);
+    };
+
+    return {
+        init: memoizedInit,
+        debouncedInit,
+        reset,
+    };
+}
+
 // ===================================================================
 
 // Check for inative items
@@ -706,11 +1012,13 @@ function closeModal(modalId, clearId = null) {
         if (modalId === "gateway-test-modal") {
             cleanupGatewayTestModal();
         } else if (modalId === "tool-test-modal") {
-            cleanupToolTestModal(); // ADD THIS LINE
+            cleanupToolTestModal();
         } else if (modalId === "prompt-test-modal") {
             cleanupPromptTestModal();
         } else if (modalId === "resource-test-modal") {
             cleanupResourceTestModal();
+        } else if (modalId === "a2a-test-modal") {
+            cleanupA2ATestModal();
         }
 
         modal.classList.add("hidden");
@@ -740,6 +1048,24 @@ function resetModalState(modalId) {
                 // Clear any error messages
                 const errorElements = form.querySelectorAll(".error-message");
                 errorElements.forEach((el) => el.remove());
+                // Clear inline validation error styling
+                const inlineErrors = form.querySelectorAll(
+                    "p[data-error-message-for]",
+                );
+                inlineErrors.forEach((el) => el.classList.add("invisible"));
+                // Clear red border styling from inputs
+                const invalidInputs = form.querySelectorAll(
+                    ".border-red-500, .focus\\:ring-red-500, .dark\\:border-red-500, .dark\\:ring-red-500",
+                );
+                invalidInputs.forEach((el) => {
+                    el.classList.remove(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    el.setCustomValidity("");
+                });
             } catch (error) {
                 console.error("Error resetting form:", error);
             }
@@ -3058,7 +3384,11 @@ async function viewAgent(agentId) {
                     const tagSpan = document.createElement("span");
                     tagSpan.className =
                         "inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1";
-                    tagSpan.textContent = tag;
+                    const raw =
+                        typeof tag === "object" && tag !== null
+                            ? tag.id || tag.label || JSON.stringify(tag)
+                            : tag;
+                    tagSpan.textContent = raw;
                     tagsP.appendChild(tagSpan);
                 });
             } else {
@@ -3377,6 +3707,9 @@ async function editA2AAgent(agentId) {
             "auth-headers-fields-a2a-edit",
         );
         const authOAuthSection = safeGetElement("auth-oauth-fields-a2a-edit");
+        const authQueryParamSection = safeGetElement(
+            "auth-query_param-fields-a2a-edit",
+        );
 
         // Individual fields
         const authUsernameField = safeGetElement(
@@ -3415,6 +3748,14 @@ async function editA2AAgent(agentId) {
             "oauth-auth-code-fields-a2a-edit",
         );
 
+        // Query param fields
+        const authQueryParamKeyField = safeGetElement(
+            "auth-query-param-key-a2a-edit",
+        );
+        const authQueryParamValueField = safeGetElement(
+            "auth-query-param-value-a2a-edit",
+        );
+
         // Hide all auth sections first
         if (authBasicSection) {
             authBasicSection.style.display = "none";
@@ -3427,6 +3768,9 @@ async function editA2AAgent(agentId) {
         }
         if (authOAuthSection) {
             authOAuthSection.style.display = "none";
+        }
+        if (authQueryParamSection) {
+            authQueryParamSection.style.display = "none";
         }
 
         switch (agent.authType) {
@@ -3501,6 +3845,18 @@ async function editA2AAgent(agentId) {
                     }
                 }
                 break;
+            case "query_param":
+                if (authQueryParamSection) {
+                    authQueryParamSection.style.display = "block";
+                    if (authQueryParamKeyField) {
+                        authQueryParamKeyField.value =
+                            agent.authQueryParamKey || "";
+                    }
+                    if (authQueryParamValueField) {
+                        authQueryParamValueField.value = "*****"; // mask value
+                    }
+                }
+                break;
             case "":
             default:
                 // No auth – keep everything hidden
@@ -3560,6 +3916,7 @@ function toggleA2AAuthFields(authType) {
         "auth-bearer-fields-a2a-edit",
         "auth-headers-fields-a2a-edit",
         "auth-oauth-fields-a2a-edit",
+        "auth-query_param-fields-a2a-edit",
     ];
     sections.forEach((id) => {
         const el = document.getElementById(id);
@@ -3941,7 +4298,11 @@ async function viewResource(resourceId) {
                     const tagSpan = document.createElement("span");
                     tagSpan.className =
                         "inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1 dark:bg-blue-900 dark:text-blue-200";
-                    tagSpan.textContent = tag;
+                    const raw =
+                        typeof tag === "object" && tag !== null
+                            ? tag.id || tag.label || JSON.stringify(tag)
+                            : tag;
+                    tagSpan.textContent = raw;
                     tagsP.appendChild(tagSpan);
                 });
             } else {
@@ -4860,7 +5221,11 @@ async function viewGateway(gatewayId) {
                     const tagSpan = document.createElement("span");
                     tagSpan.className =
                         "inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1";
-                    tagSpan.textContent = tag;
+                    const raw =
+                        typeof tag === "object" && tag !== null
+                            ? tag.id || tag.label || JSON.stringify(tag)
+                            : tag;
+                    tagSpan.textContent = raw;
                     tagsP.appendChild(tagSpan);
                 });
             } else {
@@ -5136,6 +5501,9 @@ async function editGateway(gatewayId) {
             "auth-headers-fields-gw-edit",
         );
         const authOAuthSection = safeGetElement("auth-oauth-fields-gw-edit");
+        const authQueryParamSection = safeGetElement(
+            "auth-query_param-fields-gw-edit",
+        );
 
         // Individual fields
         const authUsernameField = safeGetElement(
@@ -5186,6 +5554,9 @@ async function editGateway(gatewayId) {
         }
         if (authOAuthSection) {
             authOAuthSection.style.display = "none";
+        }
+        if (authQueryParamSection) {
+            authQueryParamSection.style.display = "none";
         }
 
         switch (gateway.authType) {
@@ -5299,6 +5670,35 @@ async function editGateway(gatewayId) {
                         Array.isArray(config.scopes)
                     ) {
                         oauthScopesField.value = config.scopes.join(" ");
+                    }
+                }
+                break;
+            case "query_param":
+                if (authQueryParamSection) {
+                    authQueryParamSection.style.display = "block";
+                    // Get the input fields within the section
+                    const queryParamKeyField =
+                        authQueryParamSection.querySelector(
+                            "input[name='auth_query_param_key']",
+                        );
+                    const queryParamValueField =
+                        authQueryParamSection.querySelector(
+                            "input[name='auth_query_param_value']",
+                        );
+                    if (queryParamKeyField && gateway.authQueryParamKey) {
+                        queryParamKeyField.value = gateway.authQueryParamKey;
+                    }
+                    if (queryParamValueField) {
+                        // Always show masked value for security
+                        queryParamValueField.value = MASKED_AUTH_VALUE;
+                        if (gateway.authQueryParamValueUnmasked) {
+                            queryParamValueField.dataset.isMasked = "true";
+                            queryParamValueField.dataset.realValue =
+                                gateway.authQueryParamValueUnmasked;
+                        } else {
+                            delete queryParamValueField.dataset.isMasked;
+                            delete queryParamValueField.dataset.realValue;
+                        }
                     }
                 }
                 break;
@@ -5471,11 +5871,11 @@ async function viewServer(serverId) {
 
             const statusSpan = document.createElement("span");
             statusSpan.className = `px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                server.isActive
+                server.enabled
                     ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300"
                     : "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300"
             }`;
-            statusSpan.textContent = server.isActive ? "Active" : "Inactive";
+            statusSpan.textContent = server.enabled ? "Active" : "Inactive";
             statusP.appendChild(statusSpan);
 
             tagsStatusDiv.appendChild(tagsP);
@@ -5944,6 +6344,73 @@ async function editServer(serverId) {
         const iconField = safeGetElement("edit-server-icon");
         if (iconField) {
             iconField.value = server.icon || "";
+        }
+
+        // Set OAuth 2.0 configuration fields (RFC 9728)
+        const oauthEnabledCheckbox = safeGetElement(
+            "edit-server-oauth-enabled",
+        );
+        const oauthConfigSection = safeGetElement(
+            "edit-server-oauth-config-section",
+        );
+        const oauthAuthServerField = safeGetElement(
+            "edit-server-oauth-authorization-server",
+        );
+        const oauthScopesField = safeGetElement("edit-server-oauth-scopes");
+        const oauthTokenEndpointField = safeGetElement(
+            "edit-server-oauth-token-endpoint",
+        );
+
+        if (oauthEnabledCheckbox) {
+            oauthEnabledCheckbox.checked = server.oauth_enabled || false;
+        }
+
+        // Show/hide OAuth config section based on oauth_enabled state
+        if (oauthConfigSection) {
+            if (server.oauth_enabled) {
+                oauthConfigSection.classList.remove("hidden");
+            } else {
+                oauthConfigSection.classList.add("hidden");
+            }
+        }
+
+        // Populate OAuth config fields if oauth_config exists
+        if (server.oauth_config) {
+            // Extract authorization server (may be in authorization_servers array or authorization_server string)
+            let authServer = "";
+            if (
+                server.oauth_config.authorization_servers &&
+                server.oauth_config.authorization_servers.length > 0
+            ) {
+                authServer = server.oauth_config.authorization_servers[0];
+            } else if (server.oauth_config.authorization_server) {
+                authServer = server.oauth_config.authorization_server;
+            }
+            if (oauthAuthServerField) {
+                oauthAuthServerField.value = authServer;
+            }
+
+            // Extract scopes (may be scopes_supported array or scopes array)
+            const scopes =
+                server.oauth_config.scopes_supported ||
+                server.oauth_config.scopes ||
+                [];
+            if (oauthScopesField) {
+                oauthScopesField.value = Array.isArray(scopes)
+                    ? scopes.join(" ")
+                    : scopes;
+            }
+
+            // Extract token endpoint
+            if (oauthTokenEndpointField) {
+                oauthTokenEndpointField.value =
+                    server.oauth_config.token_endpoint || "";
+            }
+        } else {
+            // Clear OAuth config fields when no config exists
+            if (oauthAuthServerField) oauthAuthServerField.value = "";
+            if (oauthScopesField) oauthScopesField.value = "";
+            if (oauthTokenEndpointField) oauthTokenEndpointField.value = "";
         }
 
         // Store server data for modal population
@@ -6690,16 +7157,134 @@ if (window.htmx && !window._promptsHtmxHandlerAttached) {
 // ENHANCED TAB HANDLING with Better Error Management
 // ===================================================================
 
+const ADMIN_ONLY_TABS = new Set([
+    "users",
+    "metrics",
+    "performance",
+    "observability",
+    "plugins",
+    "logs",
+    "export-import",
+    "version-info",
+    "maintenance",
+]);
+
+function isAdminUser() {
+    return Boolean(window.IS_ADMIN);
+}
+
+function isAdminOnlyTab(tabName) {
+    return ADMIN_ONLY_TABS.has(tabName);
+}
+
+function getDefaultTabName() {
+    return safeGetElement("overview-panel", true) ? "overview" : "gateways";
+}
+
 let tabSwitchTimeout = null;
+
+/**
+ * Dynamically detects which pagination table names belong to a given tab panel
+ * by scanning for pagination control elements within that panel.
+ * Returns array of table names (e.g., ['tools'], ['servers'], etc.)
+ */
+function getTableNamesForTab(tabName) {
+    const panel = document.getElementById(`${tabName}-panel`);
+    if (!panel) {
+        return [];
+    }
+
+    // Find all pagination control elements within this panel
+    // Pattern: id="<tableName>-pagination-controls"
+    const paginationControls = panel.querySelectorAll(
+        '[id$="-pagination-controls"]',
+    );
+
+    const tableNames = [];
+    paginationControls.forEach((control) => {
+        // Extract table name from id: "tools-pagination-controls" -> "tools"
+        const match = control.id.match(/^(.+)-pagination-controls$/);
+        if (match) {
+            tableNames.push(match[1]);
+        }
+    });
+
+    return tableNames;
+}
+
+/**
+ * Cleans up URL params for tables not belonging to the target tab
+ * Keeps only params for the current tab's tables and global params (team_id)
+ * Automatically detects which tables belong to the tab by scanning the DOM.
+ */
+function cleanUpUrlParamsForTab(targetTabName) {
+    const currentUrl = new URL(window.location.href);
+    const newParams = new URLSearchParams();
+
+    // Dynamically detect which tables belong to this tab
+    const targetTables = getTableNamesForTab(targetTabName);
+
+    // Preserve global params
+    if (currentUrl.searchParams.has("team_id")) {
+        newParams.set("team_id", currentUrl.searchParams.get("team_id"));
+    }
+
+    // Only keep params for tables that belong to the target tab
+    currentUrl.searchParams.forEach((value, key) => {
+        // Check if this param belongs to one of the target tab's tables
+        for (const tableName of targetTables) {
+            const prefix = tableName + "_";
+            if (key.startsWith(prefix)) {
+                newParams.set(key, value);
+                break;
+            }
+        }
+    });
+
+    // Update URL
+    const newUrl =
+        currentUrl.pathname +
+        (newParams.toString() ? "?" + newParams.toString() : "") +
+        currentUrl.hash;
+    window.history.replaceState({}, "", newUrl);
+}
 
 function showTab(tabName) {
     try {
+        if (!isAdminUser() && isAdminOnlyTab(tabName)) {
+            console.warn(`Blocked non-admin access to tab: ${tabName}`);
+            const fallbackTab = getDefaultTabName();
+            if (tabName !== fallbackTab) {
+                showTab(fallbackTab);
+            }
+            return;
+        }
         console.log(`Switching to tab: ${tabName}`);
 
         // Clear any pending tab switch
         if (tabSwitchTimeout) {
             clearTimeout(tabSwitchTimeout);
         }
+
+        // Cleanup observability tab when leaving
+        const currentPanel = document.querySelector(".tab-panel:not(.hidden)");
+        if (
+            currentPanel &&
+            currentPanel.id === "observability-panel" &&
+            tabName !== "observability"
+        ) {
+            console.log("Leaving observability tab, triggering cleanup...");
+            // Destroy all observability charts
+            window.chartRegistry.destroyByPrefix("metrics-");
+            window.chartRegistry.destroyByPrefix("tools-");
+            window.chartRegistry.destroyByPrefix("prompts-");
+            window.chartRegistry.destroyByPrefix("resources-");
+            // Dispatch event so Alpine components can stop intervals and reset state
+            document.dispatchEvent(new CustomEvent("observability:leave"));
+        }
+
+        // Clean up URL params from other tabs when switching tabs
+        cleanUpUrlParamsForTab(tabName);
 
         // Navigation styling (immediate)
         document.querySelectorAll(".tab-panel").forEach((p) => {
@@ -6731,6 +7316,23 @@ function showTab(tabName) {
         // Debounced content loading
         tabSwitchTimeout = setTimeout(() => {
             try {
+                if (tabName === "overview") {
+                    // Load overview content if not already loaded
+                    const overviewPanel = safeGetElement("overview-panel");
+                    if (overviewPanel) {
+                        const hasLoadingMessage =
+                            overviewPanel.innerHTML.includes(
+                                "Loading overview",
+                            );
+                        if (hasLoadingMessage) {
+                            // Trigger HTMX load manually if HTMX is available
+                            if (window.htmx && window.htmx.trigger) {
+                                window.htmx.trigger(overviewPanel, "load");
+                            }
+                        }
+                    }
+                }
+
                 if (tabName === "metrics") {
                     // Only load if we're still on the metrics tab
                     if (!panel.classList.contains("hidden")) {
@@ -6766,6 +7368,24 @@ function showTab(tabName) {
                     }
                 }
 
+                if (tabName === "gateways") {
+                    // Load Gateways table if not already loaded
+                    const gatewaysTable = safeGetElement("gateways-table");
+                    if (gatewaysTable) {
+                        const hasLoadingMessage =
+                            gatewaysTable.innerHTML.includes(
+                                "Loading gateways...",
+                            );
+                        const isEmpty = gatewaysTable.innerHTML.trim() === "";
+                        if (hasLoadingMessage || isEmpty) {
+                            // Trigger HTMX load manually if HTMX is available
+                            if (window.htmx && window.htmx.trigger) {
+                                window.htmx.trigger(gatewaysTable, "load");
+                            }
+                        }
+                    }
+                }
+
                 if (tabName === "tokens") {
                     // Load Tokens list and set up form handling
                     const tokensList = safeGetElement("tokens-list");
@@ -6789,13 +7409,34 @@ function showTab(tabName) {
                     updateTeamScopingWarning();
                 }
 
+                if (tabName === "catalog") {
+                    // Load servers list if not already loaded
+                    const serversList = safeGetElement("servers-table");
+                    if (serversList) {
+                        const hasLoadingMessage =
+                            serversList.innerHTML.includes(
+                                "Loading servers...",
+                            );
+                        if (hasLoadingMessage) {
+                            // Trigger HTMX load manually if HTMX is available
+                            if (window.htmx && window.htmx.trigger) {
+                                window.htmx.trigger(serversList, "load");
+                            }
+                        }
+                    }
+                }
+
                 if (tabName === "a2a-agents") {
                     // Load A2A agents list if not already loaded
-                    const agentsList = safeGetElement("a2a-agents-list");
-                    if (agentsList && agentsList.innerHTML.trim() === "") {
-                        // Trigger HTMX load manually if HTMX is available
-                        if (window.htmx && window.htmx.trigger) {
-                            window.htmx.trigger(agentsList, "load");
+                    const agentsList = safeGetElement("agents-table");
+                    if (agentsList) {
+                        const hasLoadingMessage =
+                            agentsList.innerHTML.includes("Loading agents...");
+                        if (hasLoadingMessage) {
+                            // Trigger HTMX load manually if HTMX is available
+                            if (window.htmx && window.htmx.trigger) {
+                                window.htmx.trigger(agentsList, "load");
+                            }
                         }
                     }
                 }
@@ -6866,15 +7507,17 @@ function showTab(tabName) {
                 }
 
                 if (tabName === "gateways") {
-                    // Reload gateways list to show any newly registered servers
-                    const gatewaysSection = safeGetElement("gateways-panel");
-                    if (gatewaysSection) {
-                        const gatewaysTbody =
-                            gatewaysSection.querySelector("tbody");
-                        if (gatewaysTbody) {
-                            // Trigger HTMX reload if available
+                    // Load gateways list if not already loaded
+                    const gatewaysList = safeGetElement("gateways-table");
+                    if (gatewaysList) {
+                        const hasLoadingMessage =
+                            gatewaysList.innerHTML.includes(
+                                "Loading gateways...",
+                            );
+                        if (hasLoadingMessage) {
+                            // Trigger HTMX load manually if HTMX is available
                             if (window.htmx && window.htmx.trigger) {
-                                window.htmx.trigger(gatewaysTbody, "load");
+                                window.htmx.trigger(gatewaysList, "load");
                             } else {
                                 // Fallback: reload the page section via fetch
                                 const rootPath = window.ROOT_PATH || "";
@@ -6887,16 +7530,17 @@ function showTab(tabName) {
                                             html,
                                             "text/html",
                                         );
-                                        const newTbody = doc.querySelector(
-                                            "#gateways-section tbody",
-                                        );
-                                        if (newTbody) {
-                                            gatewaysTbody.innerHTML =
-                                                newTbody.innerHTML;
+                                        const newTable =
+                                            doc.querySelector(
+                                                "#gateways-table",
+                                            );
+                                        if (newTable) {
+                                            gatewaysList.innerHTML =
+                                                newTable.innerHTML;
                                             // Process any HTMX attributes in the new content
                                             if (window.htmx) {
                                                 window.htmx.process(
-                                                    gatewaysTbody,
+                                                    gatewaysList,
                                                 );
                                             }
                                         }
@@ -6911,6 +7555,10 @@ function showTab(tabName) {
                         }
                     }
                 }
+
+                // Note: Charts are already destroyed when leaving observability tab (see above),
+                // so we don't need to destroy them again on entry. The loaded partials will
+                // re-render charts on their next auto-refresh cycle or when the partial is reloaded.
 
                 if (tabName === "plugins") {
                     const pluginsPanel = safeGetElement("plugins-panel");
@@ -7112,6 +7760,7 @@ function handleAuthTypeSelection(
     bearerFields,
     headersFields,
     oauthFields,
+    queryParamFields,
 ) {
     if (!basicFields || !bearerFields || !headersFields) {
         console.warn("Auth field elements not found");
@@ -7128,6 +7777,11 @@ function handleAuthTypeSelection(
     // Hide OAuth fields if they exist
     if (oauthFields) {
         oauthFields.style.display = "none";
+    }
+
+    // Hide query param fields if they exist
+    if (queryParamFields) {
+        queryParamFields.style.display = "none";
     }
 
     // Show relevant field based on selection
@@ -7160,6 +7814,11 @@ function handleAuthTypeSelection(
         case "oauth":
             if (oauthFields) {
                 oauthFields.style.display = "block";
+            }
+            break;
+        case "query_param":
+            if (queryParamFields) {
+                queryParamFields.style.display = "block";
             }
             break;
         default:
@@ -7824,12 +8483,17 @@ function initToolSelect(
                     const selectedGatewayIds = getSelectedGatewayIds
                         ? getSelectedGatewayIds()
                         : [];
-                    const gatewayParam =
-                        selectedGatewayIds && selectedGatewayIds.length
-                            ? `?gateway_id=${encodeURIComponent(selectedGatewayIds.join(","))}`
-                            : "";
+                    const selectedTeamId = getCurrentTeamId();
+                    const params = new URLSearchParams();
+                    if (selectedGatewayIds && selectedGatewayIds.length) {
+                        params.set("gateway_id", selectedGatewayIds.join(","));
+                    }
+                    if (selectedTeamId) {
+                        params.set("team_id", selectedTeamId);
+                    }
+                    const queryString = params.toString();
                     const response = await fetch(
-                        `${window.ROOT_PATH}/admin/tools/ids${gatewayParam}`,
+                        `${window.ROOT_PATH}/admin/tools/ids${queryString ? `?${queryString}` : ""}`,
                     );
                     if (!response.ok) {
                         throw new Error("Failed to fetch tool IDs");
@@ -8267,12 +8931,17 @@ function initResourceSelect(
                     const selectedGatewayIds = getSelectedGatewayIds
                         ? getSelectedGatewayIds()
                         : [];
-                    const gatewayParam =
-                        selectedGatewayIds && selectedGatewayIds.length
-                            ? `?gateway_id=${encodeURIComponent(selectedGatewayIds.join(","))}`
-                            : "";
+                    const selectedTeamId = getCurrentTeamId();
+                    const params = new URLSearchParams();
+                    if (selectedGatewayIds && selectedGatewayIds.length) {
+                        params.set("gateway_id", selectedGatewayIds.join(","));
+                    }
+                    if (selectedTeamId) {
+                        params.set("team_id", selectedTeamId);
+                    }
+                    const queryString = params.toString();
                     const resp = await fetch(
-                        `${window.ROOT_PATH}/admin/resources/ids${gatewayParam}`,
+                        `${window.ROOT_PATH}/admin/resources/ids${queryString ? `?${queryString}` : ""}`,
                     );
                     if (!resp.ok) {
                         throw new Error("Failed to fetch resource IDs");
@@ -8695,12 +9364,17 @@ function initPromptSelect(
                     const selectedGatewayIds = getSelectedGatewayIds
                         ? getSelectedGatewayIds()
                         : [];
-                    const gatewayParam =
-                        selectedGatewayIds && selectedGatewayIds.length
-                            ? `?gateway_id=${encodeURIComponent(selectedGatewayIds.join(","))}`
-                            : "";
+                    const selectedTeamId = getCurrentTeamId();
+                    const params = new URLSearchParams();
+                    if (selectedGatewayIds && selectedGatewayIds.length) {
+                        params.set("gateway_id", selectedGatewayIds.join(","));
+                    }
+                    if (selectedTeamId) {
+                        params.set("team_id", selectedTeamId);
+                    }
+                    const queryString = params.toString();
                     const resp = await fetch(
-                        `${window.ROOT_PATH}/admin/prompts/ids${gatewayParam}`,
+                        `${window.ROOT_PATH}/admin/prompts/ids${queryString ? `?${queryString}` : ""}`,
                     );
                     if (!resp.ok) {
                         throw new Error("Failed to fetch prompt IDs");
@@ -9098,8 +9772,14 @@ function initGatewaySelect(
 
             try {
                 // Fetch all gateway IDs from the server
+                const selectedTeamId = getCurrentTeamId();
+                const params = new URLSearchParams();
+                if (selectedTeamId) {
+                    params.set("team_id", selectedTeamId);
+                }
+                const queryString = params.toString();
                 const response = await fetch(
-                    `${window.ROOT_PATH}/admin/gateways/ids`,
+                    `${window.ROOT_PATH}/admin/gateways/ids${queryString ? `?${queryString}` : ""}`,
                 );
                 if (!response.ok) {
                     throw new Error("Failed to fetch gateway IDs");
@@ -9901,135 +10581,6 @@ document.addEventListener("DOMContentLoaded", function () {
 // INACTIVE ITEMS HANDLING
 // ===================================================================
 
-function toggleInactiveItems(type) {
-    const checkbox = safeGetElement(`show-inactive-${type}`);
-    if (!checkbox) {
-        return;
-    }
-
-    // Update URL in address bar (no navigation) so state is reflected
-    try {
-        const urlObj = new URL(window.location);
-        if (checkbox.checked) {
-            urlObj.searchParams.set("include_inactive", "true");
-        } else {
-            urlObj.searchParams.delete("include_inactive");
-        }
-        // Use replaceState to avoid adding history entries for every toggle
-        window.history.replaceState({}, document.title, urlObj.toString());
-    } catch (e) {
-        // ignore (shouldn't happen)
-    }
-
-    // For servers (catalog), use loadServers function if available, otherwise reload page
-    if (type === "servers") {
-        if (typeof window.loadServers === "function") {
-            window.loadServers();
-            return;
-        }
-        // Fallback to page reload
-        const fallbackUrl = new URL(window.location);
-        if (checkbox.checked) {
-            fallbackUrl.searchParams.set("include_inactive", "true");
-        } else {
-            fallbackUrl.searchParams.delete("include_inactive");
-        }
-        window.location = fallbackUrl;
-        return;
-    }
-
-    // Try to find the HTMX container that loads this entity's partial
-    // Prefer an element with hx-get containing the admin partial endpoint
-    const selector = `[hx-get*="/admin/${type}/partial"]`;
-    let container = document.querySelector(selector);
-
-    // Fallback to conventional id naming used in templates
-    if (!container) {
-        const fallbackId =
-            type === "tools" ? "tools-table" : `${type}-list-container`;
-        container = document.getElementById(fallbackId);
-    }
-
-    if (!container) {
-        // If we couldn't find a container, fallback to full-page reload
-        const fallbackUrl = new URL(window.location);
-        if (checkbox.checked) {
-            fallbackUrl.searchParams.set("include_inactive", "true");
-        } else {
-            fallbackUrl.searchParams.delete("include_inactive");
-        }
-        window.location = fallbackUrl;
-        return;
-    }
-
-    // Build request URL based on the hx-get attribute or container id
-    const base =
-        container.getAttribute("hx-get") ||
-        container.getAttribute("data-hx-get") ||
-        "";
-    let reqUrl;
-    try {
-        if (base) {
-            // base may already include query params; construct URL and set include_inactive/page
-            reqUrl = new URL(base, window.location.origin);
-            // reset to page 1 when toggling
-            reqUrl.searchParams.set("page", "1");
-            if (checkbox.checked) {
-                reqUrl.searchParams.set("include_inactive", "true");
-            } else {
-                reqUrl.searchParams.delete("include_inactive");
-            }
-        } else {
-            // construct from known pattern
-            const root = window.ROOT_PATH || "";
-            reqUrl = new URL(
-                `${root}/admin/${type}/partial?page=1&per_page=50`,
-                window.location.origin,
-            );
-            if (checkbox.checked) {
-                reqUrl.searchParams.set("include_inactive", "true");
-            }
-        }
-    } catch (e) {
-        // fallback to full reload
-        const fallbackUrl2 = new URL(window.location);
-        if (checkbox.checked) {
-            fallbackUrl2.searchParams.set("include_inactive", "true");
-        } else {
-            fallbackUrl2.searchParams.delete("include_inactive");
-        }
-        window.location = fallbackUrl2;
-        return;
-    }
-
-    // Determine indicator selector
-    const indicator =
-        container.getAttribute("hx-indicator") || `#${type}-loading`;
-
-    // Use HTMX to reload only the container (outerHTML swap)
-    if (window.htmx && typeof window.htmx.ajax === "function") {
-        try {
-            window.htmx.ajax("GET", reqUrl.toString(), {
-                target: container,
-                swap: "outerHTML",
-                indicator,
-            });
-            return;
-        } catch (e) {
-            // fall through to full reload
-        }
-    }
-
-    // Last resort: reload page with param
-    const finalUrl = new URL(window.location);
-    if (checkbox.checked) {
-        finalUrl.searchParams.set("include_inactive", "true");
-    } else {
-        finalUrl.searchParams.delete("include_inactive");
-    }
-    window.location = finalUrl;
-}
-
 function handleToggleSubmit(event, type) {
     event.preventDefault();
 
@@ -10696,7 +11247,11 @@ async function enrichTool(toolId) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    const toolBody = document.getElementById("toolBody");
+    // Use #tool-ops-main-content-wrapper as the event delegation target because
+    // #toolBody gets replaced by HTMX swaps. The wrapper survives swaps.
+    const toolOpsWrapper = document.getElementById(
+        "tool-ops-main-content-wrapper",
+    );
     const selectedList = document.getElementById("selectedList");
     const selectedCount = document.getElementById("selectedCount");
     const searchBox = document.getElementById("searchBox");
@@ -10704,9 +11259,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let selectedTools = [];
     let selectedToolIds = [];
 
-    if (toolBody !== null) {
-        // ✅ Use event delegation for dynamically added checkboxes
-        toolBody.addEventListener("change", (event) => {
+    if (toolOpsWrapper !== null) {
+        // ✅ Use event delegation on wrapper (survives HTMX swaps)
+        toolOpsWrapper.addEventListener("change", (event) => {
             const cb = event.target;
             if (cb.classList.contains("tool-checkbox")) {
                 const toolName = cb.getAttribute("data-tool");
@@ -10763,10 +11318,14 @@ document.addEventListener("DOMContentLoaded", () => {
     if (searchBox !== null) {
         searchBox.addEventListener("input", () => {
             const query = searchBox.value.trim().toLowerCase();
-            document.querySelectorAll("#toolBody tr").forEach((row) => {
-                const name = row.dataset.name;
-                row.style.display = name.includes(query) ? "" : "none";
-            });
+            // Search within #toolBody (which is inside #tool-ops-main-content-wrapper)
+            document
+                .querySelectorAll("#tool-ops-main-content-wrapper #toolBody tr")
+                .forEach((row) => {
+                    const name = row.dataset.name;
+                    row.style.display =
+                        name && name.includes(query) ? "" : "none";
+                });
         });
     }
     // Generic API call for Enrich/Validate
@@ -13593,10 +14152,13 @@ async function viewTool(toolId) {
             if (tagsElement) {
                 if (tool.tags && tool.tags.length > 0) {
                     tagsElement.innerHTML = tool.tags
-                        .map(
-                            (tag) =>
-                                `<span class="inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1 dark:bg-blue-900 dark:text-blue-200">${escapeHtml(tag)}</span>`,
-                        )
+                        .map((tag) => {
+                            const raw =
+                                typeof tag === "object" && tag !== null
+                                    ? tag.id || tag.label || JSON.stringify(tag)
+                                    : tag;
+                            return `<span class="inline-block bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full mr-1 mb-1 dark:bg-blue-900 dark:text-blue-200">${escapeHtml(raw)}</span>`;
+                        })
                         .join("");
                 } else {
                     tagsElement.textContent = "None";
@@ -14802,13 +15364,41 @@ function setupFormValidation() {
         );
         nameFields.forEach((field) => {
             field.addEventListener("blur", function () {
-                const validation = validateInputName(this.value, "name");
+                const parentNode = this.parentNode;
+                const inputLabel = parentNode?.querySelector(
+                    `label[for="${this.id}"]`,
+                );
+                const errorMessageElement = parentNode?.querySelector(
+                    'p[data-error-message-for="name"]',
+                );
+                const validation = validateInputName(
+                    this.value,
+                    inputLabel?.innerText,
+                );
                 if (!validation.valid) {
                     this.setCustomValidity(validation.error);
-                    this.reportValidity();
+                    this.classList.add(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    if (errorMessageElement) {
+                        errorMessageElement.innerText = validation.error;
+                        errorMessageElement.classList.remove("invisible");
+                    }
                 } else {
                     this.setCustomValidity("");
                     this.value = validation.value;
+                    this.classList.remove(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    if (errorMessageElement) {
+                        errorMessageElement.classList.add("invisible");
+                    }
                 }
             });
         });
@@ -14819,32 +15409,58 @@ function setupFormValidation() {
         );
         urlFields.forEach((field) => {
             field.addEventListener("blur", function () {
-                if (this.value) {
-                    const validation = validateUrl(this.value);
-                    if (!validation.valid) {
-                        this.setCustomValidity(validation.error);
-                        this.reportValidity();
-                    } else {
-                        this.setCustomValidity("");
-                        this.value = validation.value;
+                // Skip validation for empty optional URL fields
+                if (!this.value && !this.required) {
+                    this.setCustomValidity("");
+                    this.classList.remove(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    const errorMessageElement = this.parentNode?.querySelector(
+                        'p[data-error-message-for="url"]',
+                    );
+                    if (errorMessageElement) {
+                        errorMessageElement.classList.add("invisible");
                     }
+                    return;
                 }
-            });
-        });
-
-        // Special validation for prompt name fields
-        const promptNameFields = form.querySelectorAll(
-            'input[name="prompt-name"], input[name="edit-prompt-name"]',
-        );
-        promptNameFields.forEach((field) => {
-            field.addEventListener("blur", function () {
-                const validation = validateInputName(this.value, "prompt");
+                const parentNode = this.parentNode;
+                const inputLabel = parentNode?.querySelector(
+                    `label[for="${this.id}"]`,
+                );
+                const errorMessageElement = parentNode?.querySelector(
+                    'p[data-error-message-for="url"]',
+                );
+                const validation = validateUrl(
+                    this.value,
+                    inputLabel?.innerText,
+                );
                 if (!validation.valid) {
                     this.setCustomValidity(validation.error);
-                    this.reportValidity();
+                    this.classList.add(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    if (errorMessageElement) {
+                        errorMessageElement.innerText = validation.error;
+                        errorMessageElement.classList.remove("invisible");
+                    }
                 } else {
                     this.setCustomValidity("");
                     this.value = validation.value;
+                    this.classList.remove(
+                        "border-red-500",
+                        "focus:ring-red-500",
+                        "dark:border-red-500",
+                        "dark:ring-red-500",
+                    );
+                    if (errorMessageElement) {
+                        errorMessageElement.classList.add("invisible");
+                    }
                 }
             });
         });
@@ -15292,10 +15908,15 @@ function setupTabNavigation() {
         "version-info",
     ];
 
-    tabs.forEach((tabName) => {
+    const visibleTabs = isAdminUser()
+        ? tabs
+        : tabs.filter((tabName) => !ADMIN_ONLY_TABS.has(tabName));
+
+    visibleTabs.forEach((tabName) => {
         // Suppress warnings for optional tabs that might not be enabled
         const optionalTabs = [
             "roots",
+            "metrics",
             "logs",
             "export-import",
             "version-info",
@@ -15340,6 +15961,7 @@ function setupAuthenticationToggles() {
             basicId: "auth-basic-fields-gw",
             bearerId: "auth-bearer-fields-gw",
             headersId: "auth-headers-fields-gw",
+            queryParamId: "auth-query_param-fields-gw",
         },
 
         // A2A Add Form auth fields
@@ -15349,6 +15971,7 @@ function setupAuthenticationToggles() {
             basicId: "auth-basic-fields-a2a",
             bearerId: "auth-bearer-fields-a2a",
             headersId: "auth-headers-fields-a2a",
+            queryParamId: "auth-query_param-fields-a2a",
         },
 
         // Gateway Edit Form auth fields
@@ -15359,6 +15982,7 @@ function setupAuthenticationToggles() {
             bearerId: "auth-bearer-fields-gw-edit",
             headersId: "auth-headers-fields-gw-edit",
             oauthId: "auth-oauth-fields-gw-edit",
+            queryParamId: "auth-query_param-fields-gw-edit",
         },
 
         // A2A Edit Form auth fields
@@ -15369,6 +15993,7 @@ function setupAuthenticationToggles() {
             bearerId: "auth-bearer-fields-a2a-edit",
             headersId: "auth-headers-fields-a2a-edit",
             oauthId: "auth-oauth-fields-a2a-edit",
+            queryParamId: "auth-query_param-fields-a2a-edit",
         },
 
         {
@@ -15386,11 +16011,19 @@ function setupAuthenticationToggles() {
                 const basicFields = safeGetElement(handler.basicId);
                 const bearerFields = safeGetElement(handler.bearerId);
                 const headersFields = safeGetElement(handler.headersId);
+                const oauthFields = handler.oauthId
+                    ? safeGetElement(handler.oauthId)
+                    : null;
+                const queryParamFields = handler.queryParamId
+                    ? safeGetElement(handler.queryParamId)
+                    : null;
                 handleAuthTypeSelection(
                     this.value,
                     basicFields,
                     bearerFields,
                     headersFields,
+                    oauthFields,
+                    queryParamFields,
                 );
             });
         }
@@ -15758,9 +16391,14 @@ function setupSelectorSearch() {
  */
 function filterServerTable(searchText) {
     try {
-        const tbody = document.querySelector(
-            'tbody[data-testid="server-list"]',
-        );
+        // Try to find the table using multiple strategies
+        let tbody = document.querySelector("#servers-table-body");
+
+        // Fallback to data-testid selector for backward compatibility
+        if (!tbody) {
+            tbody = document.querySelector('tbody[data-testid="server-list"]');
+        }
+
         if (!tbody) {
             console.warn("Server table not found");
             return;
@@ -15772,12 +16410,12 @@ function filterServerTable(searchText) {
         rows.forEach((row) => {
             let textContent = "";
 
-            // Get text from all searchable cells (exclude only Actions column)
-            // Table columns: Icon(0), S.No.(1), UUID(2), Name(3), Description(4), Tools(5), Resources(6), Prompts(7), Tags(8), Owner(9), Team(10), Visibility(11), Actions(12)
+            // Get text from all searchable cells (exclude Actions, Icon, and S.No. columns)
+            // Table columns: Actions(0), Icon(1), S.No.(2), UUID(3), Name(4), Description(5), Tools(6), Resources(7), Prompts(8), Tags(9), Owner(10), Team(11), Visibility(12)
             const cells = row.querySelectorAll("td");
-            // Search all columns except Icon and Actions columns
+            // Search all columns except Actions(0), Icon(1), and S.No.(2) columns
             const searchableColumnIndices = [];
-            for (let i = 1; i < cells.length - 1; i++) {
+            for (let i = 3; i < cells.length; i++) {
                 searchableColumnIndices.push(i);
             }
 
@@ -15791,9 +16429,7 @@ function filterServerTable(searchText) {
                 }
             });
 
-            const isMatch =
-                search === "" || textContent.toLowerCase().includes(search);
-            if (isMatch) {
+            if (search === "" || textContent.toLowerCase().includes(search)) {
                 row.style.display = "";
             } else {
                 row.style.display = "none";
@@ -15824,10 +16460,10 @@ function filterToolsTable(searchText) {
         rows.forEach((row) => {
             let textContent = "";
 
-            // Get text from searchable cells (exclude S.No. and Actions columns)
-            // Tools columns: S.No.(0), Gateway Name(1), Name(2), URL(3), Type(4), Request Type(5), Description(6), Annotations(7), Tags(8), Owner(9), Team(10), Visibility(11), Status(12), Actions(13)
+            // Get text from searchable cells (exclude Actions and S.No. columns)
+            // Tools columns: Actions(0), S.No.(1), Source(2), Name(3), RequestType(4), Description(5), Annotations(6), Tags(7), Owner(8), Team(9), Status(10)
             const cells = row.querySelectorAll("td");
-            const searchableColumns = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // Exclude S.No. and Actions
+            const searchableColumns = [2, 3, 4, 5, 6, 7, 8, 9, 10]; // Exclude Actions(0) and S.No.(1)
 
             searchableColumns.forEach((index) => {
                 if (cells[index]) {
@@ -15870,9 +16506,9 @@ function filterResourcesTable(searchText) {
             let textContent = "";
 
             // Get text from searchable cells (exclude Actions column)
-            // Resources columns: ID(0), URI(1), Name(2), Description(3), MIME Type(4), Tags(5), Owner(6), Team(7), Visibility(8), Status(9), Actions(10)
+            // Resources columns: Actions(0), Source(1), Name(2), Description(3), Tags(4), Owner(5), Team(6), Status(7)
             const cells = row.querySelectorAll("td");
-            const searchableColumns = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; // All except Actions
+            const searchableColumns = [1, 2, 3, 4, 5, 6, 7]; // All except Actions(0)
 
             searchableColumns.forEach((index) => {
                 if (cells[index]) {
@@ -15908,10 +16544,10 @@ function filterPromptsTable(searchText) {
         rows.forEach((row) => {
             let textContent = "";
 
-            // Get text from searchable cells (exclude Actions column)
-            // Prompts columns: S.No.(0), Name(1), Description(2), Tags(3), Owner(4), Team(5), Visibility(6), Status(7), Actions(8)
+            // Get text from searchable cells (exclude Actions and S.No. columns)
+            // Prompts columns: Actions(0), S.No.(1), GatewayName(2), Name(3), Description(4), Tags(5), Owner(6), Team(7), Status(8)
             const cells = row.querySelectorAll("td");
-            const searchableColumns = [0, 1, 2, 3, 4, 5, 6, 7]; // All except Actions
+            const searchableColumns = [2, 3, 4, 5, 6, 7, 8]; // All except Actions(0) and S.No.(1)
 
             searchableColumns.forEach((index) => {
                 if (cells[index]) {
@@ -15935,7 +16571,14 @@ function filterPromptsTable(searchText) {
  */
 function filterA2AAgentsTable(searchText) {
     try {
-        const tbody = document.querySelector("#a2a-agents-panel tbody");
+        // Try to find the table using multiple strategies
+        let tbody = document.querySelector("#agents-table tbody");
+
+        // Fallback to panel selector for backward compatibility
+        if (!tbody) {
+            tbody = document.querySelector("#a2a-agents-panel tbody");
+        }
+
         if (!tbody) {
             console.warn("A2A Agents table body not found");
             return;
@@ -15947,10 +16590,10 @@ function filterA2AAgentsTable(searchText) {
         rows.forEach((row) => {
             let textContent = "";
 
-            // Get text from searchable cells (exclude ID and Actions columns)
-            // A2A Agents columns: ID(0), Name(1), Description(2), Endpoint(3), Tags(4), Type(5), Status(6), Reachability(7), Owner(8), Team(9), Visibility(10), Actions(11)
+            // Get text from searchable cells (exclude Actions and ID columns)
+            // A2A Agents columns: Actions(0), ID(1), Name(2), Description(3), Endpoint(4), Tags(5), Type(6), Status(7), Reachability(8), Owner(9), Team(10), Visibility(11)
             const cells = row.querySelectorAll("td");
-            const searchableColumns = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // Exclude ID and Actions
+            const searchableColumns = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]; // Exclude Actions(0) and ID(1)
 
             searchableColumns.forEach((index) => {
                 if (cells[index]) {
@@ -16049,9 +16692,10 @@ function filterGatewaysTable(searchText) {
                 return;
             }
 
-            // Combine text from all cells except the last one (Actions column)
+            // Combine text from all cells except Actions(0) and S.No.(1) columns
+            // Gateways columns: Actions(0), S.No.(1), Name(2), URL(3), Tags(4), Status(5), LastSeen(6), Owner(7), Team(8), Visibility(9)
             let searchContent = "";
-            for (let i = 0; i < cells.length - 1; i++) {
+            for (let i = 2; i < cells.length; i++) {
                 if (cells[i]) {
                     const cellText = cells[i].textContent.trim();
                     searchContent += " " + cellText;
@@ -16059,19 +16703,28 @@ function filterGatewaysTable(searchText) {
             }
 
             const fullText = searchContent.trim().toLowerCase();
-            const shouldShow = search === "" || fullText.includes(search);
+            const matchesSearch = search === "" || fullText.includes(search);
+
+            // Check if row should be visible based on inactive filter
+            const checkbox = document.getElementById("show-inactive-gateways");
+            const showInactive = checkbox ? checkbox.checked : true;
+            const isEnabled = row.getAttribute("data-enabled") === "true";
+            const matchesFilter = showInactive || isEnabled;
+
+            // Only show row if it matches BOTH search AND filter
+            const shouldShow = matchesSearch && matchesFilter;
 
             // Debug first few rows
             if (index < 3) {
                 console.log(
-                    `Row ${index + 1}: "${fullText.substring(0, 50)}..." -> Match: ${shouldShow}`,
+                    `Row ${index + 1}: "${fullText.substring(0, 50)}..." -> Search: ${matchesSearch}, Filter: ${matchesFilter}, Show: ${shouldShow}`,
                 );
             }
 
             // Show/hide the row
             if (shouldShow) {
-                row.style.display = "";
-                row.style.visibility = "visible";
+                row.style.removeProperty("display");
+                row.style.removeProperty("visibility");
                 visibleCount++;
             } else {
                 row.style.display = "none";
@@ -16147,8 +16800,8 @@ window.simpleGatewaySearch = function (searchTerm) {
                     const cells = row.querySelectorAll("td");
                     let rowText = "";
 
-                    // Get text from all cells except last (Actions)
-                    for (let i = 0; i < cells.length - 1; i++) {
+                    // Get text from all cells except Actions(0) and S.No.(1)
+                    for (let i = 2; i < cells.length; i++) {
                         rowText += " " + cells[i].textContent.trim();
                     }
 
@@ -16249,8 +16902,9 @@ window.clearSearch = clearSearch;
 function initializeSearchInputs() {
     console.log("🔍 Initializing search inputs...");
 
-    // Remove existing event listeners to prevent duplicates
-    const searchInputs = [
+    // Clone inputs to remove existing event listeners before re-adding.
+    // This prevents duplicate listeners when re-initializing after reset.
+    const searchInputIds = [
         "catalog-search-input",
         "gateways-search-input",
         "tools-search-input",
@@ -16259,16 +16913,13 @@ function initializeSearchInputs() {
         "a2a-agents-search-input",
     ];
 
-    searchInputs.forEach((inputId) => {
+    searchInputIds.forEach((inputId) => {
         const input = document.getElementById(inputId);
         if (input) {
-            // Clone the input to remove all event listeners, then replace it
             const newInput = input.cloneNode(true);
             input.parentNode.replaceChild(newInput, input);
         }
     });
-
-    // Get fresh references to all search inputs after cloning
 
     // Virtual Servers search
     const catalogSearchInput = document.getElementById("catalog-search-input");
@@ -16277,6 +16928,11 @@ function initializeSearchInputs() {
             filterServerTable(this.value);
         });
         console.log("✅ Virtual Servers search initialized");
+        // Reapply current search term if any (preserves search after HTMX swap)
+        const currentSearch = catalogSearchInput.value || "";
+        if (currentSearch) {
+            filterServerTable(currentSearch);
+        }
     }
 
     // MCP Servers (Gateways) search
@@ -16307,8 +16963,11 @@ function initializeSearchInputs() {
 
         console.log("✅ MCP Servers search events attached");
 
-        // Test the function works
-        filterGatewaysTable("");
+        // Reapply current search term if any (preserves search after HTMX swap)
+        const currentSearch = gatewaysSearchInput.value || "";
+        if (currentSearch) {
+            filterGatewaysTable(currentSearch);
+        }
     } else {
         console.error("❌ MCP Servers search input not found!");
 
@@ -16365,6 +17024,16 @@ function initializeSearchInputs() {
     }
 }
 
+/**
+ * Create memoized version of search inputs initialization
+ * This prevents repeated initialization and provides explicit reset capability
+ */
+const {
+    init: initializeSearchInputsMemoized,
+    debouncedInit: initializeSearchInputsDebounced,
+    reset: resetSearchInputsState,
+} = createMemoizedInit(initializeSearchInputs, 300, "SearchInputs");
+
 function handleAuthTypeChange() {
     const authType = this.value;
 
@@ -16378,15 +17047,22 @@ function handleAuthTypeChange() {
     const bearerFields = safeGetElement(`auth-bearer-fields-${prefix}`);
     const headersFields = safeGetElement(`auth-headers-fields-${prefix}`);
     const oauthFields = safeGetElement(`auth-oauth-fields-${prefix}`);
+    const queryParamFields = safeGetElement(
+        `auth-query_param-fields-${prefix}`,
+    );
 
     // Hide all auth sections first
-    [basicFields, bearerFields, headersFields, oauthFields].forEach(
-        (section) => {
-            if (section) {
-                section.style.display = "none";
-            }
-        },
-    );
+    [
+        basicFields,
+        bearerFields,
+        headersFields,
+        oauthFields,
+        queryParamFields,
+    ].forEach((section) => {
+        if (section) {
+            section.style.display = "none";
+        }
+    });
 
     // Show the appropriate section
     switch (authType) {
@@ -16408,6 +17084,11 @@ function handleAuthTypeChange() {
         case "oauth":
             if (oauthFields) {
                 oauthFields.style.display = "block";
+            }
+            break;
+        case "query_param":
+            if (queryParamFields) {
+                queryParamFields.style.display = "block";
             }
             break;
         default:
@@ -16615,7 +17296,7 @@ function initializeTabState() {
     }
 
     // Pre-load version info if that's the initial tab
-    if (window.location.hash === "#version-info") {
+    if (isAdminUser() && window.location.hash === "#version-info") {
         setTimeout(() => {
             const panel = safeGetElement("version-info-panel");
             if (panel && panel.innerHTML.trim() === "") {
@@ -16642,7 +17323,7 @@ function initializeTabState() {
     }
 
     // Pre-load maintenance panel if that's the initial tab
-    if (window.location.hash === "#maintenance") {
+    if (isAdminUser() && window.location.hash === "#maintenance") {
         setTimeout(() => {
             const panel = safeGetElement("maintenance-panel");
             if (panel && panel.innerHTML.trim() === "") {
@@ -16679,22 +17360,55 @@ function initializeTabState() {
         }, 100);
     }
 
-    // Set checkbox states based on URL parameter
+    // Set checkbox states based on URL parameters (namespaced per table, with legacy fallback)
     const urlParams = new URLSearchParams(window.location.search);
-    const includeInactive = urlParams.get("include_inactive") === "true";
+    const legacyIncludeInactive = urlParams.get("include_inactive") === "true";
 
-    const checkboxes = [
-        "show-inactive-tools",
-        "show-inactive-resources",
-        "show-inactive-prompts",
-        "show-inactive-gateways",
-        "show-inactive-servers",
-    ];
-    checkboxes.forEach((id) => {
+    // Map checkbox IDs to their table names for namespaced URL params
+    const checkboxTableMap = {
+        "show-inactive-tools": "tools",
+        "show-inactive-resources": "resources",
+        "show-inactive-prompts": "prompts",
+        "show-inactive-gateways": "gateways",
+        "show-inactive-servers": "servers",
+        "show-inactive-a2a-agents": "agents",
+        "show-inactive-tools-toolops": "toolops",
+    };
+    Object.entries(checkboxTableMap).forEach(([id, tableName]) => {
         const checkbox = safeGetElement(id);
         if (checkbox) {
-            checkbox.checked = includeInactive;
+            // Prefer namespaced param, fall back to legacy for backwards compatibility
+            const namespacedValue = urlParams.get(tableName + "_inactive");
+            if (namespacedValue !== null) {
+                checkbox.checked = namespacedValue === "true";
+            } else {
+                checkbox.checked = legacyIncludeInactive;
+            }
         }
+    });
+
+    // Note: URL state persistence for show-inactive toggles is now handled by
+    // updateInactiveUrlState() in admin.html via @change handlers on checkboxes.
+    // The handlers write namespaced params (e.g., servers_inactive, tools_inactive).
+
+    // Disable toggle until its target exists (prevents race with initial HTMX load)
+    document.querySelectorAll(".show-inactive-toggle").forEach((checkbox) => {
+        const targetSelector = checkbox.getAttribute("hx-target");
+        if (targetSelector && !document.querySelector(targetSelector)) {
+            checkbox.disabled = true;
+        }
+    });
+
+    // Enable toggles after HTMX swaps complete
+    document.body.addEventListener("htmx:afterSettle", (event) => {
+        document
+            .querySelectorAll(".show-inactive-toggle[disabled]")
+            .forEach((checkbox) => {
+                const targetSelector = checkbox.getAttribute("hx-target");
+                if (targetSelector && document.querySelector(targetSelector)) {
+                    checkbox.disabled = false;
+                }
+            });
     });
 }
 
@@ -16722,7 +17436,6 @@ async function loadServers() {
     window.location.href = url.toString();
 }
 
-window.toggleInactiveItems = toggleInactiveItems;
 window.loadServers = loadServers;
 window.handleToggleSubmit = handleToggleSubmit;
 window.handleSubmitWithConfirmation = handleSubmitWithConfirmation;
@@ -16941,7 +17654,7 @@ function generateConfig(server, configType) {
             return {
                 servers: {
                     [cleanServerName]: {
-                        type: "http",
+                        type: "streamable-http",
                         url: `${baseUrl}/servers/${server.id}/mcp`,
                         headers: {
                             Authorization: "Bearer your-token-here",
@@ -18831,58 +19544,129 @@ function getCookie(name) {
 window.resetImportFile = resetImportFile;
 
 // ===================================================================
-// A2A AGENT TESTING FUNCTIONALITY
+// A2A AGENT TEST MODAL FUNCTIONALITY
 // ===================================================================
 
+let a2aTestFormHandler = null;
+let a2aTestCloseHandler = null;
+
 /**
- * Test an A2A agent by making a direct invocation call
+ * Open A2A test modal with agent details
  * @param {string} agentId - ID of the agent to test
  * @param {string} agentName - Name of the agent for display
  * @param {string} endpointUrl - Endpoint URL of the agent
  */
 async function testA2AAgent(agentId, agentName, endpointUrl) {
     try {
-        // Show loading state
-        const testResult = document.getElementById(`test-result-${agentId}`);
-        testResult.innerHTML =
-            '<div class="text-blue-600">🔄 Testing agent...</div>';
-        testResult.classList.remove("hidden");
+        console.log("Opening A2A test modal for:", agentName);
 
-        // Get auth token using the robust getAuthToken function
+        // Clean up any existing event listeners
+        cleanupA2ATestModal();
+
+        // Open the modal
+        openModal("a2a-test-modal");
+
+        // Set modal title and description
+        const titleElement = safeGetElement("a2a-test-modal-title");
+        const descElement = safeGetElement("a2a-test-modal-description");
+        const agentIdInput = safeGetElement("a2a-test-agent-id");
+        const queryInput = safeGetElement("a2a-test-query");
+        const resultDiv = safeGetElement("a2a-test-result");
+
+        if (titleElement) {
+            titleElement.textContent = `Test A2A Agent: ${agentName}`;
+        }
+        if (descElement) {
+            descElement.textContent = `Endpoint: ${endpointUrl}`;
+        }
+        if (agentIdInput) {
+            agentIdInput.value = agentId;
+        }
+        if (queryInput) {
+            // Reset to default value
+            queryInput.value = "Hello from MCP Gateway Admin UI test!";
+        }
+        if (resultDiv) {
+            resultDiv.classList.add("hidden");
+        }
+
+        // Set up form submission handler
+        const form = safeGetElement("a2a-test-form");
+        if (form) {
+            a2aTestFormHandler = async (e) => {
+                await handleA2ATestSubmit(e);
+            };
+            form.addEventListener("submit", a2aTestFormHandler);
+        }
+
+        // Set up close button handler
+        const closeButton = safeGetElement("a2a-test-close");
+        if (closeButton) {
+            a2aTestCloseHandler = () => {
+                handleA2ATestClose();
+            };
+            closeButton.addEventListener("click", a2aTestCloseHandler);
+        }
+    } catch (error) {
+        console.error("Error setting up A2A test modal:", error);
+        showErrorMessage("Failed to open A2A test modal");
+    }
+}
+
+/**
+ * Handle A2A test form submission
+ * @param {Event} e - Form submit event
+ */
+async function handleA2ATestSubmit(e) {
+    e.preventDefault();
+
+    const loading = safeGetElement("a2a-test-loading");
+    const responseDiv = safeGetElement("a2a-test-response-json");
+    const resultDiv = safeGetElement("a2a-test-result");
+    const testButton = safeGetElement("a2a-test-submit");
+
+    try {
+        // Show loading
+        if (loading) {
+            loading.classList.remove("hidden");
+        }
+        if (resultDiv) {
+            resultDiv.classList.add("hidden");
+        }
+        if (testButton) {
+            testButton.disabled = true;
+            testButton.textContent = "Testing...";
+        }
+
+        const agentId = safeGetElement("a2a-test-agent-id")?.value;
+        const query =
+            safeGetElement("a2a-test-query")?.value ||
+            "Hello from MCP Gateway Admin UI test!";
+
+        if (!agentId) {
+            throw new Error("Agent ID is missing");
+        }
+
+        // Get auth token
         const token = await getAuthToken();
-
-        // Debug logging
-        console.log("Available cookies:", document.cookie);
-        console.log(
-            "Found token:",
-            token ? "Yes (length: " + token.length + ")" : "No",
-        );
-
-        // Prepare headers
-        const headers = {
-            "Content-Type": "application/json",
-        };
-
+        const headers = { "Content-Type": "application/json" };
         if (token) {
             headers.Authorization = `Bearer ${token}`;
         } else {
             // Fallback to basic auth if JWT not available
             console.warn("JWT token not found, attempting basic auth fallback");
-            headers.Authorization = "Basic " + btoa("admin:changeme"); // Default admin credentials
+            headers.Authorization = "Basic " + btoa("admin:changeme");
         }
 
-        // Test payload is now determined server-side based on agent configuration
-        const testPayload = {};
-
-        // Make test request to A2A agent via admin endpoint
+        // Send test request with user query
         const response = await fetchWithTimeout(
             `${window.ROOT_PATH}/admin/a2a/${agentId}/test`,
             {
                 method: "POST",
                 headers,
-                body: JSON.stringify(testPayload),
+                body: JSON.stringify({ query }),
             },
-            window.MCPGATEWAY_UI_TOOL_TEST_TIMEOUT || 60000, // Use configurable timeout
+            window.MCPGATEWAY_UI_TOOL_TEST_TIMEOUT || 60000,
         );
 
         if (!response.ok) {
@@ -18892,57 +19676,100 @@ async function testA2AAgent(agentId, agentName, endpointUrl) {
         const result = await response.json();
 
         // Display result
-        let resultHtml;
-        if (!result.success || result.error) {
-            resultHtml = `
-                <div class="text-red-600">
-                    <div>❌ Test Failed</div>
-                    <div class="text-xs mt-1">Error: ${escapeHtml(result.error || "Unknown error")}</div>
-                </div>`;
-        } else {
-            // Check if the agent result contains an error (agent-level error)
-            const agentResult = result.result;
-            if (agentResult && agentResult.error) {
-                resultHtml = `
-                    <div class="text-yellow-600">
-                        <div>⚠️ Agent Error</div>
-                        <div class="text-xs mt-1">Agent Response: ${escapeHtml(JSON.stringify(agentResult).substring(0, 150))}...</div>
-                    </div>`;
-            } else {
-                resultHtml = `
-                    <div class="text-green-600">
-                        <div>✅ Test Successful</div>
-                        <div class="text-xs mt-1">Response: ${escapeHtml(JSON.stringify(agentResult).substring(0, 150))}...</div>
-                    </div>`;
-            }
+        const isSuccess = result.success && !result.error;
+        const icon = isSuccess ? "✅" : "❌";
+        const title = isSuccess ? "Test Successful" : "Test Failed";
+
+        let bodyHtml = "";
+        if (result.result) {
+            bodyHtml = `<details open>
+                <summary class='cursor-pointer font-medium'>Response</summary>
+                <pre class="text-sm px-4 max-h-96 dark:bg-gray-800 dark:text-gray-100 overflow-auto whitespace-pre-wrap">${escapeHtml(JSON.stringify(result.result, null, 2))}</pre>
+            </details>`;
         }
 
-        testResult.innerHTML = resultHtml;
-
-        // Auto-hide after 10 seconds
-        setTimeout(() => {
-            testResult.classList.add("hidden");
-        }, 10000);
+        responseDiv.innerHTML = `
+            <div class="p-3 rounded ${isSuccess ? "bg-green-50 dark:bg-green-900/20" : "bg-red-50 dark:bg-red-900/20"}">
+                <h4 class="font-bold ${isSuccess ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}">${icon} ${title}</h4>
+                ${result.error ? `<p class="text-red-600 dark:text-red-400 mt-2">Error: ${escapeHtml(result.error)}</p>` : ""}
+                ${bodyHtml}
+            </div>
+        `;
     } catch (error) {
-        console.error("A2A agent test failed:", error);
-
-        const testResult = document.getElementById(`test-result-${agentId}`);
-        testResult.innerHTML = `
-            <div class="text-red-600">
-                <div>❌ Test Failed</div>
-                <div class="text-xs mt-1">Error: ${escapeHtml(error.message)}</div>
-            </div>`;
-        testResult.classList.remove("hidden");
-
-        // Auto-hide after 10 seconds
-        setTimeout(() => {
-            testResult.classList.add("hidden");
-        }, 10000);
+        console.error("A2A test error:", error);
+        if (responseDiv) {
+            responseDiv.innerHTML = `<div class="text-red-600 dark:text-red-400 p-4 bg-red-50 dark:bg-red-900/20 rounded">❌ Error: ${escapeHtml(error.message)}</div>`;
+        }
+    } finally {
+        if (loading) {
+            loading.classList.add("hidden");
+        }
+        if (resultDiv) {
+            resultDiv.classList.remove("hidden");
+        }
+        if (testButton) {
+            testButton.disabled = false;
+            testButton.textContent = "Test Agent";
+        }
     }
 }
 
-// Expose A2A test function to global scope
+/**
+ * Handle A2A test modal close
+ */
+function handleA2ATestClose() {
+    try {
+        // Reset form
+        const form = safeGetElement("a2a-test-form");
+        if (form) {
+            form.reset();
+        }
+
+        // Clear response
+        const responseDiv = safeGetElement("a2a-test-response-json");
+        const resultDiv = safeGetElement("a2a-test-result");
+        if (responseDiv) {
+            responseDiv.innerHTML = "";
+        }
+        if (resultDiv) {
+            resultDiv.classList.add("hidden");
+        }
+
+        // Close modal
+        closeModal("a2a-test-modal");
+    } catch (error) {
+        console.error("Error closing A2A test modal:", error);
+    }
+}
+
+/**
+ * Clean up A2A test modal event listeners
+ */
+function cleanupA2ATestModal() {
+    try {
+        const form = safeGetElement("a2a-test-form");
+        const closeButton = safeGetElement("a2a-test-close");
+
+        if (form && a2aTestFormHandler) {
+            form.removeEventListener("submit", a2aTestFormHandler);
+            a2aTestFormHandler = null;
+        }
+
+        if (closeButton && a2aTestCloseHandler) {
+            closeButton.removeEventListener("click", a2aTestCloseHandler);
+            a2aTestCloseHandler = null;
+        }
+
+        console.log("✓ Cleaned up A2A test modal listeners");
+    } catch (error) {
+        console.error("Error cleaning up A2A test modal:", error);
+    }
+}
+
+// Expose A2A test functions to global scope
 window.testA2AAgent = testA2AAgent;
+window.openA2ATestModal = testA2AAgent;
+window.cleanupA2ATestModal = cleanupA2ATestModal;
 
 /**
  * Token Management Functions
@@ -19013,13 +19840,34 @@ function displayTokensList(tokens) {
             ? '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">Active</span>'
             : '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100">Inactive</span>';
 
+        // Build scope badges
+        const teamName = token.team_id ? getTeamNameById(token.team_id) : null;
+        const teamBadge = teamName
+            ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-800 dark:text-purple-100">Team: ${escapeHtml(teamName)}</span>`
+            : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">Public-only</span>';
+
+        const ipBadge =
+            token.ip_restrictions && token.ip_restrictions.length > 0
+                ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-800 dark:text-orange-100">${token.ip_restrictions.length} IP${token.ip_restrictions.length > 1 ? "s" : ""}</span>`
+                : "";
+
+        const serverBadge = token.server_id
+            ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 dark:bg-blue-800 dark:text-blue-100">Server-scoped</span>'
+            : "";
+
+        // Safely encode token data for data attribute (URL encoding preserves all characters)
+        const tokenDataEncoded = encodeURIComponent(JSON.stringify(token));
+
         tokensHTML += `
             <div class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
                 <div class="flex justify-between items-start">
                     <div class="flex-1">
-                        <div class="flex items-center space-x-2">
+                        <div class="flex items-center flex-wrap gap-2">
                             <h4 class="text-lg font-medium text-gray-900 dark:text-white">${escapeHtml(token.name)}</h4>
                             ${statusBadge}
+                            ${teamBadge}
+                            ${serverBadge}
+                            ${ipBadge}
                         </div>
                         ${token.description ? `<p class="text-sm text-gray-600 dark:text-gray-400 mt-1">${escapeHtml(token.description)}</p>` : ""}
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-3 text-sm text-gray-500 dark:text-gray-400">
@@ -19036,15 +19884,25 @@ function displayTokensList(tokens) {
                         ${token.server_id ? `<div class="mt-2 text-sm"><span class="font-medium text-gray-700 dark:text-gray-300">Scoped to Server:</span> ${escapeHtml(token.server_id)}</div>` : ""}
                         ${token.resource_scopes && token.resource_scopes.length > 0 ? `<div class="mt-1 text-sm"><span class="font-medium text-gray-700 dark:text-gray-300">Permissions:</span> ${token.resource_scopes.map((p) => escapeHtml(p)).join(", ")}</div>` : ""}
                     </div>
-                    <div class="flex space-x-2 ml-4">
+                    <div class="flex flex-wrap gap-2 ml-4">
                         <button
-                            onclick="viewTokenUsage('${token.id}')"
+                            data-action="token-details"
+                            data-token="${tokenDataEncoded}"
+                            class="px-3 py-1 text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 border border-gray-300 dark:border-gray-600 hover:border-gray-500 dark:hover:border-gray-400 rounded-md"
+                        >
+                            Details
+                        </button>
+                        <button
+                            data-action="token-usage"
+                            data-token-id="${escapeHtml(token.id)}"
                             class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md"
                         >
                             Usage Stats
                         </button>
                         <button
-                            onclick="revokeToken('${token.id}', '${escapeHtml(token.name)}')"
+                            data-action="token-revoke"
+                            data-token-id="${escapeHtml(token.id)}"
+                            data-token-name="${escapeHtml(token.name)}"
                             class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md"
                         >
                             Revoke
@@ -19056,6 +19914,55 @@ function displayTokensList(tokens) {
     });
 
     tokensList.innerHTML = tokensHTML;
+
+    // Attach event handlers via delegation (avoids inline JS and XSS risks)
+    setupTokenListEventHandlers(tokensList);
+}
+
+/**
+ * Set up event handlers for token list buttons using event delegation.
+ * This avoids inline onclick handlers and associated XSS risks.
+ * Uses a one-time guard to prevent duplicate handlers on repeated renders.
+ * @param {HTMLElement} container - The tokens list container element
+ */
+function setupTokenListEventHandlers(container) {
+    // Guard against duplicate handlers on repeated renders
+    if (container.dataset.handlersAttached === "true") {
+        return;
+    }
+    container.dataset.handlersAttached = "true";
+
+    container.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-action]");
+        if (!button) {
+            return;
+        }
+
+        const action = button.dataset.action;
+
+        if (action === "token-details") {
+            const tokenData = button.dataset.token;
+            if (tokenData) {
+                try {
+                    const token = JSON.parse(decodeURIComponent(tokenData));
+                    showTokenDetailsModal(token);
+                } catch (e) {
+                    console.error("Failed to parse token data:", e);
+                }
+            }
+        } else if (action === "token-usage") {
+            const tokenId = button.dataset.tokenId;
+            if (tokenId) {
+                viewTokenUsage(tokenId);
+            }
+        } else if (action === "token-revoke") {
+            const tokenId = button.dataset.tokenId;
+            const tokenName = button.dataset.tokenName;
+            if (tokenId) {
+                revokeToken(tokenId, tokenName || "");
+            }
+        }
+    });
 }
 
 /**
@@ -19082,7 +19989,7 @@ function getCurrentTeamId() {
 
     // Fallback: check URL parameters
     const urlParams = new URLSearchParams(window.location.search);
-    const teamId = urlParams.get("teamid");
+    const teamId = urlParams.get("team_id");
 
     if (!teamId || teamId === "" || teamId === "all") {
         return null;
@@ -19228,6 +20135,73 @@ function setupCreateTokenForm() {
 }
 
 /**
+ * Validate an IP address or CIDR notation string.
+ * @param {string} value - The IP/CIDR string to validate
+ * @returns {boolean} True if valid IPv4/IPv6 address or CIDR notation
+ */
+function isValidIpOrCidr(value) {
+    if (!value || typeof value !== "string") {
+        return false;
+    }
+
+    const trimmed = value.trim();
+
+    // IPv4 with optional CIDR (e.g., 192.168.1.0/24 or 192.168.1.1)
+    const ipv4Segment = "(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)";
+    const ipv4Pattern = new RegExp(
+        `^(?:${ipv4Segment}\\.){3}${ipv4Segment}(?:\\/(?:[0-9]|[1-2][0-9]|3[0-2]))?$`,
+    );
+
+    // IPv6 with optional CIDR (supports compressed forms and IPv4-embedded)
+    const ipv6Segment = "[0-9A-Fa-f]{1,4}";
+    const ipv4Embedded = `(?:${ipv4Segment}\\.){3}${ipv4Segment}`;
+    const ipv6Pattern = new RegExp(
+        "^(?:" +
+            `(?:${ipv6Segment}:){7}${ipv6Segment}|` +
+            `(?:${ipv6Segment}:){1,7}:|` +
+            `(?:${ipv6Segment}:){1,6}:${ipv6Segment}|` +
+            `(?:${ipv6Segment}:){1,5}(?::${ipv6Segment}){1,2}|` +
+            `(?:${ipv6Segment}:){1,4}(?::${ipv6Segment}){1,3}|` +
+            `(?:${ipv6Segment}:){1,3}(?::${ipv6Segment}){1,4}|` +
+            `(?:${ipv6Segment}:){1,2}(?::${ipv6Segment}){1,5}|` +
+            `${ipv6Segment}:(?::${ipv6Segment}){1,6}|` +
+            `:(?::${ipv6Segment}){1,7}|` +
+            "::|" +
+            `(?:${ipv6Segment}:){1,4}:${ipv4Embedded}|` +
+            `::(?:ffff(?::0{1,4}){0,1}:)?${ipv4Embedded}` +
+            ")(?:\\/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?$",
+    );
+
+    return ipv4Pattern.test(trimmed) || ipv6Pattern.test(trimmed);
+}
+
+/**
+ * Validate a permission scope string.
+ * Permissions should follow format: resource.action (e.g., tools.read, resources.write)
+ * Also allows wildcard (*) for full access.
+ * @param {string} value - The permission string to validate
+ * @returns {boolean} True if valid permission format
+ */
+function isValidPermission(value) {
+    if (!value || typeof value !== "string") {
+        return false;
+    }
+
+    const trimmed = value.trim();
+
+    // Allow wildcard
+    if (trimmed === "*") {
+        return true;
+    }
+
+    // Permission format: resource.action (alphanumeric with underscores, dot-separated)
+    // Examples: tools.read, resources.write, prompts.list, tools.execute
+    const permissionPattern = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/i;
+
+    return permissionPattern.test(trimmed);
+}
+
+/**
  * Create a new API token
  */
 // Create a new API token
@@ -19261,21 +20235,48 @@ async function createToken(form) {
             scope.server_id = formData.get("server_id");
         }
 
+        // Parse and validate IP restrictions
         if (formData.get("ip_restrictions")) {
             const ipRestrictions = formData.get("ip_restrictions").trim();
-            scope.ip_restrictions = ipRestrictions
-                ? ipRestrictions.split(",").map((ip) => ip.trim())
-                : [];
+            if (ipRestrictions) {
+                const ipList = ipRestrictions
+                    .split(",")
+                    .map((ip) => ip.trim())
+                    .filter((ip) => ip.length > 0);
+
+                // Validate each IP/CIDR
+                const invalidIps = ipList.filter((ip) => !isValidIpOrCidr(ip));
+                if (invalidIps.length > 0) {
+                    throw new Error(
+                        `Invalid IP address or CIDR format: ${invalidIps.join(", ")}. ` +
+                            "Use formats like 192.168.1.0/24 or 10.0.0.1",
+                    );
+                }
+                scope.ip_restrictions = ipList;
+            } else {
+                scope.ip_restrictions = [];
+            }
         } else {
             scope.ip_restrictions = [];
         }
 
+        // Parse and validate permissions
         if (formData.get("permissions")) {
-            scope.permissions = formData
+            const permList = formData
                 .get("permissions")
                 .split(",")
                 .map((p) => p.trim())
                 .filter((p) => p.length > 0);
+
+            // Validate each permission
+            const invalidPerms = permList.filter((p) => !isValidPermission(p));
+            if (invalidPerms.length > 0) {
+                throw new Error(
+                    `Invalid permission format: ${invalidPerms.join(", ")}. ` +
+                        "Use formats like tools.read, resources.write, or * for full access",
+                );
+            }
+            scope.permissions = permList;
         } else {
             scope.permissions = [];
         }
@@ -19294,10 +20295,11 @@ async function createToken(form) {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(
-                error.detail || `Failed to create token (${response.status})`,
+            const errorMsg = await parseErrorResponse(
+                response,
+                `Failed to create token (${response.status})`,
             );
+            throw new Error(errorMsg);
         }
 
         const result = await response.json();
@@ -19440,10 +20442,11 @@ async function revokeToken(tokenId, tokenName) {
         );
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(
-                error.detail || `Failed to revoke token: ${response.status}`,
+            const errorMsg = await parseErrorResponse(
+                response,
+                `Failed to revoke token: ${response.status}`,
             );
+            throw new Error(errorMsg);
         }
 
         showNotification("Token revoked successfully", "success");
@@ -19560,6 +20563,261 @@ function showUsageStatsModal(stats) {
     `;
 
     document.body.appendChild(modal);
+}
+
+/**
+ * Get team name by team ID from cached team data
+ * @param {string} teamId - The team ID to look up
+ * @returns {string} Team name or truncated ID if not found
+ */
+function getTeamNameById(teamId) {
+    if (!teamId) {
+        return null;
+    }
+
+    // Try from window.USERTEAMSDATA (most reliable source)
+    if (window.USERTEAMSDATA && Array.isArray(window.USERTEAMSDATA)) {
+        const teamObj = window.USERTEAMSDATA.find((t) => t.id === teamId);
+        if (teamObj) {
+            return teamObj.name;
+        }
+    }
+
+    // Try from Alpine.js component
+    const teamSelector = document.querySelector('[x-data*="selectedTeam"]');
+    if (
+        teamSelector &&
+        teamSelector._x_dataStack &&
+        teamSelector._x_dataStack[0]
+    ) {
+        const alpineData = teamSelector._x_dataStack[0];
+        if (alpineData.teams && Array.isArray(alpineData.teams)) {
+            const teamObj = alpineData.teams.find((t) => t.id === teamId);
+            if (teamObj) {
+                return teamObj.name;
+            }
+        }
+    }
+
+    // Fallback: return truncated ID
+    return teamId.substring(0, 8) + "...";
+}
+
+/**
+ * Show token details modal with full token information
+ * @param {Object} token - The token object with all fields
+ */
+function showTokenDetailsModal(token) {
+    const formatDate = (dateStr) => {
+        if (!dateStr) {
+            return "Never";
+        }
+        return new Date(dateStr).toLocaleString();
+    };
+
+    const formatList = (list) => {
+        if (!list || list.length === 0) {
+            return "None";
+        }
+        return list
+            .map((item) => `<li class="ml-4">• ${escapeHtml(item)}</li>`)
+            .join("");
+    };
+
+    const formatJson = (obj) => {
+        if (!obj || Object.keys(obj).length === 0) {
+            return "None";
+        }
+        return `<pre class="bg-gray-100 dark:bg-gray-700 p-2 rounded text-xs overflow-x-auto">${escapeHtml(JSON.stringify(obj, null, 2))}</pre>`;
+    };
+
+    const teamName = token.team_id ? getTeamNameById(token.team_id) : null;
+    const statusClass = token.is_active
+        ? "bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100"
+        : "bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100";
+    const statusText = token.is_active ? "Active" : "Inactive";
+
+    const modal = document.createElement("div");
+    modal.className =
+        "fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50";
+    modal.innerHTML = `
+        <div class="relative top-10 mx-auto p-5 border w-11/12 max-w-2xl shadow-lg rounded-md bg-white dark:bg-gray-800 mb-10">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-medium text-gray-900 dark:text-white">Token Details</h3>
+                <button data-action="close-modal" class="text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Basic Information -->
+            <div class="mb-6">
+                <h4 class="text-md font-semibold text-gray-900 dark:text-white mb-3 border-b border-gray-200 dark:border-gray-600 pb-2">Basic Information</h4>
+                <div class="grid grid-cols-1 gap-2 text-sm">
+                    <div class="flex items-center">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">ID:</span>
+                        <code class="bg-gray-100 dark:bg-gray-700 px-2 py-0.5 rounded text-xs flex-1 overflow-hidden text-ellipsis">${escapeHtml(token.id)}</code>
+                        <button data-action="copy-id" data-copy-value="${escapeHtml(token.id)}"
+                                class="ml-2 px-2 py-0.5 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 border border-blue-300 dark:border-blue-600 rounded">
+                            Copy
+                        </button>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Name:</span>
+                        <span class="text-gray-900 dark:text-white">${escapeHtml(token.name)}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Description:</span>
+                        <span class="text-gray-600 dark:text-gray-400">${token.description ? escapeHtml(token.description) : "None"}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Created by:</span>
+                        <span class="text-gray-900 dark:text-white">${escapeHtml(token.user_email || "Unknown")}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Team:</span>
+                        <span class="text-gray-900 dark:text-white">${teamName ? `${escapeHtml(teamName)} <code class="text-xs text-gray-500">(${escapeHtml(token.team_id.substring(0, 8))}...)</code>` : "None (Public-only)"}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Created:</span>
+                        <span class="text-gray-600 dark:text-gray-400">${formatDate(token.created_at)}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Expires:</span>
+                        <span class="text-gray-600 dark:text-gray-400">${formatDate(token.expires_at)}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Last Used:</span>
+                        <span class="text-gray-600 dark:text-gray-400">${formatDate(token.last_used)}</span>
+                    </div>
+                    <div class="flex items-center">
+                        <span class="font-medium text-gray-700 dark:text-gray-300 w-28">Status:</span>
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusClass}">${statusText}</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Scope & Restrictions -->
+            <div class="mb-6">
+                <h4 class="text-md font-semibold text-gray-900 dark:text-white mb-3 border-b border-gray-200 dark:border-gray-600 pb-2">Scope & Restrictions</h4>
+                <div class="grid grid-cols-1 gap-3 text-sm">
+                    <div>
+                        <span class="font-medium text-gray-700 dark:text-gray-300">Server:</span>
+                        <span class="ml-2 text-gray-600 dark:text-gray-400">${token.server_id ? escapeHtml(token.server_id) : "All servers"}</span>
+                    </div>
+                    <div>
+                        <span class="font-medium text-gray-700 dark:text-gray-300">Permissions:</span>
+                        ${
+                            token.resource_scopes &&
+                            token.resource_scopes.length > 0
+                                ? `<ul class="mt-1 text-gray-600 dark:text-gray-400">${formatList(token.resource_scopes)}</ul>`
+                                : '<span class="ml-2 text-gray-600 dark:text-gray-400">All (no restrictions)</span>'
+                        }
+                    </div>
+                    <div>
+                        <span class="font-medium text-gray-700 dark:text-gray-300">IP Restrictions:</span>
+                        ${
+                            token.ip_restrictions &&
+                            token.ip_restrictions.length > 0
+                                ? `<ul class="mt-1 text-gray-600 dark:text-gray-400">${formatList(token.ip_restrictions)}</ul>`
+                                : '<span class="ml-2 text-gray-600 dark:text-gray-400">None</span>'
+                        }
+                    </div>
+                    <div>
+                        <span class="font-medium text-gray-700 dark:text-gray-300">Time Restrictions:</span>
+                        <div class="mt-1">${formatJson(token.time_restrictions)}</div>
+                    </div>
+                    <div>
+                        <span class="font-medium text-gray-700 dark:text-gray-300">Usage Limits:</span>
+                        <div class="mt-1">${formatJson(token.usage_limits)}</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tags -->
+            ${
+                token.tags && token.tags.length > 0
+                    ? `
+            <div class="mb-6">
+                <h4 class="text-md font-semibold text-gray-900 dark:text-white mb-3 border-b border-gray-200 dark:border-gray-600 pb-2">Tags</h4>
+                <div class="flex flex-wrap gap-2">
+                    ${token.tags
+                        .map((tag) => {
+                            const raw =
+                                typeof tag === "object" && tag !== null
+                                    ? tag.id || tag.label || JSON.stringify(tag)
+                                    : tag;
+                            return `<span class="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 text-xs rounded">${escapeHtml(raw)}</span>`;
+                        })
+                        .join("")}
+                </div>
+            </div>
+            `
+                    : ""
+            }
+
+            <!-- Revocation Details (if revoked) -->
+            ${
+                token.is_revoked
+                    ? `
+            <div class="mb-6">
+                <h4 class="text-md font-semibold text-red-600 dark:text-red-400 mb-3 border-b border-red-200 dark:border-red-600 pb-2">Revocation Details</h4>
+                <div class="grid grid-cols-1 gap-2 text-sm bg-red-50 dark:bg-red-900/20 p-3 rounded">
+                    <div class="flex">
+                        <span class="font-medium text-red-700 dark:text-red-300 w-28">Revoked at:</span>
+                        <span class="text-red-600 dark:text-red-400">${formatDate(token.revoked_at)}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-red-700 dark:text-red-300 w-28">Revoked by:</span>
+                        <span class="text-red-600 dark:text-red-400">${token.revoked_by ? escapeHtml(token.revoked_by) : "Unknown"}</span>
+                    </div>
+                    <div class="flex">
+                        <span class="font-medium text-red-700 dark:text-red-300 w-28">Reason:</span>
+                        <span class="text-red-600 dark:text-red-400">${token.revocation_reason ? escapeHtml(token.revocation_reason) : "No reason provided"}</span>
+                    </div>
+                </div>
+            </div>
+            `
+                    : ""
+            }
+
+            <div class="flex justify-end">
+                <button
+                    data-action="close-modal"
+                    class="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500"
+                >
+                    Close
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Attach event handlers (avoids inline JS and XSS risks)
+    modal.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-action]");
+        if (!button) {
+            return;
+        }
+
+        const action = button.dataset.action;
+
+        if (action === "close-modal") {
+            modal.remove();
+        } else if (action === "copy-id") {
+            const value = button.dataset.copyValue;
+            if (value) {
+                navigator.clipboard.writeText(value).then(() => {
+                    button.textContent = "Copied!";
+                    setTimeout(() => {
+                        button.textContent = "Copy";
+                    }, 1500);
+                });
+            }
+        }
+    });
 }
 
 /**
@@ -19736,6 +20994,719 @@ function hideAddMemberForm(teamId) {
 // Expose team member management functions to global scope
 window.showAddMemberForm = showAddMemberForm;
 window.hideAddMemberForm = hideAddMemberForm;
+
+// Reset team creation form after successful HTMX actions
+function resetTeamCreateForm() {
+    const form = document.querySelector('form[hx-post*="/admin/teams"]');
+    if (form) {
+        form.reset();
+    }
+    const errorEl = document.getElementById("create-team-error");
+    if (errorEl) {
+        errorEl.innerHTML = "";
+    }
+}
+
+// Normalize team ID from element IDs like "add-members-form-<id>"
+function extractTeamId(prefix, elementId) {
+    if (!elementId || !elementId.startsWith(prefix)) {
+        return null;
+    }
+    return elementId.slice(prefix.length);
+}
+
+function updateAddMembersCount(teamId) {
+    const form = document.getElementById(`add-members-form-${teamId}`);
+    const countEl = document.getElementById(`selected-count-${teamId}`);
+    if (!form || !countEl) {
+        return;
+    }
+    const checked = form.querySelectorAll(
+        'input[name="associatedUsers"]:checked',
+    );
+    countEl.textContent =
+        checked.length === 0
+            ? "No users selected"
+            : `${checked.length} user${checked.length !== 1 ? "s" : ""} selected`;
+}
+
+function dedupeSelectorItems(container) {
+    if (!container) {
+        return;
+    }
+    const seen = new Set();
+    const items = Array.from(container.querySelectorAll(".user-item"));
+    items.forEach((item) => {
+        const email = item.getAttribute("data-user-email") || "";
+        if (!email) {
+            return;
+        }
+        if (seen.has(email)) {
+            item.remove();
+            return;
+        }
+        seen.add(email);
+    });
+}
+
+// Perform server-side user search and build HTML from JSON (like tools search)
+async function performUserSearch(teamId, query, container, teamMemberData) {
+    console.log(`[Team ${teamId}] Performing user search: "${query}"`);
+
+    // Step 1: Capture current selections before replacing HTML
+    const selections = {};
+    const roleSelections = {};
+    try {
+        const userItems = container.querySelectorAll(".user-item");
+        userItems.forEach((item) => {
+            const email = item.dataset.userEmail || "";
+            const checkbox = item.querySelector(
+                'input[name="associatedUsers"]',
+            );
+            const roleSelect = item.querySelector(".role-select");
+            if (checkbox && email) {
+                selections[email] = checkbox.checked;
+            }
+            if (roleSelect && email) {
+                roleSelections[email] = roleSelect.value;
+            }
+        });
+        console.log(
+            `[Team ${teamId}] Captured ${Object.keys(selections).length} selections and ${Object.keys(roleSelections).length} role selections`,
+        );
+    } catch (e) {
+        console.error(`[Team ${teamId}] Error capturing selections:`, e);
+    }
+
+    // Step 2: Show loading state
+    container.innerHTML = `
+        <div class="text-center py-4">
+            <svg class="animate-spin h-5 w-5 text-indigo-600 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Searching users...</p>
+        </div>
+    `;
+
+    // Step 3: If query is empty, reload default list from /admin/users/partial
+    if (query === "") {
+        try {
+            const usersUrl = `${window.ROOT_PATH}/admin/users/partial?page=1&per_page=50&render=selector&team_id=${encodeURIComponent(teamId)}`;
+            console.log(
+                `[Team ${teamId}] Loading default users with URL: ${usersUrl}`,
+            );
+
+            const response = await fetchWithAuth(usersUrl);
+            if (response.ok) {
+                const html = await response.text();
+                container.innerHTML = html;
+
+                // Restore selections
+                restoreUserSelections(container, selections, roleSelections);
+            } else {
+                console.error(
+                    `[Team ${teamId}] Failed to load users: ${response.status}`,
+                );
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load users</div>';
+            }
+        } catch (error) {
+            console.error(`[Team ${teamId}] Error loading users:`, error);
+            container.innerHTML =
+                '<div class="text-center py-4 text-red-600">Error loading users</div>';
+        }
+        return;
+    }
+
+    // Step 4: Call /admin/users/search API
+    try {
+        const searchUrl = `${window.ROOT_PATH}/admin/users/search?q=${encodeURIComponent(query)}&limit=50`;
+        console.log(`[Team ${teamId}] Searching users with URL: ${searchUrl}`);
+
+        const response = await fetchWithAuth(searchUrl);
+        if (!response.ok) {
+            console.error(
+                `[Team ${teamId}] Search failed: ${response.status} ${response.statusText}`,
+            );
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.users && data.users.length > 0) {
+            // Step 5: Build HTML manually from JSON
+            let searchResultsHtml = "";
+            data.users.forEach((user) => {
+                const memberData = teamMemberData[user.email] || {};
+                const isMember = Object.keys(memberData).length > 0;
+                const memberRole = memberData.role || "member";
+                const joinedAt = memberData.joined_at;
+                const isCurrentUser = memberData.is_current_user || false;
+                const isLastOwner = memberData.is_last_owner || false;
+                const isChecked =
+                    selections[user.email] !== undefined
+                        ? selections[user.email]
+                        : isMember;
+                const selectedRole = roleSelections[user.email] || memberRole;
+
+                const borderClass = isMember
+                    ? "border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-900/20"
+                    : "border-transparent";
+
+                searchResultsHtml += `
+                    <div class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 p-3 hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md user-item border ${borderClass}" data-user-email="${escapeHtml(user.email)}">
+                        <!-- Avatar Circle -->
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
+                                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${escapeHtml(user.email[0].toUpperCase())}</span>
+                            </div>
+                        </div>
+
+                        <!-- Checkbox -->
+                        <input
+                            type="checkbox"
+                            name="associatedUsers"
+                            value="${escapeHtml(user.email)}"
+                            data-user-name="${escapeHtml(user.full_name || user.email)}"
+                            class="user-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600 flex-shrink-0"
+                            data-auto-check="true"
+                            ${isChecked ? "checked" : ""}
+                        />
+
+                        <!-- User Info with Badges -->
+                        <div class="flex-grow min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="select-none font-medium text-gray-900 dark:text-white truncate">${escapeHtml(user.full_name || user.email)}</span>
+                                ${isCurrentUser ? '<span class="inline-flex items-center px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 rounded-full dark:bg-blue-900 dark:text-blue-200">You</span>' : ""}
+                                ${isLastOwner ? '<span class="inline-flex items-center px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-800 rounded-full dark:bg-yellow-900 dark:text-yellow-200">Last Owner</span>' : ""}
+                                ${isMember && memberRole === "owner" && !isLastOwner ? '<span class="inline-flex items-center px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Owner</span>' : ""}
+                            </div>
+                            <div class="text-sm text-gray-500 dark:text-gray-400 truncate">${escapeHtml(user.email)}</div>
+                            ${isMember && joinedAt ? `<div class="text-xs text-gray-400 dark:text-gray-500">Joined: ${formatDate(joinedAt)}</div>` : ""}
+                        </div>
+
+                        <!-- Role Selector -->
+                        <select
+                            name="role_${encodeURIComponent(user.email)}"
+                            class="role-select text-sm px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white flex-shrink-0"
+                        >
+                            <option value="member" ${selectedRole === "member" ? "selected" : ""}>Member</option>
+                            <option value="owner" ${selectedRole === "owner" ? "selected" : ""}>Owner</option>
+                        </select>
+                    </div>
+                `;
+            });
+
+            // Step 6: Replace container innerHTML
+            container.innerHTML = searchResultsHtml;
+
+            // Step 7: No need to restore selections - they're already built into the HTML
+            console.log(
+                `[Team ${teamId}] Rendered ${data.users.length} users from search`,
+            );
+        } else {
+            container.innerHTML =
+                '<div class="text-center py-4 text-gray-500">No users found</div>';
+        }
+    } catch (error) {
+        console.error(`[Team ${teamId}] Error searching users:`, error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching users</div>';
+    }
+}
+
+// Restore user selections after loading default list
+function restoreUserSelections(container, selections, roleSelections) {
+    try {
+        const checkboxes = container.querySelectorAll(
+            'input[name="associatedUsers"]',
+        );
+        checkboxes.forEach((cb) => {
+            if (selections[cb.value] !== undefined) {
+                cb.checked = selections[cb.value];
+            }
+        });
+
+        const roleSelects = container.querySelectorAll(".role-select");
+        roleSelects.forEach((select) => {
+            const email = select.name.replace("role_", "");
+            const decodedEmail = decodeURIComponent(email);
+            if (roleSelections[decodedEmail]) {
+                select.value = roleSelections[decodedEmail];
+            }
+        });
+
+        console.log(`Restored ${Object.keys(selections).length} selections`);
+    } catch (e) {
+        console.error("Error restoring selections:", e);
+    }
+}
+
+// Helper to format date (similar to Python strftime "%b %d, %Y")
+function formatDate(dateString) {
+    try {
+        const date = new Date(dateString);
+        return date.toLocaleDateString("en-US", {
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+        });
+    } catch (e) {
+        return dateString;
+    }
+}
+
+function initializeAddMembersForm(form) {
+    if (!form || form.dataset.initialized === "true") {
+        return;
+    }
+    form.dataset.initialized = "true";
+
+    // Support both old add-members-form pattern and new team-members-form pattern
+    const teamId =
+        form.dataset.teamId ||
+        extractTeamId("add-members-form-", form.id) ||
+        extractTeamId("team-members-form-", form.id) ||
+        "";
+
+    console.log(
+        `[initializeAddMembersForm] Form ID: ${form.id}, Team ID: ${teamId}`,
+    );
+
+    if (!teamId) {
+        console.warn(
+            `[initializeAddMembersForm] No team ID found for form:`,
+            form,
+        );
+        return;
+    }
+
+    const searchInput = document.getElementById(`user-search-${teamId}`);
+    const searchResults = document.getElementById(
+        `user-search-results-${teamId}`,
+    );
+    const searchLoading = document.getElementById(
+        `user-search-loading-${teamId}`,
+    );
+
+    // For unified view, find the list container for client-side filtering
+    const userListContainer = document.getElementById(
+        `team-members-list-${teamId}`,
+    );
+
+    console.log(
+        `[Team ${teamId}] Form initialization - searchInput: ${!!searchInput}, userListContainer: ${!!userListContainer}, searchResults: ${!!searchResults}`,
+    );
+
+    const memberEmails = [];
+    if (searchResults?.dataset.memberEmails) {
+        try {
+            const parsed = JSON.parse(searchResults.dataset.memberEmails);
+            if (Array.isArray(parsed)) {
+                memberEmails.push(...parsed);
+            }
+        } catch (error) {
+            console.warn("Failed to parse member emails", error);
+        }
+    }
+    const memberEmailSet = new Set(memberEmails);
+
+    form.addEventListener("change", function (event) {
+        if (event.target?.name === "associatedUsers") {
+            updateAddMembersCount(teamId);
+            // Role dropdown state is not managed client-side - all logic is server-side
+        }
+    });
+
+    updateAddMembersCount(teamId);
+
+    // If we have searchInput and userListContainer, use server-side search like tools (unified view)
+    if (searchInput && userListContainer) {
+        console.log(
+            `[Team ${teamId}] Initializing server-side search for unified view`,
+        );
+
+        // Get team member data from the initial page load (embedded in the form)
+        const teamMemberDataScript = document.getElementById(
+            `team-member-data-${teamId}`,
+        );
+        let teamMemberData = {};
+        if (teamMemberDataScript) {
+            try {
+                teamMemberData = JSON.parse(
+                    teamMemberDataScript.textContent || "{}",
+                );
+                console.log(
+                    `[Team ${teamId}] Loaded team member data for ${Object.keys(teamMemberData).length} members`,
+                );
+            } catch (e) {
+                console.error(
+                    `[Team ${teamId}] Failed to parse team member data:`,
+                    e,
+                );
+            }
+        }
+
+        let searchTimeout;
+        searchInput.addEventListener("input", function () {
+            clearTimeout(searchTimeout);
+            const query = this.value.trim();
+
+            searchTimeout = setTimeout(async () => {
+                await performUserSearch(
+                    teamId,
+                    query,
+                    userListContainer,
+                    teamMemberData,
+                );
+            }, 300);
+        });
+
+        return;
+    }
+
+    if (!searchInput || !searchResults) {
+        return;
+    }
+
+    let searchTimeout;
+    searchInput.addEventListener("input", function () {
+        clearTimeout(searchTimeout);
+        const query = this.value.trim();
+
+        if (query.length < 2) {
+            searchResults.innerHTML = "";
+            if (searchLoading) {
+                searchLoading.classList.add("hidden");
+            }
+            return;
+        }
+
+        searchTimeout = setTimeout(async () => {
+            if (searchLoading) {
+                searchLoading.classList.remove("hidden");
+            }
+            try {
+                const searchUrl = searchInput.dataset.searchUrl || "";
+                const limit = searchInput.dataset.searchLimit || "10";
+                if (!searchUrl) {
+                    throw new Error("Search URL missing");
+                }
+                const response = await fetchWithAuth(
+                    `${searchUrl}?q=${encodeURIComponent(query)}&limit=${limit}`,
+                );
+                if (!response.ok) {
+                    throw new Error(`Search failed: ${response.status}`);
+                }
+                const data = await response.json();
+
+                searchResults.innerHTML = "";
+                if (data.users && data.users.length > 0) {
+                    const container = document.createElement("div");
+                    container.className =
+                        "bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md p-2 mt-1";
+
+                    data.users.forEach((user) => {
+                        if (memberEmailSet.has(user.email)) {
+                            return;
+                        }
+                        const item = document.createElement("div");
+                        item.className =
+                            "p-2 hover:bg-gray-50 dark:hover:bg-gray-700 rounded cursor-pointer text-sm";
+                        item.textContent = `${user.full_name || ""} (${user.email})`;
+                        item.addEventListener("click", () => {
+                            const container = document.getElementById(
+                                `user-selector-container-${teamId}`,
+                            );
+                            if (!container) {
+                                return;
+                            }
+                            const checkbox = container.querySelector(
+                                `input[value="${user.email}"]`,
+                            );
+
+                            if (checkbox) {
+                                checkbox.checked = true;
+                                checkbox.dispatchEvent(
+                                    new Event("change", { bubbles: true }),
+                                );
+                            } else {
+                                const userItem = document.createElement("div");
+                                userItem.className =
+                                    "flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 p-2 hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md user-item";
+                                userItem.setAttribute(
+                                    "data-user-email",
+                                    user.email,
+                                );
+
+                                const newCheckbox =
+                                    document.createElement("input");
+                                newCheckbox.type = "checkbox";
+                                newCheckbox.name = "associatedUsers";
+                                newCheckbox.value = user.email;
+                                newCheckbox.setAttribute(
+                                    "data-user-name",
+                                    user.full_name || "",
+                                );
+                                newCheckbox.className =
+                                    "user-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600 flex-shrink-0";
+                                newCheckbox.setAttribute(
+                                    "data-auto-check",
+                                    "true",
+                                );
+                                newCheckbox.checked = true;
+
+                                const label = document.createElement("span");
+                                label.className = "select-none flex-grow";
+                                label.textContent = `${user.full_name || ""} (${user.email})`;
+
+                                const roleSelect =
+                                    document.createElement("select");
+                                roleSelect.name = `role_${encodeURIComponent(
+                                    user.email,
+                                )}`;
+                                roleSelect.className =
+                                    "role-select text-sm px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white flex-shrink-0";
+
+                                const memberOption =
+                                    document.createElement("option");
+                                memberOption.value = "member";
+                                memberOption.textContent = "Member";
+                                memberOption.selected = true;
+
+                                const ownerOption =
+                                    document.createElement("option");
+                                ownerOption.value = "owner";
+                                ownerOption.textContent = "Owner";
+
+                                roleSelect.appendChild(memberOption);
+                                roleSelect.appendChild(ownerOption);
+
+                                userItem.appendChild(newCheckbox);
+                                userItem.appendChild(label);
+                                userItem.appendChild(roleSelect);
+
+                                const firstChild = container.firstChild;
+                                if (firstChild) {
+                                    container.insertBefore(
+                                        userItem,
+                                        firstChild,
+                                    );
+                                } else {
+                                    container.appendChild(userItem);
+                                }
+
+                                newCheckbox.dispatchEvent(
+                                    new Event("change", { bubbles: true }),
+                                );
+                            }
+
+                            searchInput.value = "";
+                            searchResults.innerHTML = "";
+                        });
+                        container.appendChild(item);
+                    });
+
+                    if (container.childElementCount > 0) {
+                        searchResults.appendChild(container);
+                    } else {
+                        const empty = document.createElement("div");
+                        empty.className =
+                            "text-sm text-gray-500 dark:text-gray-400 mt-1";
+                        empty.textContent = "No users found";
+                        searchResults.appendChild(empty);
+                    }
+                } else {
+                    const empty = document.createElement("div");
+                    empty.className =
+                        "text-sm text-gray-500 dark:text-gray-400 mt-1";
+                    empty.textContent = "No users found";
+                    searchResults.appendChild(empty);
+                }
+            } catch (error) {
+                console.error("Search error:", error);
+                searchResults.innerHTML = "";
+                const errorEl = document.createElement("div");
+                errorEl.className = "text-sm text-red-500 mt-1";
+                errorEl.textContent = "Search failed";
+                searchResults.appendChild(errorEl);
+            } finally {
+                if (searchLoading) {
+                    searchLoading.classList.add("hidden");
+                }
+            }
+        }, 300);
+    });
+}
+
+function initializeAddMembersForms(root = document) {
+    // Support both old add-members-form pattern and new unified team-members-form pattern
+    const addMembersForms =
+        root?.querySelectorAll?.('[id^="add-members-form-"]') || [];
+    const teamMembersForms =
+        root?.querySelectorAll?.('[id^="team-members-form-"]') || [];
+    const allForms = [...addMembersForms, ...teamMembersForms];
+    allForms.forEach((form) => initializeAddMembersForm(form));
+}
+
+function handleAdminTeamAction(event) {
+    const detail = event.detail || {};
+    const delayMs = Number(detail.delayMs) || 0;
+    setTimeout(() => {
+        if (detail.resetTeamCreateForm) {
+            resetTeamCreateForm();
+        }
+        if (
+            detail.closeTeamEditModal &&
+            typeof hideTeamEditModal === "function"
+        ) {
+            hideTeamEditModal();
+        }
+        if (detail.closeRoleModal) {
+            const roleModal = document.getElementById("role-assignment-modal");
+            if (roleModal) {
+                roleModal.classList.add("hidden");
+            }
+        }
+        if (detail.closeAllModals) {
+            const modals = document.querySelectorAll('[id$="-modal"]');
+            modals.forEach((modal) => modal.classList.add("hidden"));
+        }
+        if (detail.refreshTeamsList) {
+            const teamsList = safeGetElement("teams-list");
+            if (teamsList && window.htmx) {
+                window.htmx.trigger(teamsList, "load");
+            }
+        }
+        if (detail.refreshUnifiedTeamsList && window.htmx) {
+            const unifiedList = document.getElementById("unified-teams-list");
+            if (unifiedList) {
+                // Preserve current pagination/filter state on refresh
+                const params = new URLSearchParams();
+                params.set("page", "1"); // Reset to first page on action
+                if (typeof getTeamsPerPage === "function") {
+                    params.set("per_page", getTeamsPerPage().toString());
+                }
+                // Preserve search query from input field
+                const searchInput = document.getElementById("team-search");
+                if (searchInput && searchInput.value.trim()) {
+                    params.set("q", searchInput.value.trim());
+                }
+                // Preserve relationship filter
+                if (
+                    typeof currentTeamRelationshipFilter !== "undefined" &&
+                    currentTeamRelationshipFilter &&
+                    currentTeamRelationshipFilter !== "all"
+                ) {
+                    params.set("relationship", currentTeamRelationshipFilter);
+                }
+                const url = `${window.ROOT_PATH || ""}/admin/teams/partial?${params.toString()}`;
+                window.htmx.ajax("GET", url, {
+                    target: "#unified-teams-list",
+                    swap: "innerHTML",
+                });
+            }
+        }
+        if (detail.refreshTeamMembers && detail.teamId) {
+            if (typeof window.loadTeamMembersView === "function") {
+                window.loadTeamMembersView(detail.teamId);
+            } else if (window.htmx) {
+                const modalContent = document.getElementById(
+                    "team-edit-modal-content",
+                );
+                if (modalContent) {
+                    window.htmx.ajax(
+                        "GET",
+                        `${window.ROOT_PATH || ""}/admin/teams/${detail.teamId}/members`,
+                        {
+                            target: "#team-edit-modal-content",
+                            swap: "innerHTML",
+                        },
+                    );
+                }
+            }
+        }
+        if (detail.refreshJoinRequests && detail.teamId && window.htmx) {
+            const joinRequests = document.getElementById(
+                "team-join-requests-modal-content",
+            );
+            if (joinRequests) {
+                window.htmx.ajax(
+                    "GET",
+                    `${window.ROOT_PATH || ""}/admin/teams/${detail.teamId}/join-requests`,
+                    {
+                        target: "#team-join-requests-modal-content",
+                        swap: "innerHTML",
+                    },
+                );
+            }
+        }
+    }, delayMs);
+}
+
+function handleAdminUserAction(event) {
+    const detail = event.detail || {};
+    const delayMs = Number(detail.delayMs) || 0;
+    setTimeout(() => {
+        if (
+            detail.closeUserEditModal &&
+            typeof hideUserEditModal === "function"
+        ) {
+            hideUserEditModal();
+        }
+        if (detail.refreshUsersList) {
+            const usersList = document.getElementById("users-list-container");
+            if (usersList && window.htmx) {
+                window.htmx.trigger(usersList, "refreshUsers");
+            }
+        }
+    }, delayMs);
+}
+
+function registerAdminActionListeners() {
+    if (!document.body) {
+        return;
+    }
+    if (document.body.dataset.adminActionListeners === "1") {
+        return;
+    }
+    document.body.dataset.adminActionListeners = "1";
+
+    document.body.addEventListener("adminTeamAction", handleAdminTeamAction);
+    document.body.addEventListener("adminUserAction", handleAdminUserAction);
+    document.body.addEventListener("userCreated", function () {
+        handleAdminUserAction({ detail: { refreshUsersList: true } });
+    });
+
+    document.body.addEventListener("htmx:afterSwap", function (event) {
+        initializeAddMembersForms(event.target);
+        initializePasswordValidation(event.target);
+        const target = event.target;
+        if (
+            target &&
+            target.id &&
+            target.id.startsWith("user-selector-container-")
+        ) {
+            const teamId = extractTeamId("user-selector-container-", target.id);
+            if (teamId) {
+                dedupeSelectorItems(target);
+                updateAddMembersCount(teamId);
+            }
+        }
+    });
+
+    document.body.addEventListener("htmx:load", function (event) {
+        initializeAddMembersForms(event.target);
+        initializePasswordValidation(event.target);
+    });
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", registerAdminActionListeners);
+} else {
+    registerAdminActionListeners();
+}
 
 // Logs refresh function
 function refreshLogs() {
@@ -20131,6 +22102,100 @@ window.rejectJoinRequest = rejectJoinRequest;
 /**
  * Validate password match in user edit form
  */
+function getPasswordPolicy() {
+    const policyEl = document.getElementById("password-policy-data");
+    if (!policyEl) {
+        return null;
+    }
+    return {
+        minLength: parseInt(policyEl.dataset.minLength || "0", 10),
+        requireUppercase: policyEl.dataset.requireUppercase === "true",
+        requireLowercase: policyEl.dataset.requireLowercase === "true",
+        requireNumbers: policyEl.dataset.requireNumbers === "true",
+        requireSpecial: policyEl.dataset.requireSpecial === "true",
+    };
+}
+
+function updateRequirementIcon(elementId, isValid) {
+    const req = document.getElementById(elementId);
+    if (!req) {
+        return;
+    }
+    const icon = req.querySelector("span");
+    if (!icon) {
+        return;
+    }
+    if (isValid) {
+        icon.className =
+            "inline-flex items-center justify-center w-4 h-4 bg-green-500 text-white rounded-full text-xs mr-2";
+        icon.textContent = "✓";
+    } else {
+        icon.className =
+            "inline-flex items-center justify-center w-4 h-4 bg-gray-400 text-white rounded-full text-xs mr-2";
+        icon.textContent = "✗";
+    }
+}
+
+function validatePasswordRequirements() {
+    const policy = getPasswordPolicy();
+    const passwordField = document.getElementById("password-field");
+    if (!policy || !passwordField) {
+        return;
+    }
+
+    const password = passwordField.value || "";
+    const lengthCheck = password.length >= policy.minLength;
+    updateRequirementIcon("req-length", lengthCheck);
+
+    const uppercaseCheck = !policy.requireUppercase || /[A-Z]/.test(password);
+    updateRequirementIcon("req-uppercase", uppercaseCheck);
+
+    const lowercaseCheck = !policy.requireLowercase || /[a-z]/.test(password);
+    updateRequirementIcon("req-lowercase", lowercaseCheck);
+
+    const numbersCheck = !policy.requireNumbers || /[0-9]/.test(password);
+    updateRequirementIcon("req-numbers", numbersCheck);
+
+    const specialChars = "!@#$%^&*()_+-=[]{};:'\"\\|,.<>`~/?";
+    const specialCheck =
+        !policy.requireSpecial ||
+        [...password].some((char) => specialChars.includes(char));
+    updateRequirementIcon("req-special", specialCheck);
+
+    const submitButton = document.querySelector(
+        '#user-edit-modal-content button[type="submit"]',
+    );
+    const allRequirementsMet =
+        lengthCheck &&
+        uppercaseCheck &&
+        lowercaseCheck &&
+        numbersCheck &&
+        specialCheck;
+    const passwordEmpty = password.length === 0;
+
+    if (submitButton) {
+        if (passwordEmpty || allRequirementsMet) {
+            submitButton.disabled = false;
+            submitButton.className =
+                "px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500";
+        } else {
+            submitButton.disabled = true;
+            submitButton.className =
+                "px-4 py-2 text-sm font-medium text-white bg-gray-400 border border-transparent rounded-md cursor-not-allowed";
+        }
+    }
+}
+
+function initializePasswordValidation(root = document) {
+    if (
+        root?.querySelector?.("#password-field") ||
+        document.getElementById("password-field")
+    ) {
+        validatePasswordRequirements();
+        validatePasswordMatch();
+    }
+}
+
 function validatePasswordMatch() {
     const passwordField = document.getElementById("password-field");
     const confirmPasswordField = document.getElementById(
@@ -20171,6 +22236,7 @@ function validatePasswordMatch() {
 
 // Expose password validation function to global scope
 window.validatePasswordMatch = validatePasswordMatch;
+window.validatePasswordRequirements = validatePasswordRequirements;
 
 // ===================================================================
 // SELECTIVE IMPORT FUNCTIONS
@@ -21330,7 +23396,7 @@ function initializePluginFunctions() {
 }
 
 // Initialize plugin functions if plugins panel exists
-if (document.getElementById("plugins-panel")) {
+if (isAdminUser() && document.getElementById("plugins-panel")) {
     initializePluginFunctions();
     // Populate filter dropdowns on initial load
     if (window.populatePluginFilters) {
@@ -21568,7 +23634,32 @@ function initializeChatScroll() {
 /**
  * Generate a unique user ID for the session
  */
+function getAuthenticatedUserId() {
+    const currentUser = window.CURRENT_USER;
+    if (!currentUser) {
+        return "";
+    }
+    if (typeof currentUser === "string") {
+        return currentUser;
+    }
+    if (typeof currentUser === "object") {
+        return (
+            currentUser.id ||
+            currentUser.user_id ||
+            currentUser.sub ||
+            currentUser.email ||
+            ""
+        );
+    }
+    return "";
+}
+
 function generateUserId() {
+    const authenticatedUserId = getAuthenticatedUserId();
+    if (authenticatedUserId) {
+        sessionStorage.setItem("llm_chat_user_id", authenticatedUserId);
+        return authenticatedUserId;
+    }
     // Check if user ID exists in session storage
     let userId = sessionStorage.getItem("llm_chat_user_id");
     if (!userId) {
@@ -23788,10 +25879,18 @@ async function serverSideToolSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/tools/search?${params.toString()}`;
 
         console.log(`[Tool Search] Searching tools with URL: ${searchUrl}`);
 
@@ -24208,10 +26307,18 @@ async function serverSidePromptSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/prompts/search?${params.toString()}`;
 
         console.log(`[Prompt Search] Searching prompts with URL: ${searchUrl}`);
 
@@ -24515,10 +26622,18 @@ async function serverSideResourceSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/resources/search?${params.toString()}`;
 
         console.log(
             `[Resource Search] Searching resources with URL: ${searchUrl}`,
@@ -24823,10 +26938,18 @@ async function serverSideEditToolSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/tools/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/tools/search?${params.toString()}`;
 
         console.log(
             `[Edit Tool Search] Searching tools with URL: ${searchUrl}`,
@@ -25098,10 +27221,18 @@ async function serverSideEditPromptsSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/prompts/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/prompts/search?${params.toString()}`;
 
         console.log(
             `[Edit Prompt Search] Searching prompts with URL: ${searchUrl}`,
@@ -25381,10 +27512,18 @@ async function serverSideEditResourcesSearch(searchTerm) {
     }
 
     try {
-        // Call the search API with gateway filter
-        const searchUrl = gatewayIdParam
-            ? `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100&gateway_id=${encodeURIComponent(gatewayIdParam)}`
-            : `${window.ROOT_PATH}/admin/resources/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        // Call the search API with gateway and team filters
+        const selectedTeamId = getCurrentTeamId();
+        const params = new URLSearchParams();
+        params.set("q", searchTerm);
+        params.set("limit", "100");
+        if (gatewayIdParam) {
+            params.set("gateway_id", gatewayIdParam);
+        }
+        if (selectedTeamId) {
+            params.set("team_id", selectedTeamId);
+        }
+        const searchUrl = `${window.ROOT_PATH}/admin/resources/search?${params.toString()}`;
 
         console.log(
             `[Edit Resource Search] Searching resources with URL: ${searchUrl}`,
@@ -26527,7 +28666,7 @@ function generateStatusBadgeHtml(enabled, reachable, typeLabel) {
  */
 function updateEntityActionButtons(cell, type, id, isEnabled) {
     // We look for the form that toggles activation inside the cell
-    const form = cell.querySelector('form[action*="/toggle"]');
+    const form = cell.querySelector('form[action*="/state"]');
     if (!form) {
         return;
     }
@@ -27945,8 +30084,11 @@ async function saveLLMProvider(event) {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || "Failed to save provider");
+            const errorMsg = await parseErrorResponse(
+                response,
+                "Failed to save provider",
+            );
+            throw new Error(errorMsg);
         }
 
         closeLLMProviderModal();
@@ -27987,8 +30129,11 @@ async function deleteLLMProvider(providerId, providerName) {
         );
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || "Failed to delete provider");
+            const errorMsg = await parseErrorResponse(
+                response,
+                "Failed to delete provider",
+            );
+            throw new Error(errorMsg);
         }
 
         showToast("Provider deleted successfully", "success");
@@ -28005,7 +30150,7 @@ async function deleteLLMProvider(providerId, providerName) {
 async function toggleLLMProvider(providerId) {
     try {
         const response = await fetch(
-            `${window.ROOT_PATH}/llm/providers/${providerId}/toggle`,
+            `${window.ROOT_PATH}/llm/providers/${providerId}/state`,
             {
                 method: "POST",
                 headers: {
@@ -28326,8 +30471,11 @@ async function saveLLMModel(event) {
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || "Failed to save model");
+            const errorMsg = await parseErrorResponse(
+                response,
+                "Failed to save model",
+            );
+            throw new Error(errorMsg);
         }
 
         closeLLMModelModal();
@@ -28364,8 +30512,11 @@ async function deleteLLMModel(modelId, modelName) {
         );
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || "Failed to delete model");
+            const errorMsg = await parseErrorResponse(
+                response,
+                "Failed to delete model",
+            );
+            throw new Error(errorMsg);
         }
 
         showToast("Model deleted successfully", "success");
@@ -28382,7 +30533,7 @@ async function deleteLLMModel(modelId, modelName) {
 async function toggleLLMModel(modelId) {
     try {
         const response = await fetch(
-            `${window.ROOT_PATH}/llm/models/${modelId}/toggle`,
+            `${window.ROOT_PATH}/llm/models/${modelId}/state`,
             {
                 method: "POST",
                 headers: {
@@ -28562,6 +30713,34 @@ function llmApiInfoApp() {
     };
 }
 
+window.overviewDashboard = function () {
+    return {
+        init() {
+            this.updateSvgColors();
+            const observer = new MutationObserver(() => this.updateSvgColors());
+            observer.observe(document.documentElement, {
+                attributes: true,
+                attributeFilter: ["class"],
+            });
+        },
+        updateSvgColors() {
+            const isDark = document.documentElement.classList.contains("dark");
+            const svg = document.getElementById("overview-architecture");
+            if (!svg) {
+                return;
+            }
+
+            const marker = svg.querySelector("#arrowhead polygon");
+            if (marker) {
+                marker.setAttribute(
+                    "class",
+                    isDark ? "fill-gray-500" : "fill-gray-400",
+                );
+            }
+        },
+    };
+};
+
 // Make LLM functions globally available
 window.switchLLMSettingsTab = switchLLMSettingsTab;
 window.showAddProviderModal = showAddProviderModal;
@@ -28584,3 +30763,557 @@ window.toggleLLMModel = toggleLLMModel;
 window.refreshLLMModels = refreshLLMModels;
 window.filterModelsByProvider = filterModelsByProvider;
 window.llmApiInfoApp = llmApiInfoApp;
+
+// Debounce helper for search
+const searchDebounceTimers = {};
+function debouncedServerSideUserSearch(teamId, searchTerm, delay = 300) {
+    if (searchDebounceTimers[teamId]) {
+        clearTimeout(searchDebounceTimers[teamId]);
+    }
+    searchDebounceTimers[teamId] = setTimeout(() => {
+        serverSideUserSearch(teamId, searchTerm);
+    }, delay);
+}
+window.debouncedServerSideUserSearch = debouncedServerSideUserSearch;
+
+// Team user search function - searches all users and splits into members/non-members
+async function serverSideUserSearch(teamId, searchTerm) {
+    const membersContainer = document.getElementById(
+        `team-members-container-${teamId}`,
+    );
+    const nonMembersContainer = document.getElementById(
+        `team-non-members-container-${teamId}`,
+    );
+
+    if (!membersContainer || !nonMembersContainer) {
+        console.error("Team containers not found");
+        return;
+    }
+
+    // Read per_page from data attributes (set server-side), fallback to 20
+    const membersPerPage =
+        membersContainer.dataset.perPage ||
+        membersContainer.getAttribute("data-per-page") ||
+        20;
+    const nonMembersPerPage =
+        nonMembersContainer.dataset.perPage ||
+        nonMembersContainer.getAttribute("data-per-page") ||
+        20;
+
+    // If search is empty, reload both sections with full data
+    if (!searchTerm || searchTerm.trim() === "") {
+        try {
+            // Reload members - use fetchWithAuth for bearer token support
+            const membersResponse = await fetchWithAuth(
+                `${window.ROOT_PATH}/admin/teams/${teamId}/members/partial?page=1&per_page=${membersPerPage}`,
+            );
+            if (membersResponse.ok) {
+                membersContainer.innerHTML = await membersResponse.text();
+                // Re-initialize HTMX on new content for infinite scroll triggers
+                if (typeof htmx !== "undefined") {
+                    htmx.process(membersContainer);
+                }
+            }
+
+            // Reload non-members
+            const nonMembersResponse = await fetchWithAuth(
+                `${window.ROOT_PATH}/admin/teams/${teamId}/non-members/partial?page=1&per_page=${nonMembersPerPage}`,
+            );
+            if (nonMembersResponse.ok) {
+                nonMembersContainer.innerHTML = await nonMembersResponse.text();
+                // Re-initialize HTMX on new content for infinite scroll triggers
+                if (typeof htmx !== "undefined") {
+                    htmx.process(nonMembersContainer);
+                }
+            }
+        } catch (error) {
+            console.error("Error reloading user lists:", error);
+        }
+        return;
+    }
+
+    try {
+        // First, collect member data AND checkbox states from DOM (before search replaces content)
+        const memberDataFromDom = {};
+        const checkboxStates = {}; // Track checkbox states for all visible users
+        const existingMemberItems = document.querySelectorAll(
+            `#team-members-container-${teamId} .user-item`,
+        );
+        existingMemberItems.forEach((item) => {
+            const email = item.dataset.userEmail;
+            if (email) {
+                const roleSelect = item.querySelector(".role-select");
+                const checkbox = item.querySelector(".user-checkbox");
+                memberDataFromDom[email] = {
+                    role: roleSelect ? roleSelect.value : "member",
+                };
+                if (checkbox) {
+                    checkboxStates[email] = checkbox.checked;
+                }
+            }
+        });
+
+        // Also collect checkbox states from non-members section
+        const existingNonMemberItems = document.querySelectorAll(
+            `#team-non-members-container-${teamId} .user-item`,
+        );
+        existingNonMemberItems.forEach((item) => {
+            const email = item.dataset.userEmail;
+            if (email) {
+                const checkbox = item.querySelector(".user-checkbox");
+                const roleSelect = item.querySelector(".role-select");
+                if (checkbox) {
+                    checkboxStates[email] = checkbox.checked;
+                    // Also preserve role selection for users being added
+                    if (checkbox.checked && roleSelect) {
+                        memberDataFromDom[email] = {
+                            role: roleSelect.value,
+                            pendingAdd: true, // Flag that this is a pending addition
+                        };
+                    }
+                }
+            }
+        });
+
+        // If no members found in DOM yet, fetch from server to get membership data with roles
+        if (Object.keys(memberDataFromDom).length === 0) {
+            try {
+                const membersResp = await fetchWithAuth(
+                    `${window.ROOT_PATH}/admin/teams/${teamId}/members/partial?page=1&per_page=100`,
+                );
+                if (membersResp.ok) {
+                    const tempDiv = document.createElement("div");
+                    tempDiv.innerHTML = await membersResp.text();
+                    tempDiv.querySelectorAll(".user-item").forEach((item) => {
+                        const email = item.dataset.userEmail;
+                        if (email) {
+                            const roleSelect =
+                                item.querySelector(".role-select");
+                            memberDataFromDom[email] = {
+                                role: roleSelect ? roleSelect.value : "member",
+                            };
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error("Error fetching member data:", e);
+            }
+        }
+
+        // Search all users - use fetchWithAuth for bearer token support
+        const searchUrl = `${window.ROOT_PATH}/admin/users/search?q=${encodeURIComponent(searchTerm)}&limit=100`;
+        const response = await fetchWithAuth(searchUrl);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.users && data.users.length > 0) {
+            // Split users into members and non-members based on collected data
+            const members = [];
+            const nonMembers = [];
+
+            data.users.forEach((user) => {
+                if (memberDataFromDom[user.email]) {
+                    members.push({
+                        ...user,
+                        role: memberDataFromDom[user.email].role,
+                    });
+                } else {
+                    nonMembers.push(user);
+                }
+            });
+
+            // Helper to escape HTML
+            function escapeHtml(text) {
+                const div = document.createElement("div");
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            // Render members with preserved roles, checkbox states, and loadedMembers hidden input
+            let membersHtml = "";
+            members.forEach((user) => {
+                const fullName = escapeHtml(user.full_name || user.email);
+                const email = escapeHtml(user.email);
+                const role = user.role || "member";
+                const isOwner = role === "owner";
+                // Preserve checkbox state if available, otherwise default to checked for existing members
+                const isChecked =
+                    checkboxStates[user.email] !== undefined
+                        ? checkboxStates[user.email]
+                        : true;
+                membersHtml += `
+                    <div class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 p-3 hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md user-item border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-900/20" data-user-email="${email}">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
+                                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${user.email[0].toUpperCase()}</span>
+                            </div>
+                        </div>
+                        <input type="hidden" name="loadedMembers" value="${email}" />
+                        <input type="checkbox" name="associatedUsers" value="${email}" data-user-name="${fullName}" class="user-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600 flex-shrink-0" ${isChecked ? "checked" : ""} data-auto-check="true" />
+                        <div class="flex-grow min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="select-none font-medium text-gray-900 dark:text-white truncate">${fullName}</span>
+                                ${isOwner ? '<span class="inline-flex items-center px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Owner</span>' : ""}
+                            </div>
+                            <div class="text-sm text-gray-500 dark:text-gray-400 truncate">${email}</div>
+                        </div>
+                        <select name="role_${encodeURIComponent(user.email)}" class="role-select text-sm px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white flex-shrink-0">
+                            <option value="member" ${!isOwner ? "selected" : ""}>Member</option>
+                            <option value="owner" ${isOwner ? "selected" : ""}>Owner</option>
+                        </select>
+                    </div>
+                `;
+            });
+
+            // Render non-members with preserved checkbox states and roles
+            let nonMembersHtml = "";
+            nonMembers.forEach((user) => {
+                const fullName = escapeHtml(user.full_name || user.email);
+                const email = escapeHtml(user.email);
+                // Preserve checkbox state if available, otherwise default to unchecked for non-members
+                const isChecked =
+                    checkboxStates[user.email] !== undefined
+                        ? checkboxStates[user.email]
+                        : false;
+                // Preserve role selection for users being added
+                const pendingData = memberDataFromDom[user.email];
+                const role =
+                    pendingData && pendingData.pendingAdd
+                        ? pendingData.role
+                        : "member";
+                const isOwner = role === "owner";
+                nonMembersHtml += `
+                    <div class="flex items-center space-x-3 text-gray-700 dark:text-gray-300 mb-2 p-3 hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-md user-item border border-transparent" data-user-email="${email}" data-is-member="false">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
+                                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${user.email[0].toUpperCase()}</span>
+                            </div>
+                        </div>
+                        <input type="checkbox" name="associatedUsers" value="${email}" data-user-name="${fullName}" class="user-checkbox form-checkbox h-5 w-5 text-indigo-600 dark:bg-gray-800 dark:border-gray-600 flex-shrink-0" ${isChecked ? "checked" : ""} />
+                        <div class="flex-grow min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="select-none font-medium text-gray-900 dark:text-white truncate">${fullName}</span>
+                            </div>
+                            <div class="text-sm text-gray-500 dark:text-gray-400 truncate">${email}</div>
+                        </div>
+                        <select name="role_${encodeURIComponent(user.email)}" class="role-select text-sm px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white flex-shrink-0">
+                            <option value="member" ${!isOwner ? "selected" : ""}>Member</option>
+                            <option value="owner" ${isOwner ? "selected" : ""}>Owner</option>
+                        </select>
+                    </div>
+                `;
+            });
+
+            membersContainer.innerHTML =
+                membersHtml ||
+                '<div class="text-center py-4 text-gray-500 dark:text-gray-400">No matching members</div>';
+            nonMembersContainer.innerHTML =
+                nonMembersHtml ||
+                '<div class="text-center py-4 text-gray-500 dark:text-gray-400">No matching users</div>';
+        } else {
+            // No results
+            membersContainer.innerHTML =
+                '<div class="text-center py-4 text-gray-500 dark:text-gray-400">No matching members</div>';
+            nonMembersContainer.innerHTML =
+                '<div class="text-center py-4 text-gray-500 dark:text-gray-400">No matching users</div>';
+        }
+    } catch (error) {
+        console.error("Error searching users:", error);
+        membersContainer.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching users</div>';
+        nonMembersContainer.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching users</div>';
+    }
+}
+
+window.serverSideUserSearch = serverSideUserSearch;
+
+// ============================================================================ //
+//                         TEAM SEARCH AND FILTER FUNCTIONS                      //
+// ============================================================================ //
+
+/**
+ * Debounce timer for team search
+ */
+let teamSearchDebounceTimer = null;
+
+/**
+ * Current relationship filter state
+ */
+let currentTeamRelationshipFilter = "all";
+
+/**
+ * Perform server-side search for teams and update the teams list
+ * @param {string} searchTerm - The search query
+ */
+function serverSideTeamSearch(searchTerm) {
+    // Debounce the search to avoid excessive API calls
+    if (teamSearchDebounceTimer) {
+        clearTimeout(teamSearchDebounceTimer);
+    }
+
+    teamSearchDebounceTimer = setTimeout(() => {
+        performTeamSearch(searchTerm);
+    }, 300);
+}
+
+/**
+ * Default per_page for teams list
+ */
+const DEFAULT_TEAMS_PER_PAGE = 10;
+
+/**
+ * Get current per_page value from pagination controls or use default
+ */
+function getTeamsPerPage() {
+    // Try to get from pagination controls select element
+    const paginationControls = document.getElementById(
+        "teams-pagination-controls",
+    );
+    if (paginationControls) {
+        const select = paginationControls.querySelector("select");
+        if (select && select.value) {
+            return parseInt(select.value, 10) || DEFAULT_TEAMS_PER_PAGE;
+        }
+    }
+    return DEFAULT_TEAMS_PER_PAGE;
+}
+
+/**
+ * Actually perform the team search after debounce
+ * @param {string} searchTerm - The search query
+ */
+async function performTeamSearch(searchTerm) {
+    const container = document.getElementById("unified-teams-list");
+    const loadingIndicator = document.getElementById("teams-loading");
+
+    if (!container) {
+        console.error("unified-teams-list container not found");
+        return;
+    }
+
+    // Show loading state
+    if (loadingIndicator) {
+        loadingIndicator.style.display = "block";
+    }
+
+    // Build URL with search query and current relationship filter
+    const params = new URLSearchParams();
+    params.set("page", "1");
+    params.set("per_page", getTeamsPerPage().toString());
+
+    if (searchTerm && searchTerm.trim() !== "") {
+        params.set("q", searchTerm.trim());
+    }
+
+    if (
+        currentTeamRelationshipFilter &&
+        currentTeamRelationshipFilter !== "all"
+    ) {
+        params.set("relationship", currentTeamRelationshipFilter);
+    }
+
+    const url = `${window.ROOT_PATH || ""}/admin/teams/partial?${params.toString()}`;
+
+    console.log(`[Team Search] Searching teams with URL: ${url}`);
+
+    try {
+        // Use HTMX to load the results
+        if (window.htmx) {
+            // HTMX handles the indicator automatically via the indicator option
+            // Don't manually hide it - HTMX will hide it when request completes
+            window.htmx.ajax("GET", url, {
+                target: "#unified-teams-list",
+                swap: "innerHTML",
+                indicator: "#teams-loading",
+            });
+        } else {
+            // Fallback to fetch if HTMX is not available
+            const response = await fetch(url);
+            if (response.ok) {
+                const html = await response.text();
+                container.innerHTML = html;
+            } else {
+                container.innerHTML =
+                    '<div class="text-center py-4 text-red-600">Failed to load teams</div>';
+            }
+            // Only hide indicator in fetch fallback path (HTMX handles its own)
+            if (loadingIndicator) {
+                loadingIndicator.style.display = "none";
+            }
+        }
+    } catch (error) {
+        console.error("Error searching teams:", error);
+        container.innerHTML =
+            '<div class="text-center py-4 text-red-600">Error searching teams</div>';
+        // Hide indicator on error in fallback path
+        if (loadingIndicator) {
+            loadingIndicator.style.display = "none";
+        }
+    }
+}
+
+/**
+ * Filter teams by relationship (owner, member, public, all)
+ * @param {string} filter - The relationship filter value
+ */
+function filterByRelationship(filter) {
+    // Update button states
+    const filterButtons = document.querySelectorAll(".filter-btn");
+    filterButtons.forEach((btn) => {
+        if (btn.getAttribute("data-filter") === filter) {
+            btn.classList.add(
+                "active",
+                "bg-indigo-100",
+                "dark:bg-indigo-900",
+                "text-indigo-700",
+                "dark:text-indigo-300",
+                "border-indigo-300",
+                "dark:border-indigo-600",
+            );
+            btn.classList.remove(
+                "bg-white",
+                "dark:bg-gray-700",
+                "text-gray-700",
+                "dark:text-gray-300",
+            );
+        } else {
+            btn.classList.remove(
+                "active",
+                "bg-indigo-100",
+                "dark:bg-indigo-900",
+                "text-indigo-700",
+                "dark:text-indigo-300",
+                "border-indigo-300",
+                "dark:border-indigo-600",
+            );
+            btn.classList.add(
+                "bg-white",
+                "dark:bg-gray-700",
+                "text-gray-700",
+                "dark:text-gray-300",
+            );
+        }
+    });
+
+    // Update current filter state
+    currentTeamRelationshipFilter = filter;
+
+    // Get current search query
+    const searchInput = document.getElementById("team-search");
+    const searchQuery = searchInput ? searchInput.value.trim() : "";
+
+    // Perform search with new filter
+    performTeamSearch(searchQuery);
+}
+
+/**
+ * Legacy filterTeams function - redirects to serverSideTeamSearch
+ * @param {string} searchValue - The search query
+ */
+function filterTeams(searchValue) {
+    serverSideTeamSearch(searchValue);
+}
+
+// ============================================================================ //
+//                    TEAM SELECTOR DROPDOWN FUNCTIONS                           //
+// ============================================================================ //
+
+/**
+ * Debounce timer for team selector search
+ */
+let teamSelectorSearchDebounceTimer = null;
+
+/**
+ * Search teams in the team selector dropdown
+ * @param {string} searchTerm - The search query
+ */
+function searchTeamSelector(searchTerm) {
+    // Debounce the search
+    if (teamSelectorSearchDebounceTimer) {
+        clearTimeout(teamSelectorSearchDebounceTimer);
+    }
+
+    teamSelectorSearchDebounceTimer = setTimeout(() => {
+        performTeamSelectorSearch(searchTerm);
+    }, 300);
+}
+
+/**
+ * Perform the team selector search
+ * @param {string} searchTerm - The search query
+ */
+function performTeamSelectorSearch(searchTerm) {
+    const container = document.getElementById("team-selector-items");
+    if (!container) {
+        console.error("team-selector-items container not found");
+        return;
+    }
+
+    // Build URL
+    const params = new URLSearchParams();
+    params.set("page", "1");
+    params.set("per_page", "20");
+    params.set("render", "selector");
+
+    if (searchTerm && searchTerm.trim() !== "") {
+        params.set("q", searchTerm.trim());
+    }
+
+    const url = `${window.ROOT_PATH || ""}/admin/teams/partial?${params.toString()}`;
+
+    // Use HTMX to load results
+    if (window.htmx) {
+        window.htmx.ajax("GET", url, {
+            target: "#team-selector-items",
+            swap: "innerHTML",
+        });
+    }
+}
+
+/**
+ * Select a team from the team selector dropdown
+ * @param {HTMLElement} button - The button element that was clicked
+ */
+function selectTeamFromSelector(button) {
+    const teamId = button.dataset.teamId;
+    const teamName = button.dataset.teamName;
+    const isPersonal = button.dataset.teamIsPersonal === "true";
+
+    // Update the Alpine.js component state
+    const selectorContainer = button.closest("[x-data]");
+    if (selectorContainer && selectorContainer.__x) {
+        const alpineData = selectorContainer.__x.$data;
+        alpineData.selectedTeam = teamId;
+        alpineData.selectedTeamName = (isPersonal ? "👤 " : "🏢 ") + teamName;
+        alpineData.open = false;
+    }
+
+    // Clear the search input
+    const searchInput = document.getElementById("team-selector-search");
+    if (searchInput) {
+        searchInput.value = "";
+    }
+
+    // Reset the loaded flag so next open reloads the list
+    const itemsContainer = document.getElementById("team-selector-items");
+    if (itemsContainer) {
+        delete itemsContainer.dataset.loaded;
+    }
+
+    // Call the existing updateTeamContext function (defined in admin.html)
+    if (typeof window.updateTeamContext === "function") {
+        window.updateTeamContext(teamId);
+    }
+}
+
+// Make team functions globally available
+window.serverSideTeamSearch = serverSideTeamSearch;
+window.filterByRelationship = filterByRelationship;
+window.filterTeams = filterTeams;
+window.searchTeamSelector = searchTeamSelector;
+window.selectTeamFromSelector = selectTeamFromSelector;

@@ -1,5 +1,5 @@
 {{- $targetVersion := .Values.postgres.upgrade.targetVersion | toString -}}
-{{- if and .Values.postgres.upgrade.enabled (eq $targetVersion "18") (not .Values.postgres.upgrade.backupCompleted) }}
+{{- if and .Values.postgres.upgrade.enabled (eq $targetVersion "18") (not .Values.postgres.upgrade.backupCompleted) (not .Values.postgres.external.enabled) }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,6 +15,9 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "mcp-stack.serviceAccountName" . }}
+      {{- end }}
       containers:
         - name: postgres-backup
           image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"

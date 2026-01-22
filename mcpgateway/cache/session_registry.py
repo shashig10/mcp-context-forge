@@ -783,6 +783,15 @@ class SessionRegistry(SessionBackend):
             except Exception as e:
                 logger.error(f"Database error during broadcast: {e}")
 
+    async def get_all_session_ids(self) -> list[str]:
+        """Return a snapshot list of all known local session IDs.
+
+        Returns:
+            list[str]: A snapshot list of currently known local session IDs.
+        """
+        async with self._lock:
+            return list(self._sessions.keys())
+
     def get_session_sync(self, session_id: str) -> Any:
         """Get session synchronously from local cache only.
 
@@ -863,12 +872,16 @@ class SessionRegistry(SessionBackend):
         elif self._backend == "memory":
             transport = self.get_session_sync(session_id)
             if transport and self._session_message:
-                data = orjson.loads(self._session_message.get("message"))
-                if isinstance(data, dict) and "message" in data:
-                    message = data["message"]
+                message_json = self._session_message.get("message")
+                if message_json:
+                    data = orjson.loads(message_json)
+                    if isinstance(data, dict) and "message" in data:
+                        message = data["message"]
+                    else:
+                        message = data
+                    await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
                 else:
-                    message = data
-                await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
+                    logger.warning(f"Session message stored but message content is None for session {session_id}")
 
         elif self._backend == "redis":
             if not self._redis:
@@ -1313,8 +1326,53 @@ class SessionRegistry(SessionBackend):
                 logger.error(f"Error in memory cleanup task: {e}")
                 await asyncio.sleep(300)  # Sleep longer on error
 
+    def _get_oauth_experimental_config(self, server_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Query OAuth configuration for a server (synchronous, run in threadpool).
+
+        This method queries the database for OAuth configuration and returns
+        RFC 9728-safe fields for advertising in MCP capabilities.
+
+        Args:
+            server_id: The server ID to query OAuth configuration for.
+
+        Returns:
+            Dict with 'oauth' key containing safe OAuth config, or None if not configured.
+        """
+        # First-Party
+        from mcpgateway.db import Server as DbServer  # pylint: disable=import-outside-toplevel
+        from mcpgateway.db import SessionLocal  # pylint: disable=import-outside-toplevel
+
+        db = SessionLocal()
+        try:
+            server = db.get(DbServer, server_id)
+            if server and getattr(server, "oauth_enabled", False) and getattr(server, "oauth_config", None):
+                # Filter oauth_config to RFC 9728-safe fields only (never expose secrets)
+                oauth_config = server.oauth_config
+                safe_oauth: Dict[str, Any] = {}
+
+                # Extract authorization servers
+                if oauth_config.get("authorization_servers"):
+                    safe_oauth["authorization_servers"] = oauth_config["authorization_servers"]
+                elif oauth_config.get("authorization_server"):
+                    safe_oauth["authorization_servers"] = [oauth_config["authorization_server"]]
+
+                # Extract scopes
+                scopes = oauth_config.get("scopes_supported") or oauth_config.get("scopes")
+                if scopes:
+                    safe_oauth["scopes_supported"] = scopes
+
+                # Add bearer methods
+                safe_oauth["bearer_methods_supported"] = oauth_config.get("bearer_methods_supported", ["header"])
+
+                if safe_oauth.get("authorization_servers"):
+                    logger.debug(f"Advertising OAuth capability for server {server_id}")
+                    return {"oauth": safe_oauth}
+            return None
+        finally:
+            db.close()
+
     # Handle initialize logic
-    async def handle_initialize_logic(self, body: Dict[str, Any], session_id: Optional[str] = None) -> InitializeResult:
+    async def handle_initialize_logic(self, body: Dict[str, Any], session_id: Optional[str] = None, server_id: Optional[str] = None) -> InitializeResult:
         """Process MCP protocol initialization request.
 
         Validates the protocol version and returns server capabilities and information.
@@ -1324,6 +1382,7 @@ class SessionRegistry(SessionBackend):
             body: Request body containing protocol_version and optional client_info.
                 Expected keys: 'protocol_version' or 'protocolVersion', 'capabilities'.
             session_id: Optional session ID to associate client capabilities with.
+            server_id: Optional server ID to query OAuth configuration for RFC 9728 support.
 
         Returns:
             InitializeResult containing protocol version, server capabilities, and server info.
@@ -1369,6 +1428,17 @@ class SessionRegistry(SessionBackend):
             await self.store_client_capabilities(session_id, client_capabilities)
             logger.debug(f"Stored capabilities for session {session_id}: {client_capabilities}")
 
+        # Build experimental capabilities (including OAuth if configured)
+        experimental: Optional[Dict[str, Dict[str, Any]]] = None
+
+        # Query OAuth configuration if server_id is provided
+        if server_id:
+            try:
+                # Run synchronous DB query in threadpool to avoid blocking the event loop
+                experimental = await asyncio.to_thread(self._get_oauth_experimental_config, server_id)
+            except Exception as e:
+                logger.warning(f"Failed to query OAuth config for server {server_id}: {e}")
+
         return InitializeResult(
             protocolVersion=protocol_version,
             capabilities=ServerCapabilities(
@@ -1377,6 +1447,7 @@ class SessionRegistry(SessionBackend):
                 tools={"listChanged": True},
                 logging={},
                 completions={},  # Advertise completions capability per MCP spec
+                experimental=experimental,  # OAuth capability when configured
             ),
             serverInfo=Implementation(name=settings.app_name, version=__version__),
             instructions=("MCP Gateway providing federated tools, resources and prompts. Use /admin interface for configuration."),
@@ -1479,15 +1550,17 @@ class SessionRegistry(SessionBackend):
                 "id": req_id,
             }
             # Get the token from the current authentication context
-            # The user object doesn't contain the token directly, we need to reconstruct it
-            # Since we don't have access to the original headers here, we need a different approach
-            # We'll extract the token from the session or create a new admin token
+            # The user object should contain auth_token, token_teams, and is_admin from the SSE endpoint
             token = None
+            token_teams = user.get("token_teams", [])  # Default to empty list, never None
+            is_admin = user.get("is_admin", False)  # Preserve admin status from SSE endpoint
+
             try:
-                if hasattr(user, "get") and "auth_token" in user:
+                if hasattr(user, "get") and user.get("auth_token"):
                     token = user["auth_token"]
                 else:
-                    # Fallback: create an admin token for internal RPC calls
+                    # Fallback: create token preserving the user's context (including admin status)
+                    logger.warning("No auth token available for SSE RPC call - creating fallback token")
                     now = datetime.now(timezone.utc)
                     payload = {
                         "sub": user.get("email", "system"),
@@ -1495,10 +1568,11 @@ class SessionRegistry(SessionBackend):
                         "aud": settings.jwt_audience,
                         "iat": int(now.timestamp()),
                         "jti": str(uuid.uuid4()),
+                        "teams": token_teams,  # Always a list - preserves token scope
                         "user": {
                             "email": user.get("email", "system"),
                             "full_name": user.get("full_name", "System"),
-                            "is_admin": True,  # Internal calls should have admin access
+                            "is_admin": is_admin,  # Preserve admin status for cookie-authenticated admins
                             "auth_provider": "internal",
                         },
                     }

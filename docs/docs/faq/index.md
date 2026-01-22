@@ -16,7 +16,7 @@
     OCI image (Docker/Podman) - shares host network so localhost works:
 
     ```bash
-    podman run --network=host -p 4444:4444 ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
+    podman run --network=host -p 4444:4444 ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-2
     ```
 
 ???+ example "🗂️ What URLs are available for the admin interface and API docs?"
@@ -72,7 +72,6 @@
     - Logging: `LOG_LEVEL`, `LOG_FORMAT`, `LOG_TO_FILE`, `LOG_FILE`, `LOG_FOLDER`, `LOG_ROTATION_ENABLED`, `LOG_MAX_SIZE_MB`, `LOG_BACKUP_COUNT`
     - Transport: `TRANSPORT_TYPE`, `WEBSOCKET_PING_INTERVAL`, `SSE_RETRY_TIMEOUT`
     - Tools: `TOOL_TIMEOUT`, `MAX_TOOL_RETRIES`, `TOOL_RATE_LIMIT`, `TOOL_CONCURRENT_LIMIT`
-    - Federation: `FEDERATION_ENABLED`, `FEDERATION_PEERS`, `FEDERATION_SYNC_INTERVAL`
 
 ---
 
@@ -112,7 +111,7 @@
     Include a persistent volume with your container or Kubernetes deployment. Ex:
 
     ```bash
-    docker run -v $(pwd)/data:/app ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
+    docker run -v $(pwd)/data:/app ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-2
     ```
 
     For production use, we recommend PostgreSQL. A Docker Compose target with PostgreSQL and Redis is provided.
@@ -247,6 +246,23 @@
     | database is locked    | Use Postgres / increase DB_POOL_SIZE   |
     | already exists errors | Use *Show inactive* toggle in UI       |
     | SSE drops every 30 s  | Raise `SSE_RETRY_TIMEOUT`              |
+
+???+ example "🔄 What happens if the database or Redis is temporarily unavailable?"
+    The gateway uses **exponential backoff with jitter** for connection retries at startup:
+
+    - **Retry pattern**: 2s → 4s → 8s → 16s → 30s (capped), with ±25% random jitter
+    - **Default**: 30 retries ≈ 5 minutes total wait before worker exits
+    - **Benefit**: Prevents CPU-intensive crash-respawn loops during dependency outages
+
+    Configuration:
+    ```bash
+    DB_MAX_RETRIES=30              # Database retry attempts (default: 30)
+    DB_RETRY_INTERVAL_MS=2000      # Base interval, doubles each attempt
+    REDIS_MAX_RETRIES=30           # Redis retry attempts (default: 30)
+    REDIS_RETRY_INTERVAL_MS=2000   # Base interval, doubles each attempt
+    ```
+
+    See [Performance Architecture › Startup Resilience](../architecture/performance-architecture.md#startup-resilience) for details.
 
 ---
 

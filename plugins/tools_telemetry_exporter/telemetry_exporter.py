@@ -8,12 +8,13 @@ This plugin exports comprehensive tool invocation telemetry to OpenTelemetry.
 """
 
 # Standard
-import json
 from typing import Dict
 
+# Third-Party
+import orjson
+
 # First-Party
-from mcpgateway.common.models import Gateway, Tool
-from mcpgateway.plugins.framework import Plugin, PluginConfig, PluginContext
+from mcpgateway.plugins.framework import get_attr, Plugin, PluginConfig, PluginContext
 from mcpgateway.plugins.framework.constants import GATEWAY_METADATA, TOOL_METADATA
 from mcpgateway.plugins.framework.hooks.tools import ToolPostInvokePayload, ToolPostInvokeResult, ToolPreInvokePayload, ToolPreInvokeResult
 from mcpgateway.services.logging_service import LoggingService
@@ -80,20 +81,20 @@ class ToolsTelemetryExporterPlugin(Plugin):
             Dictionary with base attributes plus tool and target MCP server details.
         """
         global_context = context.global_context
-        tool_metadata: Tool = global_context.metadata.get(TOOL_METADATA)
-        target_mcp_server_metadata: Gateway = global_context.metadata.get(GATEWAY_METADATA)
+        tool_metadata = global_context.metadata.get(TOOL_METADATA)
+        target_mcp_server_metadata = global_context.metadata.get(GATEWAY_METADATA)
 
         return {
             **self._get_base_context_attributes(context),
             "tool": {
-                "name": tool_metadata.name or "",
-                "target_tool_name": tool_metadata.original_name or "",
-                "description": tool_metadata.description or "",
+                "name": get_attr(tool_metadata, "name"),
+                "target_tool_name": get_attr(tool_metadata, "original_name"),
+                "description": get_attr(tool_metadata, "description"),
             },
             "target_mcp_server": {
-                "id": target_mcp_server_metadata.id or "",
-                "name": target_mcp_server_metadata.name or "",
-                "url": str(target_mcp_server_metadata.url or ""),
+                "id": get_attr(target_mcp_server_metadata, "id"),
+                "name": get_attr(target_mcp_server_metadata, "name"),
+                "url": str(get_attr(target_mcp_server_metadata, "url")),
             },
         }
 
@@ -134,7 +135,7 @@ class ToolsTelemetryExporterPlugin(Plugin):
             "tool.name": context_attributes["tool"]["name"],
             "tool.target_tool_name": context_attributes["tool"]["target_tool_name"],
             "tool.description": context_attributes["tool"]["description"],
-            "tool.invocation.args": json.dumps(payload.args),
+            "tool.invocation.args": orjson.dumps(payload.args, default=str).decode(),
             "headers": payload.headers.model_dump_json() if payload.headers else "{}",
         }
 
@@ -167,7 +168,7 @@ class ToolsTelemetryExporterPlugin(Plugin):
             max_payload_bytes_size = self.telemetry_config.get("max_payload_bytes_size", 10000)
             result_content = result.get("content")
             if result_content:
-                result_content_str = json.dumps(result_content, default=str)
+                result_content_str = orjson.dumps(result_content, default=str).decode()
                 if len(result_content_str) <= max_payload_bytes_size:
                     export_attributes["tool.invocation.result"] = result_content_str
                 else:

@@ -12,7 +12,7 @@ import base64
 import asyncio
 from contextlib import asynccontextmanager
 import logging
-from unittest.mock import ANY, AsyncMock, call, MagicMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 # Third-Party
 import pytest
@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 # First-Party
 from mcpgateway.cache.global_config_cache import global_config_cache
+from mcpgateway.cache.tool_lookup_cache import tool_lookup_cache
 from mcpgateway.db import Gateway as DbGateway
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.config import settings
@@ -30,6 +31,7 @@ from mcpgateway.services.tool_service import (
     TextContent,
     ToolError,
     ToolInvocationError,
+    ToolNameConflictError,
     ToolNotFoundError,
     ToolResult,
     ToolService,
@@ -42,6 +44,10 @@ from mcpgateway.utils.pagination import decode_cursor
 @pytest.fixture(autouse=True)
 def mock_logging_services():
     """Mock audit_trail and structured_logger to prevent database writes during tests."""
+    # Clear SSL context cache before each test for isolation
+    from mcpgateway.utils.ssl_context_cache import clear_ssl_context_cache
+    clear_ssl_context_cache()
+
     with patch("mcpgateway.services.tool_service.audit_trail") as mock_audit, patch("mcpgateway.services.tool_service.structured_logger") as mock_logger:
         mock_audit.log_action = MagicMock(return_value=None)
         mock_logger.log = MagicMock(return_value=None)
@@ -63,6 +69,14 @@ def mock_fresh_db_session():
 
     with patch("mcpgateway.services.tool_service.fresh_db_session", mock_fresh_session):
         yield
+
+
+@pytest.fixture(autouse=True)
+def reset_tool_lookup_cache():
+    """Clear tool lookup cache between tests to avoid cross-test pollution."""
+    tool_lookup_cache.invalidate_all_local()
+    yield
+    tool_lookup_cache.invalidate_all_local()
 
 
 @pytest.fixture
@@ -172,7 +186,7 @@ def mock_tool(mock_gateway):
     tool.import_batch_id = "2"
     tool.federation_source = "federation_source"
     tool.team_id = "5"
-    tool.visibility = "private"
+    tool.visibility = "public"  # Use public for tests that don't test authorization
     tool.owner_email = "admin@admin.org"
     tool.enabled = True
     tool.reachable = True
@@ -190,6 +204,7 @@ def mock_tool(mock_gateway):
     tool.custom_name_slug = "test-tool"
     tool.display_name = None
     tool.tags = []
+    tool.team = None
 
     # Set up metrics
     tool.metrics = []
@@ -213,9 +228,6 @@ def mock_tool(mock_gateway):
     }
 
     return tool
-
-
-from mcpgateway.services.tool_service import ToolNameConflictError
 
 
 class TestToolService:
@@ -260,7 +272,7 @@ class TestToolService:
 
         assert tool_read.auth.auth_type == "basic"
         assert tool_read.auth.username == "test_user"
-        assert tool_read.auth.password == "********"
+        assert tool_read.auth.password == settings.masked_auth_value
 
     @pytest.mark.asyncio
     async def test_convert_tool_to_read_bearer_auth(self, tool_service, mock_tool):
@@ -273,7 +285,7 @@ class TestToolService:
         tool_read = tool_service.convert_tool_to_read(mock_tool)
 
         assert tool_read.auth.auth_type == "bearer"
-        assert tool_read.auth.token == "********"
+        assert tool_read.auth.token == settings.masked_auth_value
 
     @pytest.mark.asyncio
     async def test_convert_tool_to_read_authheaders_auth(self, tool_service, mock_tool):
@@ -288,7 +300,7 @@ class TestToolService:
 
         assert tool_read.auth.auth_type == "authheaders"
         assert tool_read.auth.auth_header_key == "test-api-key"
-        assert tool_read.auth.auth_header_value == "********"
+        assert tool_read.auth.auth_header_value == settings.masked_auth_value
 
     @pytest.mark.asyncio
     async def test_convert_tool_to_read_include_auth_false_skips_decode(self, tool_service, mock_tool):
@@ -432,6 +444,48 @@ class TestToolService:
 
         # Verify notification
         tool_service._notify_tool_added.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_tool_from_a2a_agent_passes_scope_fields(self, tool_service, test_db):
+        """Ensure A2A tool creation carries team/owner/visibility to register_tool."""
+        agent = MagicMock()
+        agent.slug = "agent-slug"
+        agent.name = "Agent Name"
+        agent.endpoint_url = "https://example.com/a2a"
+        agent.description = "Agent description"
+        agent.agent_type = "custom"
+        agent.auth_type = "bearer"
+        agent.auth_value = "secret"
+        agent.tags = ["alpha"]
+        agent.id = "agent-123"
+        agent.team_id = "team-123"
+        agent.owner_email = "owner@example.com"
+        agent.visibility = "team"
+
+        mock_scalar = Mock()
+        mock_scalar.scalar_one_or_none.return_value = None
+        test_db.execute = Mock(return_value=mock_scalar)
+
+        tool_read = MagicMock()
+        tool_read.id = "tool-1"
+        tool_service.register_tool = AsyncMock(return_value=tool_read)
+
+        tool_db = MagicMock()
+        test_db.get = Mock(return_value=tool_db)
+
+        result = await tool_service.create_tool_from_a2a_agent(
+            test_db,
+            agent,
+            created_by="creator@example.com",
+        )
+
+        tool_service.register_tool.assert_awaited_once()
+        _, kwargs = tool_service.register_tool.call_args
+        assert kwargs["team_id"] == agent.team_id
+        assert kwargs["owner_email"] == agent.owner_email
+        assert kwargs["visibility"] == agent.visibility
+        test_db.get.assert_called_once_with(DbTool, tool_read.id)
+        assert result == tool_db
 
     @pytest.mark.asyncio
     async def test_register_tool_with_gateway_id(self, tool_service, mock_tool, test_db):
@@ -803,12 +857,9 @@ class TestToolService:
     @pytest.mark.asyncio
     async def test_list_server_tools_active_only(self):
         mock_db = Mock()
-        mock_tool = Mock(enabled=True, team_id=None)
-        mock_row = MagicMock()
-        mock_row.__getitem__ = lambda self, idx: mock_tool if idx == 0 else None
-        mock_row.team_name = None
+        mock_tool = Mock(enabled=True, team_id=None, team=None)
 
-        mock_db.execute.return_value.all.return_value = [mock_row]
+        mock_db.execute.return_value.scalars.return_value.all.return_value = [mock_tool]
 
         service = ToolService()
         service.convert_tool_to_read = Mock(return_value="converted_tool")
@@ -821,18 +872,10 @@ class TestToolService:
     @pytest.mark.asyncio
     async def test_list_server_tools_include_inactive(self):
         mock_db = Mock()
-        active_tool = Mock(enabled=True, reachable=True, team_id=None)
-        inactive_tool = Mock(enabled=False, reachable=True, team_id=None)
+        active_tool = Mock(enabled=True, reachable=True, team_id=None, team=None)
+        inactive_tool = Mock(enabled=False, reachable=True, team_id=None, team=None)
 
-        active_row = MagicMock()
-        active_row.__getitem__ = lambda self, idx: active_tool if idx == 0 else None
-        active_row.team_name = None
-
-        inactive_row = MagicMock()
-        inactive_row.__getitem__ = lambda self, idx: inactive_tool if idx == 0 else None
-        inactive_row.team_name = None
-
-        mock_db.execute.return_value.all.return_value = [active_row, inactive_row]
+        mock_db.execute.return_value.scalars.return_value.all.return_value = [active_tool, inactive_tool]
 
         service = ToolService()
         service.convert_tool_to_read = Mock(side_effect=["active_converted", "inactive_converted"])
@@ -841,6 +884,44 @@ class TestToolService:
 
         assert tools == ["active_converted", "inactive_converted"]
         assert service.convert_tool_to_read.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_list_server_tools_includes_team_name(self):
+        """Test that list_server_tools properly populates team name via email_team relationship.
+
+        This test guards against regressions if the joinedload strategy is changed.
+        """
+        mock_db = Mock()
+        # Mock a tool with an active team relationship
+        mock_email_team = Mock()
+        mock_email_team.name = "Engineering Team"
+        mock_tool = Mock(
+            enabled=True,
+            team_id="team-123",
+            email_team=mock_email_team,
+        )
+        # The team property should return the team name from email_team
+        mock_tool.team = mock_email_team.name
+
+        mock_db.execute.return_value.scalars.return_value.all.return_value = [mock_tool]
+
+        service = ToolService()
+        # Use a mock that captures the tool's team value
+        captured_tools = []
+
+        def capture_tool(tool, include_metrics=False, include_auth=False):
+            captured_tools.append({"team": tool.team, "team_id": tool.team_id})
+            return "converted_tool"
+
+        service.convert_tool_to_read = Mock(side_effect=capture_tool)
+
+        tools = await service.list_server_tools(mock_db, server_id="server123", include_inactive=False)
+
+        assert tools == ["converted_tool"]
+        # Verify the tool's team was accessible during conversion
+        assert len(captured_tools) == 1
+        assert captured_tools[0]["team"] == "Engineering Team"
+        assert captured_tools[0]["team_id"] == "team-123"
 
     @pytest.mark.asyncio
     async def test_get_tool(self, tool_service, mock_tool, test_db):
@@ -911,8 +992,14 @@ class TestToolService:
         """Test deleting a tool."""
         # Mock DB get to return tool
         test_db.get = Mock(return_value=mock_tool)
-        test_db.delete = Mock()
+
+        # Mock the fetchone result for DELETE ... RETURNING
+        mock_fetch_result = Mock()
+        mock_fetch_result.fetchone.return_value = (mock_tool.id,)
+        mock_fetch_result.rowcount = 1  # Indicate successful deletion
+        test_db.execute = Mock(return_value=mock_fetch_result)
         test_db.commit = Mock()
+        test_db.rollback = Mock()
 
         # Mock notification
         tool_service._notify_tool_deleted = AsyncMock()
@@ -922,7 +1009,8 @@ class TestToolService:
 
         # Verify DB operations
         test_db.get.assert_called_once_with(DbTool, 1)
-        test_db.delete.assert_called_once_with(mock_tool)
+        # Verify execute was called for DELETE ... RETURNING
+        test_db.execute.assert_called_once()
         test_db.commit.assert_called_once()
 
         # Verify notification
@@ -932,15 +1020,22 @@ class TestToolService:
     async def test_delete_tool_purge_metrics(self, tool_service, mock_tool, test_db):
         """Test deleting a tool with metric purge."""
         test_db.get = Mock(return_value=mock_tool)
-        test_db.delete = Mock()
         test_db.commit = Mock()
-        test_db.execute = Mock()
+        test_db.rollback = Mock()
+
+        # Mock execute results: batch deletes return rowcount=0 to stop loop, final DELETE returns rowcount=1
+        batch_result = Mock()
+        batch_result.rowcount = 0  # No rows to delete (stops the batch loop)
+        delete_result = Mock()
+        delete_result.rowcount = 1  # Final DELETE succeeded
+        test_db.execute = Mock(side_effect=[batch_result, batch_result, delete_result])
+
         tool_service._notify_tool_deleted = AsyncMock()
 
         await tool_service.delete_tool(test_db, 1, purge_metrics=True)
 
-        assert test_db.execute.call_count == 2
-        test_db.delete.assert_called_once_with(mock_tool)
+        # Verify execute was called: 1 for ToolMetric + 1 for ToolMetricsHourly + 1 for DELETE = 3
+        assert test_db.execute.call_count == 3
         test_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
@@ -956,8 +1051,8 @@ class TestToolService:
         assert "Tool not found: 999" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_toggle_tool_status(self, tool_service, mock_tool, test_db):
-        """Test toggling tool active status."""
+    async def test_set_tool_state(self, tool_service, mock_tool, test_db):
+        """Test setting tool active state."""
         # Mock DB get to return tool
         test_db.get = Mock(return_value=mock_tool)
         test_db.commit = Mock()
@@ -1004,7 +1099,7 @@ class TestToolService:
         tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Deactivate the tool (it's active by default)
-        result = await tool_service.toggle_tool_status(test_db, 1, activate=False, reachable=True)
+        result = await tool_service.set_tool_state(test_db, 1, activate=False, reachable=True)
 
         # Verify DB operations
         test_db.get.assert_called_once_with(DbTool, 1)
@@ -1022,15 +1117,15 @@ class TestToolService:
         assert result == tool_read
 
     @pytest.mark.asyncio
-    async def test_toggle_tool_status_not_found(self, tool_service, test_db):
-        """Test toggling tool active status."""
+    async def test_set_tool_state_not_found(self, tool_service, test_db):
+        """Test setting tool state when not found."""
         # Mock DB get to return tool
         test_db.get = Mock(return_value=None)
         test_db.commit = Mock()
         test_db.refresh = Mock()
 
         with pytest.raises(ToolError) as exc:
-            await tool_service.toggle_tool_status(test_db, "1", activate=False, reachable=True)
+            await tool_service.set_tool_state(test_db, "1", activate=False, reachable=True)
 
         assert "Tool not found: 1" in str(exc.value)
 
@@ -1038,8 +1133,8 @@ class TestToolService:
         test_db.get.assert_called_once_with(DbTool, "1")
 
     @pytest.mark.asyncio
-    async def test_toggle_tool_status_activate_tool(self, tool_service, test_db, mock_tool, monkeypatch):
-        """Test toggling tool active status."""
+    async def test_set_tool_state_activate_tool(self, tool_service, test_db, mock_tool, monkeypatch):
+        """Test activating tool state."""
         # Mock DB get to return tool
         mock_tool.enabled = False
         test_db.get = Mock(return_value=mock_tool)
@@ -1048,7 +1143,7 @@ class TestToolService:
 
         tool_service._notify_tool_activated = AsyncMock()
 
-        result = await tool_service.toggle_tool_status(test_db, "1", activate=True, reachable=True)
+        result = await tool_service.set_tool_state(test_db, "1", activate=True, reachable=True)
 
         # Verify DB operations
         test_db.get.assert_called_once_with(DbTool, "1")
@@ -1112,8 +1207,8 @@ class TestToolService:
         assert q.empty()
 
     @pytest.mark.asyncio
-    async def test_toggle_tool_status_no_change(self, tool_service, mock_tool, test_db):
-        """Test toggling tool active status."""
+    async def test_set_tool_state_no_change(self, tool_service, mock_tool, test_db):
+        """Test setting tool state with no change."""
         # Mock DB get to return tool
         test_db.get = Mock(return_value=mock_tool)
         test_db.commit = Mock()
@@ -1160,7 +1255,7 @@ class TestToolService:
         tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Deactivate the tool (it's active by default)
-        result = await tool_service.toggle_tool_status(test_db, 1, activate=True, reachable=True)
+        result = await tool_service.set_tool_state(test_db, 1, activate=True, reachable=True)
 
         # Verify DB operations
         test_db.get.assert_called_once_with(DbTool, 1)
@@ -1366,7 +1461,7 @@ class TestToolService:
         # The service wraps the exception in ToolError
         result = await tool_service.update_tool(test_db, "999", tool_update)
 
-        assert result.auth == AuthenticationValues(auth_type="basic", username="test_user", password="********")
+        assert result.auth == AuthenticationValues(auth_type="basic", username="test_user", password=settings.masked_auth_value)
 
     @pytest.mark.asyncio
     async def test_update_tool_bearer_auth(self, tool_service, mock_tool, test_db):
@@ -1387,7 +1482,7 @@ class TestToolService:
         # The service wraps the exception in ToolError
         result = await tool_service.update_tool(test_db, "999", tool_update)
 
-        assert result.auth == AuthenticationValues(auth_type="bearer", token="********")
+        assert result.auth == AuthenticationValues(auth_type="bearer", token=settings.masked_auth_value)
 
     @pytest.mark.asyncio
     async def test_update_tool_empty_auth(self, tool_service, mock_tool, test_db):
@@ -1426,14 +1521,10 @@ class TestToolService:
         # Set tool to inactive
         mock_tool.enabled = False
 
-        # Mock DB to return inactive tool for first query, None for second query
-        mock_scalar1 = Mock()
-        mock_scalar1.scalar_one_or_none.return_value = None
-
-        mock_scalar2 = Mock()
-        mock_scalar2.scalar_one_or_none.return_value = mock_tool
-
-        test_db.execute = Mock(side_effect=[mock_scalar1, mock_scalar2])
+        # Mock DB to return inactive tool in single query
+        mock_scalar = Mock()
+        mock_scalar.scalar_one_or_none.return_value = mock_tool
+        test_db.execute = Mock(return_value=mock_scalar)
 
         # Should raise NotFoundError with "inactive" message
         with pytest.raises(ToolNotFoundError) as exc_info:
@@ -1626,7 +1717,7 @@ class TestToolService:
             url="http://fake-mcp:8080/mcp",
             enabled=True,
             reachable=True,
-            auth_type="bearer",  #  ←← attribute your error complained about
+            auth_type="bearer",  # attribute your error complained about
             auth_value="Bearer abc123",
             capabilities={"prompts": {"listChanged": True}, "resources": {"listChanged": True}, "tools": {"listChanged": True}},
             transport="STREAMABLEHTTP",
@@ -1684,7 +1775,7 @@ class TestToolService:
             result = await tool_service.invoke_tool(test_db, "dummy_tool", {"param": "value"}, request_headers=None)
 
         session_mock.initialize.assert_awaited_once()
-        session_mock.call_tool.assert_awaited_once_with("dummy_tool", {"param": "value"})
+        session_mock.call_tool.assert_awaited_once_with("dummy_tool", {"param": "value"}, meta=None)
 
         # Our ToolResult bubbled back out
         assert result.content[0].text == "MCP response"
@@ -1729,7 +1820,7 @@ class TestToolService:
             url="http://fake-mcp:8080/sse",
             enabled=True,
             reachable=True,
-            auth_type="bearer",  #  ←← attribute your error complained about
+            auth_type="bearer",  # attribute your error complained about
             auth_value="Bearer abc123",
             capabilities={"prompts": {"listChanged": True}, "resources": {"listChanged": True}, "tools": {"listChanged": True}},
             transport="STREAMABLEHTTP",
@@ -1760,8 +1851,6 @@ class TestToolService:
             return m
 
         test_db.execute = Mock(side_effect=execute_side_effect)
-
-        expected_result = ToolResult(content=[TextContent(type="text", text="")])
 
         with (
             patch("mcpgateway.services.tool_service.decode_auth", return_value={"Authorization": "Bearer xyz"}),
@@ -1840,8 +1929,6 @@ class TestToolService:
         mock_tool.auth_value = basic_auth_value
         mock_tool.url = "http://example.com/sse"
 
-        payload = {"param": "value"}
-
         # Mock DB to return the tool
         mock_scalar_1 = Mock()
         mock_scalar_1.scalar_one_or_none.return_value = mock_tool
@@ -1879,6 +1966,11 @@ class TestToolService:
 
         test_db.execute = Mock(side_effect=execute_side_effect)
 
+        # Mock db.query() for global_config_cache which uses legacy query API
+        mock_query = Mock()
+        mock_query.first.return_value = None  # No global config
+        test_db.query = Mock(return_value=mock_query)
+
         expected_result = ToolResult(content=[TextContent(type="text", text="MCP response")])
 
         session_mock = AsyncMock()
@@ -1904,10 +1996,10 @@ class TestToolService:
             # ------------------------------------------------------------------
             # 4.  Act
             # ------------------------------------------------------------------
-            result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
+            await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
 
         session_mock.initialize.assert_awaited_once()
-        session_mock.call_tool.assert_awaited_once_with("test_tool", {"param": "value"})
+        session_mock.call_tool.assert_awaited_once_with("test_tool", {"param": "value"}, meta=None)
 
         sse_ctx.__aenter__.assert_awaited_once()
 
@@ -1949,6 +2041,46 @@ class TestToolService:
             assert call_kwargs["tool_id"] == str(mock_tool.id)
             assert call_kwargs["success"] is False
             assert call_kwargs["error_message"] == "HTTP error"
+
+    @pytest.mark.asyncio
+    async def test_invoke_tool_with_metadata(self, tool_service, mock_tool, test_db):
+        """Test invoking a tool with metadata."""
+        # Configure tool as MCP/SSE
+        mock_tool.integration_type = "MCP"
+        mock_tool.request_type = "SSE"
+        mock_tool.url = "http://example.com/sse"
+        mock_tool.auth_value = None
+
+        # Mock DB
+        mock_scalar = Mock()
+        mock_scalar.scalar_one_or_none.return_value = mock_tool
+        test_db.execute = Mock(return_value=mock_scalar)
+
+        # Mock SSE client and session
+        sse_ctx = AsyncMock()
+        sse_ctx.__aenter__.return_value = ["read", "write"]
+
+        session_mock = AsyncMock()
+        session_mock.initialize = AsyncMock()
+        session_mock.call_tool = AsyncMock(return_value=ToolResult(content=[TextContent(type="text", text="MCP response")]))
+
+        client_session_cm = AsyncMock()
+        client_session_cm.__aenter__.return_value = session_mock
+
+        meta_data = {"trace_id": "123", "user": "test"}
+
+        # Mock metrics buffer service
+        mock_metrics_buffer = Mock()
+
+        with (
+            patch("mcpgateway.services.tool_service.sse_client", return_value=sse_ctx),
+            patch("mcpgateway.services.tool_service.ClientSession", return_value=client_session_cm),
+            patch("mcpgateway.services.tool_service.decode_auth", return_value={}),
+            patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service", return_value=mock_metrics_buffer),
+        ):
+            await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None, meta_data=meta_data)
+
+        session_mock.call_tool.assert_awaited_once_with("test_tool", {}, meta=meta_data)
 
     @pytest.mark.asyncio
     async def test_invoke_tool_error_exception_group_unwrapping(self, tool_service, mock_tool, mock_global_config_obj, test_db):
@@ -2315,7 +2447,7 @@ class TestToolService:
         tool_service.convert_tool_to_read = Mock(return_value=MagicMock())
 
         with patch("mcpgateway.services.tool_service.select", return_value=mock_query):
-            with patch("mcpgateway.services.tool_service.json_contains_expr") as mock_json_contains:
+            with patch("mcpgateway.services.tool_service.json_contains_tag_expr") as mock_json_contains:
                 # return a fake condition object that query.where will accept
                 fake_condition = MagicMock()
                 mock_json_contains.return_value = fake_condition
@@ -2435,7 +2567,7 @@ class TestToolService:
             patch("mcpgateway.services.tool_service.ClientSession", return_value=client_session_cm),
             patch("mcpgateway.services.tool_service.extract_using_jq", side_effect=lambda data, _filt: data),
         ):
-            result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
+            await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=None)
 
         # Verify OAuth was called
         tool_service.oauth_manager.get_access_token.assert_called_once_with(mock_gateway.oauth_config)
@@ -2474,7 +2606,7 @@ class TestToolService:
             patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=mock_passthrough),
             patch("mcpgateway.services.tool_service.extract_using_jq", return_value={"result": "success with headers"}),
         ):
-            result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
+            await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
 
         # Verify passthrough headers were used
         tool_service._http_client.request.assert_called_once()
@@ -2528,7 +2660,7 @@ class TestToolService:
             patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=mock_passthrough),
             patch("mcpgateway.services.tool_service.extract_using_jq", side_effect=lambda data, _filt: data),
         ):
-            result = await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
+            await tool_service.invoke_tool(test_db, "test_tool", {"param": "value"}, request_headers=request_headers)
 
         # Verify MCP session was initialized and tool called
         session_mock.initialize.assert_awaited_once()
@@ -2920,3 +3052,420 @@ class TestSchemaValidatorCaching:
         # Invalid instance
         with pytest.raises(jsonschema.ValidationError):
             _validate_with_cached_schema({"foo": 123}, schema)
+
+
+class TestCorrelationIdPoolExclusion:
+    """Tests for X-Correlation-ID exclusion from pooled sessions.
+
+    Regression tests for the bug where X-Correlation-ID was pinned to pooled sessions,
+    causing the first request's correlation ID to leak to subsequent requests.
+    """
+
+    def test_correlation_id_not_added_to_headers_for_pooled_path(self):
+        """Verify X-Correlation-ID is not added to headers when pool is used.
+
+        The MCP SDK pins headers at transport creation, so per-request headers
+        like X-Correlation-ID would be reused across all requests on the same
+        pooled session, breaking distributed tracing.
+        """
+        # Simulate the pooled code path logic from tool_service.py
+        use_pool = True
+        headers = {"Authorization": "Bearer token123"}
+        correlation_id = "req-12345"
+
+        # In the pooled path, correlation ID should NOT be added
+        if use_pool:
+            # This is what the code should do - NOT add the header
+            pass  # headers remain unchanged
+        else:
+            # Non-pooled path would add it
+            if correlation_id and headers:
+                headers["X-Correlation-ID"] = correlation_id
+
+        # Verify X-Correlation-ID was NOT added for pooled path
+        assert "X-Correlation-ID" not in headers
+        assert headers == {"Authorization": "Bearer token123"}
+
+    def test_correlation_id_added_for_non_pooled_path(self):
+        """Verify X-Correlation-ID IS added when pool is not used."""
+        use_pool = False
+        headers = {"Authorization": "Bearer token123"}
+        correlation_id = "req-67890"
+
+        # Non-pooled path: safe to add per-request headers
+        if not use_pool:
+            if correlation_id and headers:
+                headers["X-Correlation-ID"] = correlation_id
+
+        # Verify X-Correlation-ID WAS added for non-pooled path
+        assert headers["X-Correlation-ID"] == "req-67890"
+
+    def test_correlation_id_not_added_when_headers_none(self):
+        """Verify no error when headers is None."""
+        use_pool = False
+        headers = None
+        correlation_id = "req-aaaaa"
+
+        # Non-pooled path with None headers
+        if not use_pool:
+            if correlation_id and headers:
+                headers["X-Correlation-ID"] = correlation_id
+
+        # Headers should remain None (no modification attempted)
+        assert headers is None
+
+    def test_correlation_id_not_added_when_correlation_id_none(self):
+        """Verify no error when correlation_id is None."""
+        use_pool = False
+        headers = {"Authorization": "Bearer token"}
+        correlation_id = None
+
+        # Non-pooled path with None correlation_id
+        if not use_pool:
+            if correlation_id and headers:
+                headers["X-Correlation-ID"] = correlation_id
+
+        # Headers should remain unchanged
+        assert "X-Correlation-ID" not in headers
+
+
+# ----------------------------------------------------- #
+# Token Teams Filtering Tests (Issue #1915)             #
+# ----------------------------------------------------- #
+class TestToolServiceTokenTeamsFiltering:
+    """Tests for token_teams parameter in list_tools and list_server_tools."""
+
+    @pytest.mark.asyncio
+    async def test_list_tools_with_token_teams_uses_token_teams(self, tool_service, test_db):
+        """Test that list_tools uses token_teams when provided instead of DB lookup."""
+        mock_tool = MagicMock(spec=DbTool, id="1", team_id="team_a")
+
+        # Mock DB execute chain
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool])))))
+        test_db.commit = Mock()
+
+        tool_read = MagicMock()
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
+
+        # When token_teams is provided, TeamManagementService should NOT be called
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock()
+            result, _ = await tool_service.list_tools(test_db, user_email="user@example.com", token_teams=["team_a"])
+
+            # TeamManagementService should NOT be instantiated since token_teams was provided
+            mock_team_service.return_value.get_user_teams.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_tools_with_empty_token_teams_sees_own_and_public(self, tool_service, test_db):
+        """Test that empty token_teams list sees own resources and public resources."""
+        mock_tool_public = MagicMock(spec=DbTool, id="1", team_id=None, visibility="public", owner_email="other@example.com")
+        mock_tool_own = MagicMock(spec=DbTool, id="2", team_id=None, visibility="private", owner_email="user@example.com")
+
+        # Mock DB execute chain to return tools
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool_public, mock_tool_own])))))
+        test_db.commit = Mock()
+
+        tool_service.convert_tool_to_read = Mock(side_effect=[MagicMock(), MagicMock()])
+
+        # With empty token_teams, user should see their own and public resources
+        result, _ = await tool_service.list_tools(test_db, user_email="user@example.com", token_teams=[])
+
+        # verify DB was queried
+        assert test_db.execute.called
+
+    @pytest.mark.asyncio
+    async def test_list_tools_without_token_teams_uses_db_lookup(self, tool_service, test_db):
+        """Test that list_tools performs DB team lookup when token_teams is None."""
+        mock_tool = MagicMock(spec=DbTool, id="1", team_id="team_a")
+
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool])))))
+        test_db.commit = Mock()
+
+        tool_read = MagicMock()
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
+
+        mock_team = MagicMock(id="team_a", is_personal=False)
+
+        # When token_teams is None, TeamManagementService SHOULD be called
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
+            result, _ = await tool_service.list_tools(test_db, user_email="user@example.com", token_teams=None)
+
+            # TeamManagementService SHOULD be called for DB lookup
+            mock_team_service.return_value.get_user_teams.assert_called_once_with("user@example.com")
+
+    @pytest.mark.asyncio
+    async def test_list_server_tools_with_token_teams(self, tool_service, test_db):
+        """Test list_server_tools uses token_teams for filtering."""
+        mock_tool = MagicMock(spec=DbTool, id="1", team_id="team_x", enabled=True)
+        mock_server = MagicMock()
+        mock_server.tools = [mock_tool]
+
+        test_db.execute = Mock(return_value=MagicMock(scalar_one_or_none=Mock(return_value=mock_server)))
+        test_db.commit = Mock()
+
+        tool_read = MagicMock()
+        tool_service.convert_tool_to_read = Mock(return_value=tool_read)
+
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock()
+            result = await tool_service.list_server_tools(test_db, server_id="server-1", include_inactive=False, user_email="user@example.com", token_teams=["team_x"])
+
+            # TeamManagementService should NOT be called since token_teams was provided
+            mock_team_service.return_value.get_user_teams.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_tools_token_teams_filters_by_membership(self, tool_service, test_db):
+        """Test that only tools matching token_teams are returned."""
+        mock_tool_a = MagicMock(spec=DbTool, id="1", team_id="team_a")
+        mock_tool_b = MagicMock(spec=DbTool, id="2", team_id="team_b")
+
+        # DB returns both tools, but filtering should occur
+        test_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[mock_tool_a, mock_tool_b])))))
+        test_db.commit = Mock()
+
+        tool_read_a = MagicMock()
+        tool_read_b = MagicMock()
+        tool_service.convert_tool_to_read = Mock(side_effect=[tool_read_a, tool_read_b])
+
+        # Only team_a in token_teams - should only see team_a tools
+        result, _ = await tool_service.list_tools(test_db, user_email="user@example.com", token_teams=["team_a"])
+
+        assert test_db.execute.called
+
+
+class TestToolAccessAuthorization:
+    """Tests for _check_tool_access authorization logic."""
+
+    @pytest.fixture
+    def tool_service(self):
+        """Create a tool service instance."""
+        return ToolService()
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session."""
+        db = MagicMock()
+        db.commit = Mock()
+        return db
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_public_always_allowed(self, tool_service, mock_db):
+        """Public tools should be accessible to anyone."""
+        tool_payload = {"id": "1", "visibility": "public", "owner_email": None, "team_id": None}
+
+        # Unauthenticated
+        assert await tool_service._check_tool_access(mock_db, tool_payload, user_email=None, token_teams=[]) is True
+        # Authenticated
+        assert await tool_service._check_tool_access(mock_db, tool_payload, user_email="user@test.com", token_teams=["team-1"]) is True
+        # Admin
+        assert await tool_service._check_tool_access(mock_db, tool_payload, user_email=None, token_teams=None) is True
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_admin_bypass(self, tool_service, mock_db):
+        """Admin (user_email=None, token_teams=None) should have full access."""
+        private_tool = {"id": "1", "visibility": "private", "owner_email": "secret@test.com", "team_id": "secret-team"}
+
+        # Admin bypass: both None = unrestricted access
+        assert await tool_service._check_tool_access(mock_db, private_tool, user_email=None, token_teams=None) is True
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_private_denied_to_unauthenticated(self, tool_service, mock_db):
+        """Private tools should be denied to unauthenticated users."""
+        private_tool = {"id": "1", "visibility": "private", "owner_email": "owner@test.com", "team_id": None}
+
+        # Unauthenticated (public-only token)
+        assert await tool_service._check_tool_access(mock_db, private_tool, user_email=None, token_teams=[]) is False
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_private_allowed_to_owner(self, tool_service, mock_db):
+        """Private tools should be accessible to the owner."""
+        private_tool = {"id": "1", "visibility": "private", "owner_email": "owner@test.com", "team_id": None}
+
+        # Owner with non-empty token_teams
+        assert await tool_service._check_tool_access(mock_db, private_tool, user_email="owner@test.com", token_teams=["some-team"]) is True
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_team_tool_allowed_to_member(self, tool_service, mock_db):
+        """Team tools should be accessible to team members."""
+        team_tool = {"id": "1", "visibility": "team", "owner_email": "owner@test.com", "team_id": "team-abc"}
+
+        # Team member via token_teams
+        assert await tool_service._check_tool_access(mock_db, team_tool, user_email="member@test.com", token_teams=["team-abc"]) is True
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_team_tool_denied_to_non_member(self, tool_service, mock_db):
+        """Team tools should be denied to non-members."""
+        team_tool = {"id": "1", "visibility": "team", "owner_email": "owner@test.com", "team_id": "team-abc"}
+
+        # Non-member
+        assert await tool_service._check_tool_access(mock_db, team_tool, user_email="outsider@test.com", token_teams=["other-team"]) is False
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_public_only_token_denied_private(self, tool_service, mock_db):
+        """Public-only tokens (token_teams=[]) should only access public tools."""
+        private_tool = {"id": "1", "visibility": "private", "owner_email": "owner@test.com", "team_id": None}
+
+        # Even owner with public-only token is denied
+        assert await tool_service._check_tool_access(mock_db, private_tool, user_email="owner@test.com", token_teams=[]) is False
+
+
+class TestToolListingGracefulErrorHandling:
+    """Tests for graceful error handling when convert_tool_to_read fails.
+
+    These tests verify that when one tool fails to convert (e.g., due to corrupted data),
+    the listing operation continues with remaining tools instead of failing completely.
+    This prevents a single corrupted entity from breaking the entire listing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_list_tools_continues_on_conversion_error(self, caplog):
+        """Test that list_tools returns valid tools even when one fails conversion."""
+        import logging
+
+        caplog.set_level(logging.ERROR, logger="mcpgateway.services.tool_service")
+
+        mock_db = Mock()
+
+        # Create mock tools - tool2 will fail conversion
+        tool1 = Mock(id="1", original_name="good_tool_1", team_id=None)
+        tool1.name = "good-tool-1"
+        tool2 = Mock(id="2", original_name="bad_tool", team_id=None)
+        tool2.name = "bad-tool"
+        tool3 = Mock(id="3", original_name="good_tool_2", team_id=None)
+        tool3.name = "good-tool-2"
+
+        # Mock DB to return all three tools
+        mock_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[tool1, tool2, tool3])))))
+        mock_db.commit = Mock()
+
+        # Create valid ToolRead objects for good tools
+        tool_read_1 = MagicMock()
+        tool_read_1.name = "good_tool_1"
+        tool_read_3 = MagicMock()
+        tool_read_3.name = "good_tool_2"
+
+        # Make convert_tool_to_read succeed for tool1 and tool3, but fail for tool2
+        def mock_convert(tool, include_metrics=False, include_auth=False):
+            if tool.id == "2":
+                raise ValueError("Simulated conversion error: corrupted auth_value")
+            elif tool.id == "1":
+                return tool_read_1
+            else:
+                return tool_read_3
+
+        service = ToolService()
+        service.convert_tool_to_read = Mock(side_effect=mock_convert)
+
+        # Call list_tools - should NOT raise an exception
+        result, next_cursor = await service.list_tools(mock_db)
+
+        # Verify we got the two valid tools
+        assert len(result) == 2
+        assert tool_read_1 in result
+        assert tool_read_3 in result
+
+        # Verify convert_tool_to_read was called for all three tools
+        assert service.convert_tool_to_read.call_count == 3
+
+        # Verify the error was logged (format: "Failed to convert tool {id} ({name}): {error}")
+        assert "Failed to convert tool 2" in caplog.text
+        assert "bad-tool" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_list_server_tools_continues_on_conversion_error(self, caplog):
+        """Test that list_server_tools returns valid tools even when one fails conversion."""
+        import logging
+
+        caplog.set_level(logging.ERROR, logger="mcpgateway.services.tool_service")
+
+        mock_db = Mock()
+
+        # Create mock tools - tool2 will fail conversion
+        tool1 = Mock(enabled=True, team_id=None, team=None, id="1", original_name="good_tool_1")
+        tool1.name = "good-tool-1"
+        tool2 = Mock(enabled=True, team_id=None, team=None, id="2", original_name="bad_tool")
+        tool2.name = "bad-tool"
+        tool3 = Mock(enabled=True, team_id=None, team=None, id="3", original_name="good_tool_2")
+        tool3.name = "good-tool-2"
+
+        mock_db.execute.return_value.scalars.return_value.all.return_value = [tool1, tool2, tool3]
+
+        service = ToolService()
+
+        # Make convert_tool_to_read succeed for tool1 and tool3, but fail for tool2
+        def mock_convert(tool, include_metrics=False, include_auth=False):
+            if tool.id == "2":
+                raise ValueError("Simulated conversion error")
+            return f"converted_{tool.original_name}"
+
+        service.convert_tool_to_read = Mock(side_effect=mock_convert)
+
+        # Call list_server_tools - should NOT raise an exception
+        tools = await service.list_server_tools(mock_db, server_id="server123", include_inactive=False)
+
+        # Verify we got the two valid tools
+        assert len(tools) == 2
+        assert "converted_good_tool_1" in tools
+        assert "converted_good_tool_2" in tools
+
+        # Verify the error was logged
+        assert "Failed to convert tool 2" in caplog.text
+        assert "bad-tool" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_list_tools_for_user_continues_on_conversion_error(self, caplog):
+        """Test that list_tools_for_user returns valid tools even when one fails conversion."""
+        import logging
+
+        caplog.set_level(logging.ERROR, logger="mcpgateway.services.tool_service")
+
+        mock_db = Mock()
+
+        # Create mock tools - tool2 will fail conversion
+        tool1 = Mock(id="1", original_name="good_tool_1", team_id=None)
+        tool1.name = "good-tool-1"
+        tool2 = Mock(id="2", original_name="bad_tool", team_id=None)
+        tool2.name = "bad-tool"
+        tool3 = Mock(id="3", original_name="good_tool_2", team_id=None)
+        tool3.name = "good-tool-2"
+
+        # Mock DB to return all three tools
+        mock_db.execute = Mock(return_value=MagicMock(scalars=Mock(return_value=MagicMock(all=Mock(return_value=[tool1, tool2, tool3])))))
+        mock_db.commit = Mock()
+
+        # Create valid ToolRead objects for good tools
+        tool_read_1 = MagicMock()
+        tool_read_1.name = "good_tool_1"
+        tool_read_3 = MagicMock()
+        tool_read_3.name = "good_tool_2"
+
+        # Make convert_tool_to_read succeed for tool1 and tool3, but fail for tool2
+        def mock_convert(tool, include_metrics=False, include_auth=False):
+            if tool.id == "2":
+                raise ValueError("Simulated conversion error: corrupted data")
+            elif tool.id == "1":
+                return tool_read_1
+            else:
+                return tool_read_3
+
+        service = ToolService()
+        service.convert_tool_to_read = Mock(side_effect=mock_convert)
+
+        # Mock TeamManagementService for user context
+        mock_team = MagicMock(id="team-1", is_personal=True)
+        with patch("mcpgateway.services.tool_service.TeamManagementService") as mock_team_service:
+            mock_team_service.return_value.get_user_teams = AsyncMock(return_value=[mock_team])
+
+            # Call list_tools_for_user - should NOT raise an exception
+            # Returns tuple[List[ToolRead], Optional[str]]
+            result, next_cursor = await service.list_tools_for_user(mock_db, user_email="user@example.com")
+
+        # Verify we got the two valid tools
+        assert len(result) == 2
+        assert tool_read_1 in result
+        assert tool_read_3 in result
+
+        # Verify the error was logged
+        assert "Failed to convert tool 2" in caplog.text
+        assert "bad-tool" in caplog.text

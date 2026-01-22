@@ -23,7 +23,7 @@ docker run -d --name mcpgateway \
   -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
   -e DATABASE_URL=sqlite:///./mcp.db \
   --network=host \
-  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-2
 
 docker logs mcpgateway
 ```
@@ -31,8 +31,8 @@ docker logs mcpgateway
 You can now access the UI at [http://localhost:4444/admin](http://localhost:4444/admin)
 
 ### Multi-architecture containers
-Note: the container build process creates container images for 'amd64', 'arm64' and 's390x' architectures. The version `ghcr.io/ibm/mcp-context-forge:VERSION`
-not points to a manifest so that if all commands will pull the correct image for the architecture being used (whether that be locally or on Kubernetes or OpenShift).
+Note: the container build process creates container images for 'amd64', 'arm64', 's390x', and 'ppc64le' architectures. The version `ghcr.io/ibm/mcp-context-forge:VERSION`
+points to a manifest so that all commands will pull the correct image for the architecture being used (whether that be locally or on Kubernetes or OpenShift).
 
 If the specific image is needed for one architecture on a different architecture use the appropriate arguments for your given container execution tool:
 

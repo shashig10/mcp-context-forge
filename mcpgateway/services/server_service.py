@@ -13,20 +13,23 @@ It also publishes event notifications for server changes.
 
 # Standard
 import asyncio
+import binascii
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 # Third-Party
 import httpx
+from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload, Session
+from sqlalchemy.orm import joinedload, selectinload, Session
 
 # First-Party
 from mcpgateway.config import settings
 from mcpgateway.db import A2AAgent as DbA2AAgent
 from mcpgateway.db import EmailTeam as DbEmailTeam
 from mcpgateway.db import EmailTeamMember as DbEmailTeamMember
+from mcpgateway.db import get_for_update
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import Resource as DbResource
 from mcpgateway.db import Server as DbServer
@@ -41,7 +44,7 @@ from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.pagination import unified_paginate
-from mcpgateway.utils.sqlalchemy_modifier import json_contains_expr
+from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
 
 # Cache import (lazy to avoid circular dependencies)
 _REGISTRY_CACHE = None
@@ -127,7 +130,7 @@ class ServerNameConflictError(ServerError):
 class ServerService:
     """Service for managing MCP Servers in the catalog.
 
-    Provides methods to create, list, retrieve, update, toggle status, and delete server records.
+    Provides methods to create, list, retrieve, update, set state, and delete server records.
     Also supports event notifications for changes in server data.
     """
 
@@ -254,7 +257,9 @@ class ServerService:
             ...     created_at=now, updated_at=now, enabled=True,
             ...     associated_tools=[], associated_resources=[], associated_prompts=[], associated_a2a_agents=[],
             ...     tags=[], metrics=[m1, m2],
-            ...     tools=[], resources=[], prompts=[], a2a_agents=[]
+            ...     tools=[], resources=[], prompts=[], a2a_agents=[],
+            ...     team_id=None, owner_email=None, visibility=None,
+            ...     created_by=None, modified_by=None
             ... )
             >>> result = svc.convert_server_to_read(server, include_metrics=True)
             >>> result.metrics.total_executions
@@ -262,8 +267,35 @@ class ServerService:
             >>> result.metrics.successful_executions
             1
         """
-        server_dict = server.__dict__.copy()
-        server_dict.pop("_sa_instance_state", None)
+        # Build dict explicitly from attributes to ensure SQLAlchemy populates them
+        # (using __dict__.copy() can return empty dict with certain query patterns)
+        server_dict = {
+            "id": server.id,
+            "name": server.name,
+            "description": server.description,
+            "icon": server.icon,
+            "enabled": server.enabled,
+            "created_at": server.created_at,
+            "updated_at": server.updated_at,
+            "team_id": server.team_id,
+            "owner_email": server.owner_email,
+            "visibility": server.visibility,
+            "created_by": server.created_by,
+            "created_from_ip": getattr(server, "created_from_ip", None),
+            "created_via": getattr(server, "created_via", None),
+            "created_user_agent": getattr(server, "created_user_agent", None),
+            "modified_by": server.modified_by,
+            "modified_from_ip": getattr(server, "modified_from_ip", None),
+            "modified_via": getattr(server, "modified_via", None),
+            "modified_user_agent": getattr(server, "modified_user_agent", None),
+            "import_batch_id": getattr(server, "import_batch_id", None),
+            "federation_source": getattr(server, "federation_source", None),
+            "version": getattr(server, "version", None),
+            "tags": server.tags or [],
+            # OAuth 2.0 configuration for RFC 9728 Protected Resource Metadata
+            "oauth_enabled": getattr(server, "oauth_enabled", False),
+            "oauth_config": getattr(server, "oauth_config", None),
+        }
 
         # Compute aggregated metrics only if requested (avoids N+1 queries in list operations)
         if include_metrics:
@@ -310,19 +342,13 @@ class ServerService:
             }
         else:
             server_dict["metrics"] = None
-        # Also update associated IDs (if not already done)
+        # Add associated IDs from relationships
         server_dict["associated_tools"] = [tool.name for tool in server.tools] if server.tools else []
         server_dict["associated_resources"] = [res.id for res in server.resources] if server.resources else []
         server_dict["associated_prompts"] = [prompt.id for prompt in server.prompts] if server.prompts else []
         server_dict["associated_a2a_agents"] = [agent.id for agent in server.a2a_agents] if server.a2a_agents else []
-        server_dict["tags"] = server.tags or []
 
-        # Include metadata fields for proper API response
-        server_dict["created_by"] = getattr(server, "created_by", None)
-        server_dict["modified_by"] = getattr(server, "modified_by", None)
-        server_dict["created_at"] = getattr(server, "created_at", None)
-        server_dict["updated_at"] = getattr(server, "updated_at", None)
-        server_dict["version"] = getattr(server, "version", None)
+        # Team name is loaded via server.team property from email_team relationship
         server_dict["team"] = getattr(server, "team", None)
 
         return ServerRead.model_validate(server_dict)
@@ -377,22 +403,6 @@ class ServerService:
             "a2a_agents": a2a_agents or [],
             "gateways": gateways or [],
         }
-
-    def _get_team_name(self, db: Session, team_id: Optional[str]) -> Optional[str]:
-        """Retrieve the team name given a team ID.
-
-        Args:
-            db (Session): Database session for querying teams.
-            team_id (Optional[str]): The ID of the team.
-
-        Returns:
-            Optional[str]: The name of the team if found, otherwise None.
-        """
-        if not team_id:
-            return None
-        team = db.query(DbEmailTeam).filter(DbEmailTeam.id == team_id, DbEmailTeam.is_active.is_(True)).first()
-        db.commit()  # Release transaction to avoid idle-in-transaction
-        return team.name if team else None
 
     async def register_server(
         self,
@@ -473,6 +483,9 @@ class ServerService:
                 team_id=getattr(server_in, "team_id", None) or team_id,
                 owner_email=getattr(server_in, "owner_email", None) or owner_email or created_by,
                 visibility=getattr(server_in, "visibility", None) or visibility,
+                # OAuth 2.0 configuration for RFC 9728 Protected Resource Metadata
+                oauth_enabled=getattr(server_in, "oauth_enabled", False) or False,
+                oauth_config=getattr(server_in, "oauth_config", None),
                 # Metadata fields
                 created_by=created_by,
                 created_from_ip=created_from_ip,
@@ -480,17 +493,23 @@ class ServerService:
                 created_user_agent=created_user_agent,
                 version=1,
             )
-            # Check for existing server with the same name
-            if visibility.lower() == "public":
-                # Check for existing public server with the same name
-                existing_server = db.execute(select(DbServer).where(DbServer.name == server_in.name, DbServer.visibility == "public")).scalar_one_or_none()
-                if existing_server:
-                    raise ServerNameConflictError(server_in.name, enabled=existing_server.enabled, server_id=existing_server.id, visibility=existing_server.visibility)
-            elif visibility.lower() == "team" and team_id:
-                # Check for existing team server with the same name
-                existing_server = db.execute(select(DbServer).where(DbServer.name == server_in.name, DbServer.visibility == "team", DbServer.team_id == team_id)).scalar_one_or_none()
-                if existing_server:
-                    raise ServerNameConflictError(server_in.name, enabled=existing_server.enabled, server_id=existing_server.id, visibility=existing_server.visibility)
+            # Check for existing server with the same name (with row locking to prevent race conditions)
+            # The unique constraint is on (team_id, owner_email, name), so we check based on that
+            owner_email_to_check = getattr(server_in, "owner_email", None) or owner_email or created_by
+            team_id_to_check = getattr(server_in, "team_id", None) or team_id
+
+            # Build conditions based on the actual unique constraint: (team_id, owner_email, name)
+            conditions = [
+                DbServer.name == server_in.name,
+                DbServer.team_id == team_id_to_check if team_id_to_check else DbServer.team_id.is_(None),
+                DbServer.owner_email == owner_email_to_check if owner_email_to_check else DbServer.owner_email.is_(None),
+            ]
+            if server_in.id:
+                conditions.append(DbServer.id != server_in.id)
+
+            existing_server = get_for_update(db, DbServer, where=and_(*conditions))
+            if existing_server:
+                raise ServerNameConflictError(server_in.name, enabled=existing_server.enabled, server_id=existing_server.id, visibility=existing_server.visibility)
             # Set custom UUID if provided
             if server_in.id:
                 logger.info(f"Setting custom UUID for server: {server_in.id}")
@@ -634,7 +653,7 @@ class ServerService:
                 user_email=created_by,
             )
 
-            db_server.team = self._get_team_name(db, db_server.team_id)
+            # Team name is loaded via db_server.team property from email_team relationship
             return self.convert_server_to_read(db_server)
         except IntegrityError as ie:
             db.rollback()
@@ -747,6 +766,7 @@ class ServerService:
                 selectinload(DbServer.resources),
                 selectinload(DbServer.prompts),
                 selectinload(DbServer.a2a_agents),
+                joinedload(DbServer.email_team),
             )
             .order_by(desc(DbServer.created_at), desc(DbServer.id))
         )
@@ -783,9 +803,9 @@ class ServerService:
             if visibility:
                 query = query.where(DbServer.visibility == visibility)
 
-        # Add tag filtering if tags are provided
+        # Add tag filtering if tags are provided (supports both List[str] and List[Dict] formats)
         if tags:
-            query = query.where(json_contains_expr(db, DbServer.tags, tags, match_any=True))
+            query = query.where(json_contains_tag_expr(db, DbServer.tags, tags, match_any=True))
 
         # Use unified pagination helper - handles both page and cursor pagination
         pag_result = await unified_paginate(
@@ -808,20 +828,17 @@ class ServerService:
             # Cursor-based: pag_result is a tuple
             servers_db, next_cursor = pag_result
 
-        # Fetch team names for the servers (common for both pagination types)
-        team_ids_set = {s.team_id for s in servers_db if s.team_id}
-        team_map = {}
-        if team_ids_set:
-            teams = db.execute(select(DbEmailTeam.id, DbEmailTeam.name).where(DbEmailTeam.id.in_(team_ids_set), DbEmailTeam.is_active.is_(True))).all()
-            team_map = {team.id: team.name for team in teams}
-
         db.commit()  # Release transaction to avoid idle-in-transaction
 
         # Convert to ServerRead (common for both pagination types)
+        # Team names are loaded via joinedload(DbServer.email_team)
         result = []
         for s in servers_db:
-            s.team = team_map.get(s.team_id) if s.team_id else None
-            result.append(self.convert_server_to_read(s, include_metrics=False))
+            try:
+                result.append(self.convert_server_to_read(s, include_metrics=False))
+            except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+                logger.exception(f"Failed to convert server {getattr(s, 'id', 'unknown')} ({getattr(s, 'name', 'unknown')}): {e}")
+                # Continue with remaining servers instead of failing completely
 
         # Return appropriate format based on pagination type
         if page is not None:
@@ -878,6 +895,7 @@ class ServerService:
             selectinload(DbServer.resources),
             selectinload(DbServer.prompts),
             selectinload(DbServer.a2a_agents),
+            joinedload(DbServer.email_team),
         )
 
         # Apply active/inactive filter
@@ -921,20 +939,17 @@ class ServerService:
 
         servers = db.execute(query).scalars().all()
 
-        # Fetch all team names
-        server_team_ids = [s.team_id for s in servers if s.team_id]
-        team_map = {}
-        if server_team_ids:
-            teams = db.execute(select(DbEmailTeam.id, DbEmailTeam.name).where(DbEmailTeam.id.in_(server_team_ids), DbEmailTeam.is_active.is_(True))).all()
-            team_map = {team.id: team.name for team in teams}
-
         db.commit()  # Release transaction to avoid idle-in-transaction
 
         # Skip metrics to avoid N+1 queries in list operations
+        # Team names are loaded via joinedload(DbServer.email_team)
         result = []
         for s in servers:
-            s.team = team_map.get(s.team_id) if s.team_id else None
-            result.append(self.convert_server_to_read(s, include_metrics=False))
+            try:
+                result.append(self.convert_server_to_read(s, include_metrics=False))
+            except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+                logger.exception(f"Failed to convert server {getattr(s, 'id', 'unknown')} ({getattr(s, 'name', 'unknown')}): {e}")
+                # Continue with remaining servers instead of failing completely
         return result
 
     async def get_server(self, db: Session, server_id: str) -> ServerRead:
@@ -962,7 +977,17 @@ class ServerService:
             >>> asyncio.run(service.get_server(db, 'server_id'))
             'server_read'
         """
-        server = db.get(DbServer, server_id)
+        server = db.execute(
+            select(DbServer)
+            .options(
+                selectinload(DbServer.tools),
+                selectinload(DbServer.resources),
+                selectinload(DbServer.prompts),
+                selectinload(DbServer.a2a_agents),
+                joinedload(DbServer.email_team),
+            )
+            .where(DbServer.id == server_id)
+        ).scalar_one_or_none()
         if not server:
             raise ServerNotFoundError(f"Server not found: {server_id}")
         server_data = {
@@ -978,7 +1003,7 @@ class ServerService:
             "associated_prompts": [prompt.id for prompt in server.prompts],
         }
         logger.debug(f"Server Data: {server_data}")
-        server.team = self._get_team_name(db, server.team_id) if server else None
+        # Team name is loaded via server.team property from email_team relationship
         server_read = self.convert_server_to_read(server)
 
         self._structured_logger.log(
@@ -1055,6 +1080,7 @@ class ServerService:
             >>> db = MagicMock()
             >>> server = MagicMock()
             >>> server.id = 'server_id'
+            >>> server.name = 'test_server'
             >>> server.owner_email = 'user_email'  # Set owner to match user performing update
             >>> server.team_id = None
             >>> server.visibility = 'public'
@@ -1068,12 +1094,29 @@ class ServerService:
             >>> ServerRead.model_validate = MagicMock(return_value='server_read')
             >>> server_update = MagicMock()
             >>> server_update.id = None  # No UUID change
+            >>> server_update.name = None  # No name change
+            >>> server_update.description = None
+            >>> server_update.icon = None
+            >>> server_update.visibility = None
+            >>> server_update.team_id = None
             >>> import asyncio
-            >>> asyncio.run(service.update_server(db, 'server_id', server_update, 'user_email'))
+            >>> with patch('mcpgateway.services.server_service.get_for_update', return_value=server):
+            ...     asyncio.run(service.update_server(db, 'server_id', server_update, 'user_email'))
             'server_read'
         """
         try:
-            server = db.get(DbServer, server_id)
+            server = get_for_update(
+                db,
+                DbServer,
+                server_id,
+                options=[
+                    selectinload(DbServer.tools),
+                    selectinload(DbServer.resources),
+                    selectinload(DbServer.prompts),
+                    selectinload(DbServer.a2a_agents),
+                    selectinload(DbServer.email_team),
+                ],
+            )
             if not server:
                 raise ServerNotFoundError(f"Server not found: {server_id}")
 
@@ -1092,12 +1135,14 @@ class ServerService:
                 team_id = server_update.team_id or server.team_id
                 if visibility.lower() == "public":
                     # Check for existing public server with the same name
-                    existing_server = db.execute(select(DbServer).where(DbServer.name == server_update.name, DbServer.visibility == "public")).scalar_one_or_none()
+                    existing_server = get_for_update(db, DbServer, where=and_(DbServer.name == server_update.name, DbServer.visibility == "public", DbServer.id != server.id))
                     if existing_server:
                         raise ServerNameConflictError(server_update.name, enabled=existing_server.enabled, server_id=existing_server.id, visibility=existing_server.visibility)
                 elif visibility.lower() == "team" and team_id:
                     # Check for existing team server with the same name
-                    existing_server = db.execute(select(DbServer).where(DbServer.name == server_update.name, DbServer.visibility == "team", DbServer.team_id == team_id)).scalar_one_or_none()
+                    existing_server = get_for_update(
+                        db, DbServer, where=and_(DbServer.name == server_update.name, DbServer.visibility == "team", DbServer.team_id == team_id, DbServer.id != server.id)
+                    )
                     if existing_server:
                         raise ServerNameConflictError(server_update.name, enabled=existing_server.enabled, server_id=existing_server.id, visibility=existing_server.visibility)
 
@@ -1186,6 +1231,24 @@ class ServerService:
             if server_update.tags is not None:
                 server.tags = server_update.tags
 
+            # Update OAuth 2.0 configuration if provided
+            # Track if OAuth is being explicitly disabled to prevent config re-assignment
+            oauth_being_disabled = server_update.oauth_enabled is not None and not server_update.oauth_enabled
+
+            if server_update.oauth_enabled is not None:
+                server.oauth_enabled = server_update.oauth_enabled
+                # If OAuth is being disabled, clear the config
+                if oauth_being_disabled:
+                    server.oauth_config = None
+
+            # Only update oauth_config if OAuth is not being explicitly disabled
+            # This prevents the case where oauth_enabled=False and oauth_config are both provided
+            if not oauth_being_disabled:
+                if hasattr(server_update, "model_fields_set") and "oauth_config" in server_update.model_fields_set:
+                    server.oauth_config = server_update.oauth_config
+                elif server_update.oauth_config is not None:
+                    server.oauth_config = server_update.oauth_config
+
             # Update metadata fields
             server.updated_at = datetime.now(timezone.utc)
             if modified_by:
@@ -1257,12 +1320,13 @@ class ServerService:
             )
 
             # Build a dictionary with associated IDs
+            # Team name is loaded via server.team property from email_team relationship
             server_data = {
                 "id": server.id,
                 "name": server.name,
                 "description": server.description,
                 "icon": server.icon,
-                "team": self._get_team_name(db, server.team_id),
+                "team": server.team,
                 "created_at": server.created_at,
                 "updated_at": server.updated_at,
                 "enabled": server.enabled,
@@ -1321,8 +1385,8 @@ class ServerService:
             )
             raise ServerError(f"Failed to update server: {str(e)}")
 
-    async def toggle_server_status(self, db: Session, server_id: str, activate: bool, user_email: Optional[str] = None) -> ServerRead:
-        """Toggle the activation status of a server.
+    async def set_server_state(self, db: Session, server_id: str, activate: bool, user_email: Optional[str] = None) -> ServerRead:
+        """Set the activation status of a server.
 
         Args:
             db: Database session.
@@ -1355,11 +1419,22 @@ class ServerService:
             >>> service._audit_trail = MagicMock()  # Mock audit trail to prevent database writes
             >>> ServerRead.model_validate = MagicMock(return_value='server_read')
             >>> import asyncio
-            >>> asyncio.run(service.toggle_server_status(db, 'server_id', True))
+            >>> asyncio.run(service.set_server_state(db, 'server_id', True))
             'server_read'
         """
         try:
-            server = db.get(DbServer, server_id)
+            server = get_for_update(
+                db,
+                DbServer,
+                server_id,
+                options=[
+                    selectinload(DbServer.tools),
+                    selectinload(DbServer.resources),
+                    selectinload(DbServer.prompts),
+                    selectinload(DbServer.a2a_agents),
+                    selectinload(DbServer.email_team),
+                ],
+            )
             if not server:
                 raise ServerNotFoundError(f"Server not found: {server_id}")
 
@@ -1387,7 +1462,7 @@ class ServerService:
                     await self._notify_server_deactivated(server)
                 logger.info(f"Server {server.name} {'activated' if activate else 'deactivated'}")
 
-                # Structured logging: Audit trail for server status toggle
+                # Structured logging: Audit trail for server state change
                 self._audit_trail.log_action(
                     user_id=user_email or "system",
                     action="activate_server" if activate else "deactivate_server",
@@ -1412,12 +1487,13 @@ class ServerService:
                     user_email=user_email,
                 )
 
+            # Team name is loaded via server.team property from email_team relationship
             server_data = {
                 "id": server.id,
                 "name": server.name,
                 "description": server.description,
                 "icon": server.icon,
-                "team": self._get_team_name(db, server.team_id),
+                "team": server.team,
                 "created_at": server.created_at,
                 "updated_at": server.updated_at,
                 "enabled": server.enabled,
@@ -1431,8 +1507,8 @@ class ServerService:
             # Structured logging: Log permission error
             self._structured_logger.log(
                 level="WARNING",
-                message="Server status toggle failed due to insufficient permissions",
-                event_type="server_status_toggle_permission_denied",
+                message="Server state change failed due to insufficient permissions",
+                event_type="server_state_change_permission_denied",
                 component="server_service",
                 server_id=server_id,
                 user_email=user_email,
@@ -1441,18 +1517,18 @@ class ServerService:
         except Exception as e:
             db.rollback()
 
-            # Structured logging: Log generic server status toggle failure
+            # Structured logging: Log generic server state change failure
             self._structured_logger.log(
                 level="ERROR",
-                message="Server status toggle failed",
-                event_type="server_status_toggle_failed",
+                message="Server state change failed",
+                event_type="server_state_change_failed",
                 component="server_service",
                 server_id=server_id,
                 error_type=type(e).__name__,
                 error_message=str(e),
                 user_email=user_email,
             )
-            raise ServerError(f"Failed to toggle server status: {str(e)}")
+            raise ServerError(f"Failed to set server state: {str(e)}")
 
     async def delete_server(self, db: Session, server_id: str, user_email: Optional[str] = None, purge_metrics: bool = False) -> None:
         """Permanently delete a server.
@@ -1782,3 +1858,80 @@ class ServerService:
 
         metrics_cache.invalidate("servers")
         metrics_cache.invalidate_prefix("top_servers:")
+
+    def get_oauth_protected_resource_metadata(self, db: Session, server_id: str, resource_base_url: str) -> Dict[str, Any]:
+        """
+        Get RFC 9728 OAuth 2.0 Protected Resource Metadata for a server.
+
+        This method retrieves the OAuth configuration for a server and formats it
+        according to RFC 9728 Protected Resource Metadata specification, enabling
+        MCP clients to discover OAuth authorization servers for browser-based SSO.
+
+        Args:
+            db: Database session.
+            server_id: The ID of the server.
+            resource_base_url: The base URL for the resource (e.g., "https://gateway.example.com/servers/abc123").
+
+        Returns:
+            Dict containing RFC 9728 Protected Resource Metadata:
+            - resource: The protected resource identifier (URL)
+            - authorization_servers: List of authorization server issuer URIs
+            - bearer_methods_supported: Supported bearer token methods
+            - scopes_supported: Optional list of supported scopes
+
+        Raises:
+            ServerNotFoundError: If server doesn't exist, is disabled, or is non-public.
+            ServerError: If OAuth is not enabled or not properly configured.
+
+        Examples:
+            >>> from mcpgateway.services.server_service import ServerService
+            >>> service = ServerService()
+            >>> # Method exists and is callable
+            >>> callable(service.get_oauth_protected_resource_metadata)
+            True
+        """
+        server = db.get(DbServer, server_id)
+
+        # Return not found for non-existent, disabled, or non-public servers
+        # (avoids leaking information about private/team servers)
+        if not server:
+            raise ServerNotFoundError(f"Server not found: {server_id}")
+
+        if not server.enabled:
+            raise ServerNotFoundError(f"Server not found: {server_id}")
+
+        if getattr(server, "visibility", "public") != "public":
+            raise ServerNotFoundError(f"Server not found: {server_id}")
+
+        # Check OAuth configuration
+        if not getattr(server, "oauth_enabled", False):
+            raise ServerError(f"OAuth not enabled for server: {server_id}")
+
+        oauth_config = getattr(server, "oauth_config", None)
+        if not oauth_config:
+            raise ServerError(f"OAuth not configured for server: {server_id}")
+
+        # Extract authorization server(s) - support both list and single value
+        authorization_servers = oauth_config.get("authorization_servers", [])
+        if not authorization_servers:
+            auth_server = oauth_config.get("authorization_server")
+            if auth_server:
+                authorization_servers = [auth_server]
+
+        if not authorization_servers:
+            raise ServerError(f"OAuth authorization_server not configured for server: {server_id}")
+
+        # Build RFC 9728 Protected Resource Metadata response
+        response_data: Dict[str, Any] = {
+            "resource": resource_base_url,
+            "authorization_servers": authorization_servers,
+            "bearer_methods_supported": ["header"],
+        }
+
+        # Add optional scopes if configured (never include secrets from oauth_config)
+        scopes = oauth_config.get("scopes_supported") or oauth_config.get("scopes")
+        if scopes:
+            response_data["scopes_supported"] = scopes
+
+        logger.debug(f"Returning OAuth protected resource metadata for server {server_id}")
+        return response_data

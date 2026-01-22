@@ -45,9 +45,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
-import json
 import sys
 from typing import Any, Dict, List, Sequence
+import uuid
 
 # Third-Party
 import jwt  # PyJWT
@@ -123,6 +123,11 @@ def _create_jwt_token(
     payload["iat"] = int(now.timestamp())  # Issued at
     payload["iss"] = settings.jwt_issuer  # Issuer
     payload["aud"] = settings.jwt_audience  # Audience
+    payload["jti"] = payload.get("jti") or str(uuid.uuid4())  # JWT ID for revocation support
+
+    # Optionally embed environment claim for cross-environment isolation
+    if settings.embed_environment_in_tokens:
+        payload["env"] = settings.environment
 
     # Handle legacy username format - convert to sub for consistency
     if "username" in payload and "sub" not in payload:
@@ -411,7 +416,7 @@ def main() -> None:  # pragma: no cover
     # Decode mode takes precedence
     if args.decode:
         decoded = _decode_jwt_token(args.decode, algorithms=[args.algo])
-        json.dump(decoded, sys.stdout, indent=2, default=str)
+        sys.stdout.write(orjson.dumps(decoded, default=str, option=orjson.OPT_INDENT_2).decode())
         sys.stdout.write("\n")
         return
 
@@ -419,7 +424,7 @@ def main() -> None:  # pragma: no cover
 
     if args.pretty:
         print("Payload:")
-        print(json.dumps(payload, indent=2, default=str))
+        print(orjson.dumps(payload, default=str, option=orjson.OPT_INDENT_2).decode())
         print("-")
 
     token = _create_jwt_token(payload, args.exp, args.secret, args.algo)

@@ -15,7 +15,7 @@
 {{- $postgresImage = printf "%s:%s" .Values.postgres.image.repository .Values.postgres.image.tag -}}
 {{- end -}}
 
-{{- if .Values.postgres.enabled }}
+{{- if and .Values.postgres.enabled (not .Values.postgres.external.enabled) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,6 +45,9 @@ spec:
         {{- range .Values.global.imagePullSecrets }}
         - name: {{ . }}
         {{- end }}
+      {{- end }}
+      {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "mcp-stack.serviceAccountName" . }}
       {{- end }}
       initContainers:
       {{- if and .Values.postgres.upgrade.enabled (eq $targetVersion "18") .Values.postgres.upgrade.backupCompleted }}

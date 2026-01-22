@@ -13,13 +13,13 @@ from __future__ import annotations
 
 # Standard
 from enum import Enum
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 # Third-Party
 import httpx
+import orjson
 from pydantic import BaseModel, Field
 
 # First-Party
@@ -375,8 +375,8 @@ Respond with JSON format:
 
             # Parse JSON response from Granite
             try:
-                categories = json.loads(response_text)
-            except json.JSONDecodeError:
+                categories = orjson.loads(response_text)
+            except orjson.JSONDecodeError:
                 # Fallback parsing if JSON is not perfect
                 categories = {}
                 for cat in ModerationCategory:
@@ -801,6 +801,13 @@ Respond with JSON format:
 
         return ToolPostInvokeResult(metadata={"output_checked": True})
 
+    async def shutdown(self) -> None:
+        """Shutdown and cleanup HTTP client when plugin shuts down."""
+        client = getattr(self, "_client", None)
+        if client:
+            await client.aclose()
+            self._client = None
+
     async def __aenter__(self):
         """Async context manager entry.
 
@@ -811,5 +818,4 @@ Respond with JSON format:
 
     async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
         """Async context manager exit - cleanup HTTP client."""
-        if hasattr(self, "_client"):
-            await self._client.aclose()
+        await self.shutdown()

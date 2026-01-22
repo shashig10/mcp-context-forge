@@ -19,17 +19,18 @@ underlying data.
 
 # Standard
 import asyncio
+import binascii
 from collections import defaultdict
 import csv
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import html
 import io
-import json
 import logging
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any
@@ -41,31 +42,40 @@ import uuid
 # Third-Party
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 import httpx
 import orjson
 from pydantic import SecretStr, ValidationError
 from pydantic_core import ValidationError as CoreValidationError
-from sqlalchemy import and_, case, cast, desc, func, or_, select, String, text
+from sqlalchemy import and_, bindparam, case, cast, desc, false, func, or_, select, String, text
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
-from sqlalchemy.orm import joinedload, Session
+from sqlalchemy.orm import joinedload, selectinload, Session
 from sqlalchemy.sql.functions import coalesce
+from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 # First-Party
+from mcpgateway import __version__
+from mcpgateway import version as version_module
+
 # Authentication and password-related imports
 from mcpgateway.auth import get_current_user
 from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
 from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.common.models import LogLevel
+from mcpgateway.common.validators import SecurityValidator
 from mcpgateway.config import settings
-from mcpgateway.db import EmailTeam, extract_json_field, get_db, GlobalConfig, ObservabilitySavedQuery, ObservabilitySpan, ObservabilityTrace
+from mcpgateway.db import A2AAgent as DbA2AAgent
+from mcpgateway.db import EmailTeam, extract_json_field
+from mcpgateway.db import Gateway as DbGateway
+from mcpgateway.db import get_db, GlobalConfig, ObservabilitySavedQuery, ObservabilitySpan, ObservabilityTrace
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import Resource as DbResource
+from mcpgateway.db import Server as DbServer
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.db import utc_now
-from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
+from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_any_permission, require_permission
 from mcpgateway.routers.email_auth import create_access_token
 from mcpgateway.schemas import (
     A2AAgentCreate,
@@ -118,6 +128,7 @@ from mcpgateway.services.import_service import ConflictStrategy
 from mcpgateway.services.import_service import ImportError as ImportServiceError
 from mcpgateway.services.import_service import ImportService, ImportValidationError
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services.mcp_session_pool import get_mcp_session_pool
 from mcpgateway.services.oauth_manager import OAuthManager
 from mcpgateway.services.performance_service import get_performance_service
 from mcpgateway.services.plugin_service import get_plugin_service
@@ -234,6 +245,44 @@ grpc_service_mgr: Optional[Any] = GrpcService() if (settings.mcpgateway_grpc_ena
 
 # Rate limiting storage
 rate_limit_storage = defaultdict(list)
+
+
+def _normalize_team_id(team_id: Optional[str]) -> Optional[str]:
+    """Validate and normalize team IDs for UI endpoints.
+
+    Args:
+        team_id: Raw team ID from request params.
+
+    Returns:
+        Normalized team ID string or None.
+
+    Raises:
+        ValueError: If the team ID is not a valid UUID.
+    """
+    if not team_id:
+        return None
+    try:
+        return uuid.UUID(str(team_id)).hex
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("Invalid team ID") from exc
+
+
+def _validated_team_id_param(team_id: Optional[str] = Query(None, description="Filter by team ID")) -> Optional[str]:
+    """Normalize team ID query params and raise on invalid UUIDs.
+
+    Args:
+        team_id: Raw team ID from query params.
+
+    Returns:
+        Normalized team ID string or None.
+
+    Raises:
+        HTTPException: If the team ID is not a valid UUID.
+    """
+    try:
+        return _normalize_team_id(team_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid team ID") from exc
 
 
 def get_client_ip(request: Request) -> str:
@@ -468,6 +517,161 @@ def get_user_email(user: Union[str, dict, object] = None) -> str:
     return str(user)
 
 
+def _get_span_entity_performance(
+    db: Session,
+    cutoff_time: datetime,
+    cutoff_time_naive: datetime,
+    span_names: List[str],
+    json_key: str,
+    result_key: str,
+    limit: int = 20,
+) -> List[dict]:
+    """Shared helper to compute performance metrics for spans grouped by a JSON attribute.
+
+    Args:
+        db: Database session.
+        cutoff_time: Timezone-aware datetime for filtering spans.
+        cutoff_time_naive: Naive datetime for SQLite compatibility.
+        span_names: List of span names to filter (e.g., ["tool.invoke"]).
+        json_key: JSON attribute key to group by (e.g., "tool.name").
+        result_key: Key name for the entity in returned dicts (e.g., "tool_name").
+        limit: Maximum number of results to return (default: 20).
+
+    Returns:
+        List[dict]: List of dicts with entity key and performance metrics (count, avg, min, max, percentiles).
+
+    Raises:
+        ValueError: If `json_key` is not a valid identifier (only letters, digits, underscore, dot or hyphen),
+            this function will raise a ValueError to prevent unsafe SQL interpolation when using
+            PostgreSQL native percentile queries.
+
+    Note:
+        Uses PostgreSQL `percentile_cont` when available and enabled via USE_POSTGRESDB_PERCENTILES config,
+        otherwise falls back to Python aggregation.
+    """
+    # Validate json_key to prevent SQL injection in both PostgreSQL and SQLite paths
+    if not isinstance(json_key, str) or not re.match(r"^[A-Za-z0-9_.-]+$", json_key):
+        raise ValueError("Invalid json_key for percentile query")
+
+    dialect_name = db.get_bind().dialect.name
+
+    # Use database-native percentiles only if enabled in config and using PostgreSQL
+    if dialect_name == "postgresql" and settings.use_postgresdb_percentiles:
+        # Safe: uses SQLAlchemy's bindparam for the IN-list
+        stats_sql = text(
+            """
+            SELECT
+                (attributes->> :json_key) AS entity,
+                COUNT(*) AS count,
+                AVG(duration_ms) AS avg_duration_ms,
+                MIN(duration_ms) AS min_duration_ms,
+                MAX(duration_ms) AS max_duration_ms,
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) AS p50,
+                percentile_cont(0.90) WITHIN GROUP (ORDER BY duration_ms) AS p90,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99
+            FROM observability_spans
+            WHERE name IN :names
+              AND start_time >= :cutoff_time
+              AND duration_ms IS NOT NULL
+              AND (attributes->> :json_key) IS NOT NULL
+            GROUP BY entity
+            ORDER BY avg_duration_ms DESC
+            LIMIT :limit
+            """
+        ).bindparams(bindparam("names", expanding=True))
+
+        results = db.execute(
+            stats_sql,
+            {"cutoff_time": cutoff_time, "limit": limit, "names": span_names, "json_key": json_key},
+        ).fetchall()
+
+        items: List[dict] = []
+        for row in results:
+            items.append(
+                {
+                    result_key: row.entity,
+                    "count": int(row.count) if row.count is not None else 0,
+                    "avg_duration_ms": round(float(row.avg_duration_ms), 2) if row.avg_duration_ms is not None else 0,
+                    "min_duration_ms": round(float(row.min_duration_ms), 2) if row.min_duration_ms is not None else 0,
+                    "max_duration_ms": round(float(row.max_duration_ms), 2) if row.max_duration_ms is not None else 0,
+                    "p50": round(float(row.p50), 2) if row.p50 is not None else 0,
+                    "p90": round(float(row.p90), 2) if row.p90 is not None else 0,
+                    "p95": round(float(row.p95), 2) if row.p95 is not None else 0,
+                    "p99": round(float(row.p99), 2) if row.p99 is not None else 0,
+                }
+            )
+
+        return items
+
+    # Fallback: Python aggregation (SQLite or other DBs, or PostgreSQL with USE_POSTGRESDB_PERCENTILES=False)
+    # Pass dialect_name to extract_json_field to ensure correct SQL syntax for the actual database
+    # Use timezone-aware cutoff for PostgreSQL to avoid timezone drift, naive for SQLite
+    effective_cutoff = cutoff_time if dialect_name == "postgresql" else cutoff_time_naive
+    spans = (
+        db.query(
+            extract_json_field(ObservabilitySpan.attributes, f'$."{json_key}"', dialect_name=dialect_name).label("entity"),
+            ObservabilitySpan.duration_ms,
+        )
+        .filter(
+            ObservabilitySpan.name.in_(span_names),
+            ObservabilitySpan.start_time >= effective_cutoff,
+            ObservabilitySpan.duration_ms.isnot(None),
+            extract_json_field(ObservabilitySpan.attributes, f'$."{json_key}"', dialect_name=dialect_name).isnot(None),
+        )
+        .all()
+    )
+
+    durations_by_entity: Dict[str, List[float]] = defaultdict(list)
+    for span in spans:
+        durations_by_entity[span.entity].append(span.duration_ms)
+
+    def percentile(data: List[float], p: float) -> float:
+        """Calculate percentile using linear interpolation (matches PostgreSQL percentile_cont).
+
+        Args:
+            data: Sorted list of numeric values.
+            p: Percentile to calculate (0.0 to 1.0).
+
+        Returns:
+            float: The interpolated percentile value, or 0.0 if data is empty.
+        """
+        if not data:
+            return 0.0
+        n = len(data)
+        if n == 1:
+            return data[0]
+        k = p * (n - 1)
+        f = int(k)
+        c = k - f
+        if f + 1 < n:
+            return data[f] + c * (data[f + 1] - data[f])
+        return data[f]
+
+    items: List[dict] = []
+    for entity, durations in durations_by_entity.items():
+        durations_sorted = sorted(durations)
+        n = len(durations_sorted)
+        if n == 0:
+            continue
+        items.append(
+            {
+                result_key: entity,
+                "count": n,
+                "avg_duration_ms": round(sum(durations) / n, 2),
+                "min_duration_ms": round(min(durations), 2),
+                "max_duration_ms": round(max(durations), 2),
+                "p50": round(percentile(durations_sorted, 0.50), 2),
+                "p90": round(percentile(durations_sorted, 0.90), 2),
+                "p95": round(percentile(durations_sorted, 0.95), 2),
+                "p99": round(percentile(durations_sorted, 0.99), 2),
+            }
+        )
+
+    items.sort(key=lambda x: x.get("avg_duration_ms", 0), reverse=True)
+    return items[:limit]
+
+
 def get_user_id(user: Union[str, dict[str, Any], object] = None) -> str:
     """Return the user ID from a JWT payload, user object, or string.
 
@@ -583,6 +787,7 @@ def validate_password_strength(password: str) -> tuple[bool, str]:
     """Validate password meets strength requirements.
 
     Uses configurable settings from config.py for password policy.
+    Respects password_policy_enabled toggle - if disabled, all passwords pass.
 
     Args:
         password: Password to validate
@@ -590,6 +795,10 @@ def validate_password_strength(password: str) -> tuple[bool, str]:
     Returns:
         tuple: (is_valid, error_message)
     """
+    # If password policy is disabled, skip all validation
+    if not getattr(settings, "password_policy_enabled", True):
+        return True, ""
+
     min_length = getattr(settings, "password_min_length", 8)
     require_uppercase = getattr(settings, "password_require_uppercase", False)
     require_lowercase = getattr(settings, "password_require_lowercase", False)
@@ -623,7 +832,172 @@ admin_router = APIRouter(prefix="/admin", tags=["Admin UI"])
 ####################
 
 
+@admin_router.get("/overview/partial")
+async def get_overview_partial(
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Render the overview dashboard partial HTML template.
+
+    This endpoint returns a rendered HTML partial containing an architecture
+    diagram showing ContextForge inputs (Virtual Servers), middleware (Plugins),
+    and outputs (A2A Agents, MCP Gateways, Tools, etc.) along with key metrics.
+
+    Args:
+        request: FastAPI request object
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        HTMLResponse with rendered overview partial template
+    """
+    LOGGER.debug(f"User {get_user_email(user)} requested overview partial")
+
+    try:
+        # Gather counts for all entity types
+        # Note: SQLAlchemy func.count requires pylint disable=not-callable
+        # Virtual Servers (inputs) - uses 'enabled' field
+        servers_total = db.query(func.count(DbServer.id)).scalar() or 0  # pylint: disable=not-callable
+        servers_active = db.query(func.count(DbServer.id)).filter(DbServer.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # MCP Gateways - uses 'enabled' field
+        gateways_total = db.query(func.count(DbGateway.id)).scalar() or 0  # pylint: disable=not-callable
+        gateways_active = db.query(func.count(DbGateway.id)).filter(DbGateway.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # A2A Agents (if enabled) - uses 'enabled' field
+        a2a_total = 0
+        a2a_active = 0
+        if settings.mcpgateway_a2a_enabled:
+            a2a_total = db.query(func.count(DbA2AAgent.id)).scalar() or 0  # pylint: disable=not-callable
+            a2a_active = db.query(func.count(DbA2AAgent.id)).filter(DbA2AAgent.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # Tools - uses 'enabled' field
+        tools_total = db.query(func.count(DbTool.id)).scalar() or 0  # pylint: disable=not-callable
+        tools_active = db.query(func.count(DbTool.id)).filter(DbTool.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # Prompts - uses 'enabled' field
+        prompts_total = db.query(func.count(DbPrompt.id)).scalar() or 0  # pylint: disable=not-callable
+        prompts_active = db.query(func.count(DbPrompt.id)).filter(DbPrompt.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # Resources - uses 'enabled' field
+        resources_total = db.query(func.count(DbResource.id)).scalar() or 0  # pylint: disable=not-callable
+        resources_active = db.query(func.count(DbResource.id)).filter(DbResource.enabled.is_(True)).scalar() or 0  # pylint: disable=not-callable
+
+        # Plugin stats
+        overview_plugin_service = get_plugin_service()
+        plugin_manager = getattr(request.app.state, "plugin_manager", None)
+        if plugin_manager:
+            overview_plugin_service.set_plugin_manager(plugin_manager)
+        plugin_stats = await overview_plugin_service.get_plugin_statistics()
+
+        # Infrastructure status (database, cache, uptime)
+        _, db_reachable = version_module._database_version()  # pylint: disable=protected-access
+        db_dialect = version_module.engine.dialect.name
+        cache_type = settings.cache_type
+        uptime_seconds = int(time.time() - version_module.START_TIME)
+
+        # Redis status (if applicable)
+        redis_available = version_module.REDIS_AVAILABLE
+        redis_reachable = False
+        if redis_available and cache_type.lower() == "redis" and settings.redis_url:
+            try:
+                # First-Party
+                from mcpgateway.utils.redis_client import is_redis_available  # pylint: disable=import-outside-toplevel
+
+                redis_reachable = await is_redis_available()
+            except Exception:
+                redis_reachable = False
+
+        # Aggregate metrics from services
+        overview_tool_service = ToolService()
+        overview_server_service = ServerService()
+        overview_prompt_service = PromptService()
+        overview_resource_service = ResourceService()
+
+        tool_metrics = await overview_tool_service.aggregate_metrics(db)
+        server_metrics = await overview_server_service.aggregate_metrics(db)
+        prompt_metrics = await overview_prompt_service.aggregate_metrics(db)
+        resource_metrics = await overview_resource_service.aggregate_metrics(db)
+
+        # Calculate totals
+        total_executions = (
+            (tool_metrics.get("total_executions", 0) if isinstance(tool_metrics, dict) else getattr(tool_metrics, "total_executions", 0))
+            + (server_metrics.total_executions if hasattr(server_metrics, "total_executions") else server_metrics.get("total_executions", 0))
+            + (prompt_metrics.get("total_executions", 0) if isinstance(prompt_metrics, dict) else getattr(prompt_metrics, "total_executions", 0))
+            + (resource_metrics.total_executions if hasattr(resource_metrics, "total_executions") else resource_metrics.get("total_executions", 0))
+        )
+
+        successful_executions = (
+            (tool_metrics.get("successful_executions", 0) if isinstance(tool_metrics, dict) else getattr(tool_metrics, "successful_executions", 0))
+            + (server_metrics.successful_executions if hasattr(server_metrics, "successful_executions") else server_metrics.get("successful_executions", 0))
+            + (prompt_metrics.get("successful_executions", 0) if isinstance(prompt_metrics, dict) else getattr(prompt_metrics, "successful_executions", 0))
+            + (resource_metrics.successful_executions if hasattr(resource_metrics, "successful_executions") else resource_metrics.get("successful_executions", 0))
+        )
+
+        success_rate = (successful_executions / total_executions * 100) if total_executions > 0 else 100.0
+
+        # Calculate average latency across all services
+        latencies = []
+        for m in [tool_metrics, server_metrics, prompt_metrics, resource_metrics]:
+            avg_time = m.get("avg_response_time") if isinstance(m, dict) else getattr(m, "avg_response_time", None)
+            if avg_time is not None:
+                latencies.append(avg_time)
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+
+        # Prepare context
+        context = {
+            "request": request,
+            "root_path": request.scope.get("root_path", ""),
+            # Inputs
+            "servers_total": servers_total,
+            "servers_active": servers_active,
+            # Outputs
+            "gateways_total": gateways_total,
+            "gateways_active": gateways_active,
+            "a2a_total": a2a_total,
+            "a2a_active": a2a_active,
+            "a2a_enabled": settings.mcpgateway_a2a_enabled,
+            "tools_total": tools_total,
+            "tools_active": tools_active,
+            "prompts_total": prompts_total,
+            "prompts_active": prompts_active,
+            "resources_total": resources_total,
+            "resources_active": resources_active,
+            # Plugins (plugin_stats can be dict or PluginStatsResponse)
+            "plugins_total": plugin_stats.get("total_plugins", 0) if isinstance(plugin_stats, dict) else getattr(plugin_stats, "total_plugins", 0),
+            "plugins_enabled": plugin_stats.get("enabled_plugins", 0) if isinstance(plugin_stats, dict) else getattr(plugin_stats, "enabled_plugins", 0),
+            "plugins_by_hook": plugin_stats.get("plugins_by_hook", {}) if isinstance(plugin_stats, dict) else getattr(plugin_stats, "plugins_by_hook", {}),
+            # Metrics
+            "total_executions": total_executions,
+            "success_rate": success_rate,
+            "avg_latency_ms": avg_latency * 1000 if avg_latency else 0.0,
+            # Version
+            "version": __version__,
+            # Infrastructure
+            "db_dialect": db_dialect,
+            "db_reachable": db_reachable,
+            "cache_type": cache_type,
+            "redis_available": redis_available,
+            "redis_reachable": redis_reachable,
+            "uptime_seconds": uptime_seconds,
+        }
+
+        return request.app.state.templates.TemplateResponse("overview_partial.html", context)
+
+    except Exception as e:
+        LOGGER.error(f"Error rendering overview partial: {e}")
+        error_html = f"""
+        <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 px-4 py-3 rounded">
+            <strong class="font-bold">Error loading overview:</strong>
+            <span class="block sm:inline">{html.escape(str(e))}</span>
+        </div>
+        """
+        return HTMLResponse(content=error_html, status_code=500)
+
+
 @admin_router.get("/config/passthrough-headers", response_model=GlobalConfigRead)
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=30)  # Lower limit for config endpoints
 async def get_global_passthrough_headers(
     db: Session = Depends(get_db),
@@ -649,11 +1023,13 @@ async def get_global_passthrough_headers(
         True
     """
     # Use cache for reads (Issue #1715)
-    passthrough_headers = global_config_cache.get_passthrough_headers(db, [])
+    # Pass env defaults so env/merge modes return correct headers
+    passthrough_headers = global_config_cache.get_passthrough_headers(db, settings.default_passthrough_headers)
     return GlobalConfigRead(passthrough_headers=passthrough_headers)
 
 
 @admin_router.put("/config/passthrough-headers", response_model=GlobalConfigRead)
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=20)  # Stricter limit for config updates
 async def update_global_passthrough_headers(
     request: Request,  # pylint: disable=unused-argument
@@ -708,6 +1084,7 @@ async def update_global_passthrough_headers(
 
 
 @admin_router.post("/config/passthrough-headers/invalidate-cache")
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=10)  # Strict limit for cache operations
 async def invalidate_passthrough_headers_cache(
     _user=Depends(get_current_user_with_permissions),
@@ -744,6 +1121,7 @@ async def invalidate_passthrough_headers_cache(
 
 
 @admin_router.get("/config/passthrough-headers/cache-stats")
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=30)
 async def get_passthrough_headers_cache_stats(
     _user=Depends(get_current_user_with_permissions),
@@ -778,6 +1156,7 @@ async def get_passthrough_headers_cache_stats(
 
 
 @admin_router.post("/cache/a2a-stats/invalidate")
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=10)
 async def invalidate_a2a_stats_cache(
     _user=Depends(get_current_user_with_permissions),
@@ -812,6 +1191,7 @@ async def invalidate_a2a_stats_cache(
 
 
 @admin_router.get("/cache/a2a-stats/stats")
+@require_permission("admin.system_config")
 @rate_limit(requests_per_minute=30)
 async def get_a2a_stats_cache_stats(
     _user=Depends(get_current_user_with_permissions),
@@ -838,7 +1218,61 @@ async def get_a2a_stats_cache_stats(
     return a2a_stats_cache.stats()
 
 
+@admin_router.get("/mcp-pool/metrics")
+@require_permission("admin.system_config")
+@rate_limit(requests_per_minute=60)
+async def get_mcp_session_pool_metrics(
+    request: Request,  # pylint: disable=unused-argument
+    _user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """Get MCP session pool metrics.
+
+    Returns pool statistics including hits, misses, evictions, hit rate,
+    circuit breaker status, and per-pool details. Useful for monitoring
+    pool effectiveness and diagnosing connection issues.
+
+    Args:
+        request: HTTP request object (required by rate_limit decorator)
+        _user: Authenticated user
+
+    Returns:
+        Dict with pool metrics including:
+        - hits: Number of pool hits (session reuse)
+        - misses: Number of pool misses (new session created)
+        - evictions: Number of sessions evicted due to TTL
+        - health_check_failures: Number of failed health checks
+        - circuit_breaker_trips: Number of circuit breaker activations
+        - pool_keys_evicted: Number of idle pool keys cleaned up
+        - sessions_reaped: Number of stale sessions closed by background reaper
+        - hit_rate: Ratio of hits to total requests (0.0-1.0)
+        - pool_key_count: Number of active pool keys
+        - pools: Per-pool statistics (available, active, max)
+        - circuit_breakers: Circuit breaker status per URL
+
+    Raises:
+        HTTPException: If session pool is not initialized
+
+    Examples:
+        >>> from mcpgateway.admin import get_mcp_session_pool_metrics
+        >>> get_mcp_session_pool_metrics.__name__
+        'get_mcp_session_pool_metrics'
+        >>> import inspect
+        >>> inspect.iscoroutinefunction(get_mcp_session_pool_metrics)
+        True
+    """
+    if not settings.mcp_session_pool_enabled:
+        return {"enabled": False, "message": "MCP session pool is disabled"}
+
+    try:
+        pool = get_mcp_session_pool()
+        metrics = pool.get_metrics()
+        return {"enabled": True, **metrics}
+    except RuntimeError as e:
+        return {"enabled": True, "error": str(e), "message": "Pool not yet initialized"}
+
+
 @admin_router.get("/config/settings")
+@require_permission("admin.system_config")
 async def get_configuration_settings(
     _db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -935,11 +1369,8 @@ async def get_configuration_settings(
             "plugins_enabled": settings.plugins_enabled,
             "well_known_enabled": settings.well_known_enabled,
         },
-        "Federation": {
-            "federation_enabled": settings.federation_enabled,
-            "federation_discovery": settings.federation_discovery,
-            "federation_timeout": settings.federation_timeout,
-            "federation_sync_interval": settings.federation_sync_interval,
+        "Connection Timeouts": {
+            "federation_timeout": settings.federation_timeout,  # Gateway/server HTTP request timeout
         },
         "Transport": {
             "transport_type": settings.transport_type,
@@ -995,7 +1426,7 @@ async def get_configuration_settings(
 @admin_router.get("/servers", response_model=PaginatedResponse)
 async def admin_list_servers(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -1008,7 +1439,7 @@ async def admin_list_servers(
 
     Args:
         page (int): Page number (1-indexed) for offset pagination.
-        per_page (int): Number of items per page (1-500).
+        per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive servers.
         db (Session): The database session dependency.
         user (str): The authenticated user dependency.
@@ -1085,12 +1516,182 @@ async def admin_list_servers(
         user_email=user_email,
     )
 
+    # End the read-only transaction early to avoid idle-in-transaction under load.
+    db.commit()
+
     # Return standardized paginated response
     return {
         "data": [server.model_dump(by_alias=True) for server in paginated_result["data"]],
         "pagination": paginated_result["pagination"].model_dump(),
         "links": paginated_result["links"].model_dump() if paginated_result["links"] else None,
     }
+
+
+@admin_router.get("/servers/partial", response_class=HTMLResponse)
+async def admin_servers_partial_html(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    include_inactive: bool = False,
+    render: Optional[str] = Query(None),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return paginated servers HTML partials for the admin UI.
+
+    This HTMX endpoint returns only the partial HTML used by the admin UI for
+    servers. It supports three render modes:
+
+    - default: full table partial (rows + controls)
+    - ``render="controls"``: return only pagination controls
+    - ``render="selector"``: return selector items for infinite scroll
+
+    Args:
+        request (Request): FastAPI request object used by the template engine.
+        page (int): Page number (1-indexed).
+        per_page (int): Number of items per page (bounded by settings).
+        include_inactive (bool): If True, include inactive servers in results.
+        render (Optional[str]): Render mode; one of None, "controls", "selector".
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (dependency-injected).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        Union[HTMLResponse, TemplateResponse]: A rendered template response
+        containing either the table partial, pagination controls, or selector
+        items depending on ``render``. The response contains JSON-serializable
+        encoded server data when templates expect it.
+    """
+    LOGGER.debug(f"User {get_user_email(user)} requested servers HTML partial (page={page}, per_page={per_page}, include_inactive={include_inactive}, render={render}, team_id={team_id})")
+
+    # Normalize per_page within configured bounds
+    per_page = max(settings.pagination_min_page_size, min(per_page, settings.pagination_max_page_size))
+
+    user_email = get_user_email(user)
+
+    # Team scoping
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    # Build base query with eager loading to avoid N+1 queries
+    query = select(DbServer).options(
+        selectinload(DbServer.tools),
+        selectinload(DbServer.resources),
+        selectinload(DbServer.prompts),
+        selectinload(DbServer.a2a_agents),
+        joinedload(DbServer.email_team),
+    )
+
+    if not include_inactive:
+        query = query.where(DbServer.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show servers from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbServer.team_id == team_id, DbServer.visibility.in_(["team", "public"])),
+                and_(DbServer.team_id == team_id, DbServer.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering servers by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbServer.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbServer.team_id.in_(team_ids), DbServer.visibility.in_(["team", "public"])))
+        access_conditions.append(DbServer.visibility == "public")
+        query = query.where(or_(*access_conditions))
+
+    # Apply pagination ordering for cursor support
+    query = query.order_by(desc(DbServer.created_at), desc(DbServer.id))
+
+    # Build query params for pagination links
+    query_params = {}
+    if include_inactive:
+        query_params["include_inactive"] = "true"
+    if team_id:
+        query_params["team_id"] = team_id
+
+    # Use unified pagination function
+    paginated_result = await paginate_query(
+        db=db,
+        query=query,
+        page=page,
+        per_page=per_page,
+        cursor=None,  # HTMX partials use page-based navigation
+        base_url=f"{settings.app_root_path}/admin/servers/partial",
+        query_params=query_params,
+        use_cursor_threshold=False,  # Disable auto-cursor switching for UI
+    )
+
+    # Extract paginated servers (DbServer objects)
+    servers_db = paginated_result["data"]
+    pagination = paginated_result["pagination"]
+    links = paginated_result["links"]
+
+    # Team names are loaded via joinedload(DbServer.email_team) and accessed via server.team property
+
+    # Batch convert to Pydantic models using server service
+    # This eliminates the N+1 query problem from calling get_server_details() in a loop
+    servers_pydantic = []
+    for s in servers_db:
+        try:
+            servers_pydantic.append(server_service.convert_server_to_read(s, include_metrics=False))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert server {getattr(s, 'id', 'unknown')} ({getattr(s, 'name', 'unknown')}): {e}")
+    data = jsonable_encoder(servers_pydantic)
+    base_url = f"{settings.app_root_path}/admin/servers/partial"
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
+
+    if render == "controls":
+        return request.app.state.templates.TemplateResponse(
+            "pagination_controls.html",
+            {
+                "request": request,
+                "pagination": pagination.model_dump(),
+                "base_url": base_url,
+                "hx_target": "#servers-table-body",
+                "hx_indicator": "#servers-loading",
+                "query_params": query_params,
+                "root_path": request.scope.get("root_path", ""),
+            },
+        )
+
+    if render == "selector":
+        return request.app.state.templates.TemplateResponse(
+            "servers_selector_items.html",
+            {
+                "request": request,
+                "data": data,
+                "pagination": pagination.model_dump(),
+                "root_path": request.scope.get("root_path", ""),
+            },
+        )
+
+    return request.app.state.templates.TemplateResponse(
+        "servers_partial.html",
+        {
+            "request": request,
+            "data": data,
+            "pagination": pagination.model_dump(),
+            "links": links.model_dump() if links else None,
+            "root_path": request.scope.get("root_path", ""),
+            "include_inactive": include_inactive,
+        },
+    )
 
 
 @admin_router.get("/servers/{server_id}", response_model=ServerRead)
@@ -1360,6 +1961,30 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
             except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
 
+        # Handle OAuth 2.0 configuration (RFC 9728)
+        oauth_enabled = form.get("oauth_enabled") == "on"
+        oauth_config = None
+        if oauth_enabled:
+            authorization_server = str(form.get("oauth_authorization_server", "")).strip()
+            scopes_str = str(form.get("oauth_scopes", "")).strip()
+            token_endpoint = str(form.get("oauth_token_endpoint", "")).strip()
+
+            if authorization_server:
+                oauth_config = {"authorization_servers": [authorization_server]}
+                if scopes_str:
+                    # Convert space-separated scopes to list
+                    oauth_config["scopes_supported"] = scopes_str.split()
+                if token_endpoint:
+                    oauth_config["token_endpoint"] = token_endpoint
+            else:
+                # Invalid or incomplete OAuth configuration; disable OAuth to avoid inconsistent state
+                LOGGER.warning(
+                    "OAuth was enabled for server '%s' but no authorization server was provided; disabling OAuth for this server.",
+                    form.get("name"),
+                )
+                oauth_enabled = False
+                oauth_config = None
+
         server = ServerCreate(
             id=form.get("id") or None,
             name=form.get("name"),
@@ -1370,6 +1995,8 @@ async def admin_add_server(request: Request, db: Session = Depends(get_db), user
             associated_prompts=",".join(str(x) for x in associated_prompts_list),
             tags=tags,
             visibility=visibility,
+            oauth_enabled=oauth_enabled,
+            oauth_config=oauth_config,
         )
     except KeyError as e:
         # Convert KeyError to ValidationError-like response
@@ -1586,6 +2213,30 @@ async def admin_edit_server(
             except orjson.JSONDecodeError:
                 LOGGER.warning("Failed to parse allPromptIds JSON, falling back to checked prompts")
 
+        # Handle OAuth 2.0 configuration (RFC 9728)
+        oauth_enabled = form.get("oauth_enabled") == "on"
+        oauth_config = None
+        if oauth_enabled:
+            authorization_server = str(form.get("oauth_authorization_server", "")).strip()
+            scopes_str = str(form.get("oauth_scopes", "")).strip()
+            token_endpoint = str(form.get("oauth_token_endpoint", "")).strip()
+
+            if authorization_server:
+                oauth_config = {"authorization_servers": [authorization_server]}
+                if scopes_str:
+                    # Convert space-separated scopes to list
+                    oauth_config["scopes_supported"] = scopes_str.split()
+                if token_endpoint:
+                    oauth_config["token_endpoint"] = token_endpoint
+            else:
+                # Invalid or incomplete OAuth configuration; disable OAuth to avoid inconsistent state
+                LOGGER.warning(
+                    "OAuth was enabled for server '%s' but no authorization server was provided; disabling OAuth for this server.",
+                    form.get("name"),
+                )
+                oauth_enabled = False
+                oauth_config = None
+
         server = ServerUpdate(
             id=form.get("id"),
             name=form.get("name"),
@@ -1598,6 +2249,8 @@ async def admin_edit_server(
             visibility=visibility,
             team_id=team_id,
             owner_email=user_email,
+            oauth_enabled=oauth_enabled,
+            oauth_config=oauth_config,
         )
 
         await server_service.update_server(
@@ -1635,23 +2288,23 @@ async def admin_edit_server(
         return ORJSONResponse(content={"message": str(ex), "success": False}, status_code=500)
 
 
-@admin_router.post("/servers/{server_id}/toggle")
-async def admin_toggle_server(
+@admin_router.post("/servers/{server_id}/state")
+async def admin_set_server_state(
     server_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Response:
     """
-    Toggle a server's active status via the admin UI.
+    Set a server's active status via the admin UI.
 
     This endpoint processes a form request to activate or deactivate a server.
     It expects a form field 'activate' with value "true" to activate the server
     or "false" to deactivate it. The endpoint handles exceptions gracefully and
-    logs any errors that might occur during the status toggle operation.
+    logs any errors that might occur during the status change operation.
 
     Args:
-        server_id (str): The ID of the server whose status to toggle.
+        server_id (str): The ID of the server whose status to set.
         request (Request): FastAPI request containing form data with the 'activate' field.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -1675,14 +2328,14 @@ async def admin_toggle_server(
         >>> form_data_activate = FormData([("activate", "true"), ("is_inactive_checked", "false")])
         >>> mock_request_activate = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_activate.form = AsyncMock(return_value=form_data_activate)
-        >>> original_toggle_server_status = server_service.toggle_server_status
-        >>> server_service.toggle_server_status = AsyncMock()
+        >>> original_set_server_state= server_service.set_server_state
+        >>> server_service.set_server_state = AsyncMock()
         >>>
-        >>> async def test_admin_toggle_server_activate():
-        ...     result = await admin_toggle_server(server_id, mock_request_activate, mock_db, mock_user)
+        >>> async def test_admin_set_server_state_activate():
+        ...     result = await admin_set_server_state(server_id, mock_request_activate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/admin#catalog" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_server_activate())
+        >>> asyncio.run(test_admin_set_server_state_activate())
         True
         >>>
         >>> # Happy path: Deactivate server
@@ -1690,33 +2343,33 @@ async def admin_toggle_server(
         >>> mock_request_deactivate = MagicMock(spec=Request, scope={"root_path": "/api"})
         >>> mock_request_deactivate.form = AsyncMock(return_value=form_data_deactivate)
         >>>
-        >>> async def test_admin_toggle_server_deactivate():
-        ...     result = await admin_toggle_server(server_id, mock_request_deactivate, mock_db, mock_user)
+        >>> async def test_admin_set_server_state_deactivate():
+        ...     result = await admin_set_server_state(server_id, mock_request_deactivate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/api/admin#catalog" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_server_deactivate())
+        >>> asyncio.run(test_admin_set_server_state_deactivate())
         True
         >>>
-        >>> # Edge case: Toggle with inactive checkbox checked
+        >>> # Edge case: Set state with inactive checkbox checked
         >>> form_data_inactive = FormData([("activate", "true"), ("is_inactive_checked", "true")])
         >>> mock_request_inactive = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_inactive.form = AsyncMock(return_value=form_data_inactive)
         >>>
-        >>> async def test_admin_toggle_server_inactive_checked():
-        ...     result = await admin_toggle_server(server_id, mock_request_inactive, mock_db, mock_user)
+        >>> async def test_admin_set_server_state_inactive_checked():
+        ...     result = await admin_set_server_state(server_id, mock_request_inactive, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/admin/?include_inactive=true#catalog" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_server_inactive_checked())
+        >>> asyncio.run(test_admin_set_server_state_inactive_checked())
         True
         >>>
-        >>> # Error path: Simulate an exception during toggle
+        >>> # Error path: Simulate an exception during state change
         >>> form_data_error = FormData([("activate", "true")])
         >>> mock_request_error = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_error.form = AsyncMock(return_value=form_data_error)
-        >>> server_service.toggle_server_status = AsyncMock(side_effect=Exception("Toggle failed"))
+        >>> server_service.set_server_state = AsyncMock(side_effect=Exception("State change failed"))
         >>>
-        >>> async def test_admin_toggle_server_exception():
-        ...     result = await admin_toggle_server(server_id, mock_request_error, mock_db, mock_user)
+        >>> async def test_admin_set_server_state_exception():
+        ...     result = await admin_set_server_state(server_id, mock_request_error, mock_db, mock_user)
         ...     location_header = result.headers["location"]
         ...     return (
         ...         isinstance(result, RedirectResponse)
@@ -1726,26 +2379,26 @@ async def admin_toggle_server(
         ...         and location_header.endswith("#catalog")  # Ensure the fragment is correct
         ...     )
         >>>
-        >>> asyncio.run(test_admin_toggle_server_exception())
+        >>> asyncio.run(test_admin_set_server_state_exception())
         True
         >>>
         >>> # Restore original method
-        >>> server_service.toggle_server_status = original_toggle_server_status
+        >>> server_service.set_server_state = original_set_server_state
     """
     form = await request.form()
     error_message = None
     user_email = get_user_email(user)
-    LOGGER.debug(f"User {user_email} is toggling server ID {server_id} with activate: {form.get('activate')}")
+    LOGGER.debug(f"User {user_email} is setting server ID {server_id} state with activate: {form.get('activate')}")
     activate = str(form.get("activate", "true")).lower() == "true"
     is_inactive_checked = str(form.get("is_inactive_checked", "false"))
     try:
-        await server_service.toggle_server_status(db, server_id, activate, user_email=user_email)
+        await server_service.set_server_state(db, server_id, activate, user_email=user_email)
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling servers {server_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting server {server_id} state: {e}")
         error_message = str(e)
     except Exception as e:
-        LOGGER.error(f"Error toggling server status: {e}")
-        error_message = "Error toggling server status. Please try again."
+        LOGGER.error(f"Error setting server status: {e}")
+        error_message = "Error setting server status. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -1864,7 +2517,7 @@ async def admin_delete_server(server_id: str, request: Request, db: Session = De
 @admin_router.get("/resources", response_model=PaginatedResponse)
 async def admin_list_resources(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -1877,7 +2530,7 @@ async def admin_list_resources(
 
     Args:
         page (int): Page number (1-indexed). Default: 1.
-        per_page (int): Items per page (1-500). Default: 50.
+        per_page (int): Items per page. Default: 50.
         include_inactive (bool): Whether to include inactive resources in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -1955,7 +2608,7 @@ async def admin_list_resources(
 @admin_router.get("/prompts", response_model=PaginatedResponse)
 async def admin_list_prompts(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -1968,7 +2621,7 @@ async def admin_list_prompts(
 
     Args:
         page (int): Page number (1-indexed) for offset pagination.
-        per_page (int): Number of items per page (1-500).
+        per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive prompts in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -2052,7 +2705,7 @@ async def admin_list_prompts(
 @admin_router.get("/gateways", response_model=PaginatedResponse)
 async def admin_list_gateways(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -2065,7 +2718,7 @@ async def admin_list_gateways(
 
     Args:
         page (int): Page number (1-indexed) for offset pagination.
-        per_page (int): Number of items per page (1-500).
+        per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive gateways in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -2139,51 +2792,22 @@ async def admin_list_gateways(
     }
 
 
-@admin_router.get("/gateways/ids")
-async def admin_list_gateway_ids(
-    include_inactive: bool = False,
-    db: Session = Depends(get_db),
-    user=Depends(get_current_user_with_permissions),
-) -> Dict[str, Any]:
-    """
-    Return a JSON object containing a list of all gateway IDs.
-
-    This endpoint is used by the admin UI to support the "Select All" action
-    for gateways. It returns a simple JSON payload with a single key
-    `gateway_ids` containing an array of gateway identifiers.
-
-    Args:
-        include_inactive (bool): Whether to include inactive gateways in the results.
-        db (Session): Database session dependency.
-        user: Authenticated user dependency.
-
-    Returns:
-        Dict[str, Any]: JSON object containing the `gateway_ids` list and metadata.
-    """
-    user_email = get_user_email(user)
-    LOGGER.debug(f"User {user_email} requested gateway ids list")
-    gateways, _ = await gateway_service.list_gateways(db, include_inactive=include_inactive, user_email=user_email, limit=0)
-    ids = [str(g.id) for g in gateways]
-    LOGGER.info(f"Gateway IDs retrieved: {ids}")
-    return {"gateway_ids": ids}
-
-
-@admin_router.post("/gateways/{gateway_id}/toggle")
-async def admin_toggle_gateway(
+@admin_router.post("/gateways/{gateway_id}/state")
+async def admin_set_gateway_state(
     gateway_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> RedirectResponse:
     """
-    Toggle the active status of a gateway via the admin UI.
+    Set the active status of a gateway via the admin UI.
 
-    This endpoint allows an admin to toggle the active status of a gateway.
+    This endpoint allows an admin to set the active status of a gateway.
     It expects a form field 'activate' with a value of "true" or "false" to
     determine the new status of the gateway.
 
     Args:
-        gateway_id (str): The ID of the gateway to toggle.
+        gateway_id (str): The ID of the gateway to set state for.
         request (Request): The FastAPI request object containing form data.
         db (Session): The database session dependency.
         user (str): The authenticated user dependency.
@@ -2207,14 +2831,14 @@ async def admin_toggle_gateway(
         >>> form_data_activate = FormData([("activate", "true"), ("is_inactive_checked", "false")])
         >>> mock_request_activate = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_activate.form = AsyncMock(return_value=form_data_activate)
-        >>> original_toggle_gateway_status = gateway_service.toggle_gateway_status
-        >>> gateway_service.toggle_gateway_status = AsyncMock()
+        >>> original_set_gateway_state = gateway_service.set_gateway_state
+        >>> gateway_service.set_gateway_state = AsyncMock()
         >>>
-        >>> async def test_admin_toggle_gateway_activate():
-        ...     result = await admin_toggle_gateway(gateway_id, mock_request_activate, mock_db, mock_user)
+        >>> async def test_admin_set_gateway_state_activate():
+        ...     result = await admin_set_gateway_state(gateway_id, mock_request_activate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/admin#gateways" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_gateway_activate())
+        >>> asyncio.run(test_admin_set_gateway_state_activate())
         True
         >>>
         >>> # Happy path: Deactivate gateway
@@ -2222,21 +2846,21 @@ async def admin_toggle_gateway(
         >>> mock_request_deactivate = MagicMock(spec=Request, scope={"root_path": "/api"})
         >>> mock_request_deactivate.form = AsyncMock(return_value=form_data_deactivate)
         >>>
-        >>> async def test_admin_toggle_gateway_deactivate():
-        ...     result = await admin_toggle_gateway(gateway_id, mock_request_deactivate, mock_db, mock_user)
+        >>> async def test_admin_set_gateway_state_deactivate():
+        ...     result = await admin_set_gateway_state(gateway_id, mock_request_deactivate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/api/admin#gateways" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_gateway_deactivate())
+        >>> asyncio.run(test_admin_set_gateway_state_deactivate())
         True
         >>>
         >>> # Error path: Simulate an exception during toggle
         >>> form_data_error = FormData([("activate", "true")])
         >>> mock_request_error = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_error.form = AsyncMock(return_value=form_data_error)
-        >>> gateway_service.toggle_gateway_status = AsyncMock(side_effect=Exception("Toggle failed"))
+        >>> gateway_service.set_gateway_state = AsyncMock(side_effect=Exception("State change failed"))
         >>>
-        >>> async def test_admin_toggle_gateway_exception():
-        ...     result = await admin_toggle_gateway(gateway_id, mock_request_error, mock_db, mock_user)
+        >>> async def test_admin_set_gateway_state_exception():
+        ...     result = await admin_set_gateway_state(gateway_id, mock_request_error, mock_db, mock_user)
         ...     location_header = result.headers["location"]
         ...     return (
         ...         isinstance(result, RedirectResponse)
@@ -2246,26 +2870,26 @@ async def admin_toggle_gateway(
         ...         and location_header.endswith("#gateways")  # Ensure the fragment is correct
         ...     )
         >>>
-        >>> asyncio.run(test_admin_toggle_gateway_exception())
+        >>> asyncio.run(test_admin_set_gateway_state_exception())
         True
         >>> # Restore original method
-        >>> gateway_service.toggle_gateway_status = original_toggle_gateway_status
+        >>> gateway_service.set_gateway_state = original_set_gateway_state
     """
     error_message = None
     user_email = get_user_email(user)
-    LOGGER.debug(f"User {user_email} is toggling gateway ID {gateway_id}")
+    LOGGER.debug(f"User {user_email} is setting gateway state for ID {gateway_id}")
     form = await request.form()
     activate = str(form.get("activate", "true")).lower() == "true"
     is_inactive_checked = str(form.get("is_inactive_checked", "false"))
 
     try:
-        await gateway_service.toggle_gateway_status(db, gateway_id, activate, user_email=user_email)
+        await gateway_service.set_gateway_state(db, gateway_id, activate, user_email=user_email)
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling gateway {gateway_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting gateway state {gateway_id}: {e}")
         error_message = str(e)
     except Exception as e:
-        LOGGER.error(f"Error toggling gateway status: {e}")
-        error_message = "Failed to toggle gateway status. Please try again."
+        LOGGER.error(f"Error setting gateway state: {e}")
+        error_message = "Failed to set gateway state. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -2284,7 +2908,7 @@ async def admin_toggle_gateway(
 @admin_router.get("/", name="admin_home", response_class=HTMLResponse)
 async def admin_ui(
     request: Request,
-    team_id: Optional[str] = Query(None),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -2441,18 +3065,23 @@ async def admin_ui(
             team_service = TeamManagementService(db)
             if user_email and "@" in user_email:
                 raw_teams = await team_service.get_user_teams(user_email)
+
+                # Batch fetch all data in 2 queries instead of 2N queries (N+1 elimination)
+                team_ids = [str(team.id) for team in raw_teams]
+                member_counts = await team_service.get_member_counts_batch_cached(team_ids)
+                user_roles = team_service.get_user_roles_batch(user_email, team_ids)
+
                 user_teams = []
                 for team in raw_teams:
                     try:
-                        # Get the user's role in this team
-                        user_role = await team_service.get_user_role_in_team(user_email, team.id)
+                        current_team_id = str(team.id) if team.id else ""
                         team_dict = {
-                            "id": str(team.id) if team.id else "",
+                            "id": current_team_id,
                             "name": str(team.name) if team.name else "",
                             "type": str(getattr(team, "type", "organization")),
                             "is_personal": bool(getattr(team, "is_personal", False)),
-                            "member_count": team.get_member_count() if hasattr(team, "get_member_count") else 0,
-                            "role": user_role or "member",
+                            "member_count": member_counts.get(current_team_id, 0),
+                            "role": user_roles.get(current_team_id) or "member",
                         }
                         user_teams.append(team_dict)
                     except Exception as team_error:
@@ -2468,6 +3097,7 @@ async def admin_ui(
     # Optionally you can raise HTTPException(403) if you prefer strict rejection.
     # --------------------------------------------------------------------------------
     selected_team_id = team_id
+    user_email = get_user_email(user)
     if team_id and getattr(settings, "email_auth_enabled", False):
         # If team list failed to load for some reason, be conservative and drop selection
         if not user_teams:
@@ -2791,6 +3421,9 @@ async def admin_ui(
     root_path = settings.app_root_path
     max_name_length = settings.validation_max_name_length
 
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
+
     response = request.app.state.templates.TemplateResponse(
         request,
         "admin.html",
@@ -2996,19 +3629,42 @@ async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -
                 root_path = request.scope.get("root_path", "")
                 return RedirectResponse(url=f"{root_path}/admin/login?error=invalid_credentials", status_code=303)
 
-            # Check if password change is required OR if user is using default password
-            needs_password_change = user.password_change_required
+            # Password change enforcement respects master switch and toggles
+            needs_password_change = False
 
-            # Also check if user is using the default password
-            if not needs_password_change:
-                password_service = Argon2PasswordService()
-                is_using_default_password = password_service.verify_password(settings.default_user_password.get_secret_value(), user.password_hash)  # nosec B105
-                if is_using_default_password:
+            if settings.password_change_enforcement_enabled:
+                # If flag is set on the user, always honor it (flag is cleared when password is changed)
+                if getattr(user, "password_change_required", False):
                     needs_password_change = True
-                    # Set the flag in database for future reference
-                    user.password_change_required = True
-                    db.commit()
-                    LOGGER.info(f"User {email} is using default password - forcing password change")
+                    LOGGER.debug("User %s has password_change_required flag set", email)
+
+                # Enforce expiry-based password change if configured and not already required
+                if not needs_password_change:
+                    try:
+                        pwd_changed = getattr(user, "password_changed_at", None)
+                        if pwd_changed:
+                            age_days = (utc_now() - pwd_changed).days
+                            max_age = getattr(settings, "password_max_age_days", 90)
+                            if age_days >= max_age:
+                                needs_password_change = True
+                                LOGGER.debug("User %s password expired (%s days >= %s)", email, age_days, max_age)
+                    except Exception as exc:
+                        LOGGER.debug("Failed to evaluate password age for %s: %s", email, exc)
+
+                # Detect default password on login if enabled
+                if getattr(settings, "detect_default_password_on_login", True):
+                    password_service = Argon2PasswordService()
+                    is_using_default_password = password_service.verify_password(settings.default_user_password.get_secret_value(), user.password_hash)  # nosec B105
+                    if is_using_default_password:
+                        if getattr(settings, "require_password_change_for_default_password", True):
+                            user.password_change_required = True
+                            needs_password_change = True
+                            try:
+                                db.commit()
+                            except Exception as exc:  # log commit failures
+                                LOGGER.warning("Failed to commit password_change_required flag for %s: %s", email, exc)
+                        else:
+                            LOGGER.info("User %s is using default password but enforcement is disabled", email)
 
             if needs_password_change:
                 LOGGER.info(f"User {email} requires password change - redirecting to change password page")
@@ -3053,43 +3709,63 @@ async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -
         return RedirectResponse(url=f"{root_path}/admin/login?error=server_error", status_code=303)
 
 
-@admin_router.post("/logout")
-async def admin_logout(request: Request) -> RedirectResponse:
+@admin_router.api_route("/logout", methods=["GET", "POST"])
+async def admin_logout(request: Request) -> Response:
     """
     Handle admin logout by clearing authentication cookies.
 
-    This endpoint clears the JWT authentication cookie and redirects
-    the user to a login page or back to the admin page (which will
-    trigger authentication).
+    Supports both GET and POST methods:
+    - POST: User-initiated logout from the UI (redirects to login page)
+    - GET: OIDC front-channel logout from identity provider (returns 200 OK)
+
+    For OIDC front-channel logout, Microsoft Entra ID sends GET requests to notify
+    the application that the user has logged out from the IdP. The application
+    should clear the session and return HTTP 200.
 
     Args:
         request (Request): FastAPI request object.
 
     Returns:
-        RedirectResponse: Redirect to admin page with cleared cookies.
+        Response: RedirectResponse for POST, or Response with 200 for GET (front-channel logout).
 
     Examples:
         >>> from fastapi import Request
-        >>> from fastapi.responses import RedirectResponse
+        >>> from fastapi.responses import RedirectResponse, Response
         >>> from unittest.mock import MagicMock
         >>>
-        >>> # Mock request
+        >>> # Mock POST request (user-initiated)
         >>> mock_request = MagicMock(spec=Request)
         >>> mock_request.scope = {"root_path": "/test"}
+        >>> mock_request.method = "POST"
         >>>
         >>> import asyncio
-        >>> async def test_logout():
+        >>> async def test_logout_post():
         ...     response = await admin_logout(mock_request)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_logout())
+        >>> asyncio.run(test_logout_post())
+        True
+
+        >>> # Mock GET request (front-channel logout)
+        >>> mock_request.method = "GET"
+        >>> async def test_logout_get():
+        ...     response = await admin_logout(mock_request)
+        ...     return response.status_code == 200
+        >>>
+        >>> asyncio.run(test_logout_get())
         True
     """
-    LOGGER.info("Admin user logging out")
+    LOGGER.info(f"Admin user logging out (method: {request.method})")
     root_path = request.scope.get("root_path", "")
 
-    # Create redirect response to login page
-    response = RedirectResponse(url=f"{root_path}/admin/login", status_code=303)
+    # For GET requests (OIDC front-channel logout), return 200 OK per OIDC spec
+    # For POST requests (user-initiated), redirect to login page
+    if request.method == "GET":
+        # Front-channel logout: clear cookie and return 200
+        response = Response(content="Logged out", status_code=200)
+    else:
+        # User-initiated logout: clear cookie and redirect to login
+        response = RedirectResponse(url=f"{root_path}/admin/login", status_code=303)
 
     # Clear JWT token cookie
     response.delete_cookie("jwt_token", path=settings.app_root_path or "/", secure=True, httponly=True, samesite="lax")
@@ -3144,6 +3820,7 @@ async def change_password_required_page(request: Request) -> HTMLResponse:
             "request": request,
             "root_path": root_path,
             "ui_airgapped": settings.mcpgateway_ui_airgapped,
+            "password_policy_enabled": getattr(settings, "password_policy_enabled", True),
             "password_min_length": getattr(settings, "password_min_length", 8),
             "password_require_uppercase": getattr(settings, "password_require_uppercase", False),
             "password_require_lowercase": getattr(settings, "password_require_lowercase", False),
@@ -3248,9 +3925,30 @@ async def change_password_required_handler(request: Request, db: Session = Depen
             success = await auth_service.change_password(email=current_user.email, old_password=current_password, new_password=new_password, ip_address=ip_address, user_agent=user_agent)
 
             if success:
-                # Clear the password_change_required flag
-                current_user.password_change_required = False
-                db.commit()
+                # Re-attach current_user to session for downstream use (e.g., get_teams() in token creation)
+                # Note: password_change_required is already cleared by auth_service.change_password()
+                # We must re-attach to ensure team claims are populated in the new JWT token.
+                user_email = current_user.email  # Save before potential re-query
+                try:
+                    # pylint: disable=import-outside-toplevel
+                    # Third-Party
+                    from sqlalchemy import inspect as sa_inspect
+
+                    # First-Party
+                    from mcpgateway.db import EmailUser
+
+                    insp = sa_inspect(current_user)
+                    if insp.transient or insp.detached:
+                        current_user = db.query(EmailUser).filter(EmailUser.email == user_email).first()
+                        if current_user is None:
+                            LOGGER.error(f"User {user_email} not found after successful password change - possible race condition")
+                            root_path = request.scope.get("root_path", "")
+                            return RedirectResponse(url=f"{root_path}/admin/change-password-required?error=server_error", status_code=303)
+                except Exception as e:
+                    # Return early to avoid creating token with empty team claims
+                    LOGGER.error(f"Failed to re-attach user {user_email} to session: {e} - password changed but token creation skipped")
+                    root_path = request.scope.get("root_path", "")
+                    return RedirectResponse(url=f"{root_path}/admin/login?message=password_changed", status_code=303)
 
                 # Create new JWT token
                 token, _ = await create_access_token(current_user)
@@ -3308,22 +4006,30 @@ async def _generate_unified_teams_view(team_service, current_user, root_path):  
     # Get public teams user can join
     public_teams = await team_service.discover_public_teams(current_user.email)
 
+    # Batch fetch ALL data upfront - 3 queries instead of 3N queries (N+1 elimination)
+    user_team_ids = [str(t.id) for t in user_teams]
+    public_team_ids = [str(t.id) for t in public_teams]
+    all_team_ids = user_team_ids + public_team_ids
+
+    member_counts = await team_service.get_member_counts_batch_cached(all_team_ids)
+    user_roles = team_service.get_user_roles_batch(current_user.email, user_team_ids)
+    pending_requests = team_service.get_pending_join_requests_batch(current_user.email, public_team_ids)
+
     # Combine teams with relationship information
     all_teams = []
 
     # Add user's teams (owned and member)
     for team in user_teams:
-        user_role = await team_service.get_user_role_in_team(current_user.email, team.id)
+        team_id = str(team.id)
+        user_role = user_roles.get(team_id)
         relationship = "owner" if user_role == "owner" else "member"
-        all_teams.append({"team": team, "relationship": relationship, "member_count": team.get_member_count()})
+        all_teams.append({"team": team, "relationship": relationship, "member_count": member_counts.get(team_id, 0)})
 
-    # Add public teams user can join - check for pending requests
+    # Add public teams user can join
     for team in public_teams:
-        # Check if user has a pending join request
-        user_requests = await team_service.get_user_join_requests(current_user.email, team.id)
-        pending_request = next((req for req in user_requests if req.status == "pending"), None)
-
-        relationship_data = {"team": team, "relationship": "join", "member_count": team.get_member_count(), "pending_request": pending_request}
+        team_id = str(team.id)
+        pending_request = pending_requests.get(team_id)
+        relationship_data = {"team": team, "relationship": "join", "member_count": member_counts.get(team_id, 0), "pending_request": pending_request}
         all_teams.append(relationship_data)
 
     # Generate HTML for unified team view
@@ -3457,10 +4163,359 @@ async def _generate_unified_teams_view(team_service, current_user, root_path):  
     return HTMLResponse(content=teams_html)
 
 
+@admin_router.get("/teams/ids", response_class=JSONResponse)
+@require_permission("teams.read")
+async def admin_get_all_team_ids(
+    include_inactive: bool = False,
+    visibility: Optional[str] = Query(None, description="Filter by visibility"),
+    q: Optional[str] = Query(None, description="Search query"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return all team IDs accessible to the current user.
+
+    Args:
+        include_inactive (bool): Whether to include inactive teams.
+        visibility (Optional[str]): Filter by team visibility.
+        q (Optional[str]): Search query string.
+        db (Session): Database session dependency.
+        user: Current authenticated user.
+
+    Returns:
+        JSONResponse: Dictionary with list of team IDs and count.
+    """
+    team_service = TeamManagementService(db)
+    user_email = get_user_email(user)
+
+    auth_service = EmailAuthService(db)
+    current_user = await auth_service.get_user_by_email(user_email)
+
+    if not current_user:
+        return {"team_ids": [], "count": 0}
+
+    # If admin, get all teams (filtered)
+    # If regular user, get user teams + accessible public teams?
+    # For now, admin only per usage pattern?
+    # But tools/ids handles team_id scoping. Here we filter by teams user can see.
+    # get_all_team_ids supports search/visibility.
+
+    # Check admin
+    if current_user.is_admin:
+        team_ids = await team_service.get_all_team_ids(include_inactive=include_inactive, visibility_filter=visibility, include_personal=True, search_query=q)
+    else:
+        # For non-admins, get user's teams + public teams logic?
+        # get_user_teams gets all teams user is in.
+        # discover_public_teams gets public teams.
+        # unified search across them?
+        # Simpler: just reuse list_teams logic but with huge limit?
+        # Or, just return user's teams IDs filtering in memory (since user won't have millions of teams)
+        all_teams = await team_service.get_user_teams(user_email, include_personal=True)
+        # Apply filters
+        # Note: get_user_teams includes visibility/inactive implicitly? No, it returns what they are member of.
+        # But we might need public teams too?
+        # Let's align with list_teams logic.
+
+        filtered = []
+        for t in all_teams:
+            if not include_inactive and not t.is_active:
+                continue
+            if visibility and t.visibility != visibility:
+                continue
+            if q:
+                if q.lower() not in t.name.lower() and q.lower() not in t.slug.lower():
+                    continue
+            filtered.append(t.id)
+        team_ids = filtered
+
+    return {"team_ids": team_ids, "count": len(team_ids)}
+
+
+@admin_router.get("/teams/search", response_class=JSONResponse)
+@require_permission("teams.read")
+async def admin_search_teams(
+    q: str = Query("", description="Search query"),
+    include_inactive: bool = False,
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Max results"),
+    visibility: Optional[str] = Query(None, description="Filter by visibility"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Search teams by name/slug.
+
+    Args:
+        q (str): Search query string.
+        include_inactive (bool): Whether to include inactive teams.
+        limit (int): Maximum number of results to return.
+        visibility (Optional[str]): Filter by team visibility.
+        db (Session): Database session dependency.
+        user: Current authenticated user.
+
+    Returns:
+        JSONResponse: List of matching teams with basic info.
+    """
+    team_service = TeamManagementService(db)
+    user_email = get_user_email(user)
+
+    auth_service = EmailAuthService(db)
+    current_user = await auth_service.get_user_by_email(user_email)
+
+    if not current_user:
+        return []
+
+    # Use list_teams logic
+    # For admin: search globally
+    # For user: search user teams (and maybe public?)
+    # existing list_teams handles this via include_personal/logic?
+    # list_teams handles admin vs user distinction?
+    # Wait, list_teams in service doesn't know about user per se. It lists ALL teams based on query.
+    # The CALLER (admin.py) distinguishes.
+
+    if current_user.is_admin:
+        result = await team_service.list_teams(page=1, per_page=limit, include_inactive=include_inactive, visibility_filter=visibility, include_personal=True, search_query=q)
+        # Result is dict {data, pagination...} (since page provided)
+        teams = result["data"]
+    else:
+        # Non-admin search
+        # Reuse user team fetching
+        all_teams = await team_service.get_user_teams(user_email, include_personal=True)
+        # Filter in memory
+        filtered = []
+        for t in all_teams:
+            if not include_inactive and not t.is_active:
+                continue
+            if visibility and t.visibility != visibility:
+                continue
+            if q:
+                if q.lower() not in t.name.lower() and q.lower() not in t.slug.lower():
+                    continue
+            filtered.append(t)
+
+        # Paginate manually
+        teams = filtered[:limit]
+
+    # Serialize
+    return [{"id": t.id, "name": t.name, "slug": t.slug, "description": t.description, "visibility": t.visibility, "is_active": t.is_active} for t in teams]
+
+
+@admin_router.get("/teams/partial")
+@require_permission("teams.read")
+async def admin_teams_partial_html(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Items per page"),
+    include_inactive: bool = Query(False, description="Include inactive teams"),
+    visibility: Optional[str] = Query(None, description="Filter by visibility"),
+    render: Optional[str] = Query(None, description="Render mode: 'controls' for pagination controls only"),
+    q: Optional[str] = Query(None, description="Search query"),
+    relationship: Optional[str] = Query(None, description="Filter by relationship: owner, member, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Return HTML partial for paginated teams list (HTMX).
+
+    Args:
+        request (Request): FastAPI request object.
+        page (int): Page number for pagination.
+        per_page (int): Number of items per page.
+        include_inactive (bool): Whether to include inactive teams.
+        visibility (Optional[str]): Filter by team visibility.
+        render (Optional[str]): Render mode, e.g., 'controls' for pagination controls only.
+        q (Optional[str]): Search query string.
+        relationship (Optional[str]): Filter by relationship: owner, member, public.
+        db (Session): Database session dependency.
+        user: Current authenticated user.
+
+    Returns:
+        HTMLResponse: Rendered HTML partial for teams list or pagination controls.
+
+    """
+    team_service = TeamManagementService(db)
+    user_email = get_user_email(user)
+    root_path = request.scope.get("root_path", "")
+
+    # Base URL for pagination links - preserve search query and relationship filter
+    base_url = f"{root_path}/admin/teams/partial"
+    query_parts = []
+    if q:
+        query_parts.append(f"q={urllib.parse.quote(q, safe='')}")
+    if relationship:
+        query_parts.append(f"relationship={urllib.parse.quote(relationship, safe='')}")
+    if query_parts:
+        base_url += "?" + "&".join(query_parts)
+
+    # Check permissions and get current user
+    auth_service = EmailAuthService(db)
+    current_user = await auth_service.get_user_by_email(user_email)
+
+    if not current_user:
+        return HTMLResponse(content='<div class="text-center py-8"><p class="text-red-500">User not found</p></div>', status_code=404)
+
+    # Get user's teams and public teams for relationship info
+    user_teams = await team_service.get_user_teams(user_email, include_personal=True)
+    user_team_ids = {str(t.id) for t in user_teams}
+
+    # Get user roles for owned/member distinction
+    user_roles = team_service.get_user_roles_batch(user_email, list(user_team_ids))
+
+    # Get public teams the user can join (not already a member)
+    # NOTE: Limited to 500 for memory safety. Non-admin users with "public" filter
+    # will only see up to 500 joinable teams. For deployments with >500 public teams,
+    # consider implementing SQL-level pagination for non-admin users.
+    public_teams_limit = 500
+    public_teams = await team_service.discover_public_teams(user_email, limit=public_teams_limit)
+    public_team_ids = {str(t.id) for t in public_teams}
+    if len(public_teams) >= public_teams_limit:
+        LOGGER.warning(f"Public teams discovery hit limit of {public_teams_limit} for user {user_email}. Some teams may not be visible.")
+
+    # Get pending join requests for public teams
+    pending_requests = team_service.get_pending_join_requests_batch(user_email, list(public_team_ids))
+
+    if current_user.is_admin and not relationship:
+        # Admin sees all teams when no relationship filter
+        paginated_result = await team_service.list_teams(
+            page=page, per_page=per_page, include_inactive=include_inactive, visibility_filter=visibility, base_url=base_url, include_personal=True, search_query=q
+        )
+        data = paginated_result["data"]
+        pagination = paginated_result["pagination"]
+        links = paginated_result["links"]
+    else:
+        # Filter by relationship or regular user view
+        all_teams = []
+
+        if relationship == "owner":
+            # Only teams user owns
+            all_teams = [t for t in user_teams if user_roles.get(str(t.id)) == "owner"]
+        elif relationship == "member":
+            # Only teams user is a member of (not owner)
+            all_teams = [t for t in user_teams if user_roles.get(str(t.id)) == "member"]
+        elif relationship == "public":
+            # Only public teams user can join
+            all_teams = list(public_teams)
+        else:
+            # All teams: user's teams + public teams they can join
+            all_teams = list(user_teams) + list(public_teams)
+
+        # Apply search filter
+        if q:
+            q_lower = q.lower()
+            all_teams = [t for t in all_teams if q_lower in t.name.lower() or q_lower in (t.slug or "").lower() or q_lower in (t.description or "").lower()]
+
+        # Apply visibility filter
+        if visibility:
+            all_teams = [t for t in all_teams if t.visibility == visibility]
+
+        if not include_inactive:
+            all_teams = [t for t in all_teams if t.is_active]
+
+        total = len(all_teams)
+        start = (page - 1) * per_page
+        end = start + per_page
+        data = all_teams[start:end]
+
+        pagination = PaginationMeta(page=page, per_page=per_page, total_items=total, total_pages=math.ceil(total / per_page) if per_page else 1, has_next=end < total, has_prev=page > 1)
+        links = None
+
+    if render == "controls":
+        # Return only pagination controls
+        return request.app.state.templates.TemplateResponse(
+            "pagination_controls.html",
+            {
+                "request": request,
+                "pagination": pagination if isinstance(pagination, dict) else pagination.model_dump(),
+                "links": links.model_dump() if links and not isinstance(links, dict) else links,
+                "root_path": root_path,
+                "hx_target": "#unified-teams-list",
+                "hx_indicator": "#teams-loading",
+                "query_params": {"include_inactive": include_inactive, "visibility": visibility, "q": q, "relationship": relationship},
+                "base_url": base_url,
+            },
+        )
+
+    if render == "selector":
+        # Return team selector items for infinite scroll dropdown
+        # Add member counts for display
+        team_ids = [str(t.id) for t in data]
+        counts = await team_service.get_member_counts_batch_cached(team_ids)
+        for t in data:
+            t.member_count = counts.get(str(t.id), 0)
+
+        query_params_dict = {}
+        if q:
+            query_params_dict["q"] = q
+
+        return request.app.state.templates.TemplateResponse(
+            "teams_selector_items.html",
+            {
+                "request": request,
+                "data": data,
+                "pagination": pagination if isinstance(pagination, dict) else pagination.model_dump(),
+                "root_path": root_path,
+                "query_params": query_params_dict,
+            },
+        )
+
+    # Batch count members
+    team_ids = [str(t.id) for t in data]
+    counts = await team_service.get_member_counts_batch_cached(team_ids)
+
+    # Build enriched data with relationship info
+    enriched_data = []
+    for t in data:
+        team_id = str(t.id)
+        t.member_count = counts.get(team_id, 0)
+
+        # Determine relationship
+        if t.is_personal:
+            t.relationship = "personal"
+            t.pending_request = None
+        elif team_id in user_team_ids:
+            role = user_roles.get(team_id)
+            t.relationship = "owner" if role == "owner" else "member"
+            t.pending_request = None
+        elif current_user.is_admin:
+            # Admins get admin controls for teams they're not members of
+            t.relationship = "none"  # Falls through to admin controls in template
+            t.pending_request = None
+        elif team_id in public_team_ids:
+            t.relationship = "public"
+            t.pending_request = pending_requests.get(team_id)
+        else:
+            t.relationship = "none"
+            t.pending_request = None
+
+        enriched_data.append(t)
+
+    # Build query params dict for pagination controls
+    query_params_dict = {}
+    if q:
+        query_params_dict["q"] = q
+    if relationship:
+        query_params_dict["relationship"] = relationship
+    if include_inactive:
+        query_params_dict["include_inactive"] = "true"
+    if visibility:
+        query_params_dict["visibility"] = visibility
+
+    return request.app.state.templates.TemplateResponse(
+        "teams_partial.html",
+        {
+            "request": request,
+            "data": enriched_data,
+            "pagination": pagination if isinstance(pagination, dict) else pagination.model_dump(),
+            "links": links.model_dump() if links and not isinstance(links, dict) else links,
+            "root_path": root_path,
+            "query_params": query_params_dict,
+        },
+    )
+
+
 @admin_router.get("/teams")
 @require_permission("teams.read")
 async def admin_list_teams(
     request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=100, description="Items per page"),
+    q: Optional[str] = Query(None, description="Search query"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
     unified: bool = False,
@@ -3469,6 +4524,9 @@ async def admin_list_teams(
 
     Args:
         request: FastAPI request object
+        page: Page number
+        per_page: Items per page
+        q: Search query
         db: Database session
         user: Authenticated admin user
         unified: If True, return unified team view with relationship badges
@@ -3498,57 +4556,53 @@ async def admin_list_teams(
             # Generate unified team view
             return await _generate_unified_teams_view(team_service, current_user, root_path)
 
-        # Generate traditional admin view
+        # Traditional admin view refactored to use partial logic
+        # We can reuse the logic by calling the service directly or redirecting?
+        # Redirection requires a round trip. Calling logic allows server-side render.
+        # We'll re-use the logic by calling default params.
+
+        # Call list_teams logic (similar to admin_teams_partial_html but inline)
         if current_user.is_admin:
-            teams, _ = await team_service.list_teams()
+            # Default first page
+            base_url = f"{root_path}/admin/teams/partial"
+            if q:
+                base_url += f"?q={urllib.parse.quote(q, safe='')}"
+
+            paginated_result = await team_service.list_teams(page=page, per_page=per_page, base_url=base_url, include_personal=True, search_query=q)
+            data = paginated_result["data"]
+            pagination = paginated_result["pagination"]
+            links = paginated_result["links"]
         else:
-            teams = await team_service.get_user_teams(current_user.email)
+            all_teams = await team_service.get_user_teams(current_user.email, include_personal=True)
+            # Basic pagination for user view
+            total = len(all_teams)
+            start = (page - 1) * per_page
+            end = start + per_page
+            data = all_teams[start:end]
+            pagination = PaginationMeta(page=page, per_page=per_page, total_items=total, total_pages=math.ceil(total / per_page) if per_page else 1, has_next=end < total, has_prev=page > 1)
+            links = None
 
-        # Generate HTML for teams (traditional view)
-        teams_html = ""
-        for team in teams:
-            member_count = team.get_member_count()
-            teams_html += f"""
-                <div id="team-card-{team.id}" class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
-                    <div class="flex justify-between items-start">
-                        <div>
-                            <h4 class="text-lg font-medium text-gray-900 dark:text-white">{team.name}</h4>
-                            <p class="text-sm text-gray-600 dark:text-gray-400">Slug: {team.slug}</p>
-                            <p class="text-sm text-gray-600 dark:text-gray-400">Visibility: {team.visibility}</p>
-                            <p class="text-sm text-gray-600 dark:text-gray-400">Members: {member_count}</p>
-                            {f'<p class="text-sm text-gray-600 dark:text-gray-400">{team.description}</p>' if team.description else ""}
-                        </div>
-                        <div class="flex space-x-2">
-                            <button
-                                hx-get="{root_path}/admin/teams/{team.id}/members"
-                                hx-target="#team-details-{team.id}"
-                                hx-swap="innerHTML"
-                                class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                            >
-                                View Members
-                            </button>
-                            <button
-                                onclick="showTeamEditModal('{team.id}')"
-                                class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500"
-                            >
-                                Edit
-                            </button>
-                            {f'<button onclick="leaveTeam(&quot;{team.id}&quot;, &quot;{team.name}&quot;)" class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500">Leave Team</button>' if not team.is_personal and not current_user.is_admin else ""}
-                            {f'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/teams/{team.id}" hx-confirm="Are you sure you want to delete this team?" hx-target="#team-card-{team.id}" hx-swap="outerHTML">Delete</button>' if not team.is_personal else ""}
-                        </div>
-                    </div>
-                    <div id="team-details-{team.id}" class="mt-4"></div>
-            </div>
-            """
+        # Batch counts
+        team_ids = [str(t.id) for t in data]
+        counts = await team_service.get_member_counts_batch_cached(team_ids)
+        for t in data:
+            t.member_count = counts.get(str(t.id), 0)
 
-        if not teams_html:
-            teams_html = '<div class="text-center py-8"><p class="text-gray-500 dark:text-gray-400">No teams found. Create your first team above.</p></div>'
-
-        return HTMLResponse(content=teams_html)
+        # Render template
+        return request.app.state.templates.TemplateResponse(
+            "teams_partial.html",
+            {
+                "request": request,
+                "data": data,
+                "pagination": pagination if isinstance(pagination, dict) else pagination.model_dump(),
+                "links": links.model_dump() if links and not isinstance(links, dict) else links,
+                "root_path": root_path,
+            },
+        )
 
     except Exception as e:
         LOGGER.error(f"Error listing teams for admin {user}: {e}")
-        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading teams: {str(e)}</p></div>', status_code=200)
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading teams: {html.escape(str(e))}</p></div>', status_code=200)
 
 
 @admin_router.post("/teams")
@@ -3572,7 +4626,11 @@ async def admin_create_team(
         HTTPException: If email auth is disabled or validation fails
     """
     if not getattr(settings, "email_auth_enabled", False):
-        return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
+        error_content = '<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">Email authentication is disabled</div>'
+        response = HTMLResponse(content=error_content, status_code=403)
+        response.headers["HX-Retarget"] = "#create-team-error"
+        response.headers["HX-Reswap"] = "innerHTML"
+        return response
 
     try:
         # Get root path for URL construction
@@ -3585,7 +4643,13 @@ async def admin_create_team(
         visibility = form.get("visibility", "private")
 
         if not name:
-            return HTMLResponse(content='<div class="text-red-500">Team name is required</div>', status_code=400)
+            response = HTMLResponse(
+                content='<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">Team name is required</div>',
+                status_code=400,
+            )
+            response.headers["HX-Retarget"] = "#create-team-error"
+            response.headers["HX-Reswap"] = "innerHTML"
+            return response
 
         # Create team
         # First-Party
@@ -3602,15 +4666,17 @@ async def admin_create_team(
 
         # Return HTML for the new team
         member_count = 1  # Creator is automatically a member
+        safe_team_name = html.escape(team.name)
+        safe_description = html.escape(team.description) if team.description else ""
         team_html = f"""
         <div id="team-card-{team.id}" class="border border-gray-200 dark:border-gray-600 rounded-lg p-4 mb-4">
             <div class="flex justify-between items-start">
                 <div>
-                    <h4 class="text-lg font-medium text-gray-900 dark:text-white">{team.name}</h4>
+                    <h4 class="text-lg font-medium text-gray-900 dark:text-white">{safe_team_name}</h4>
                     <p class="text-sm text-gray-600 dark:text-gray-400">Slug: {team.slug}</p>
                     <p class="text-sm text-gray-600 dark:text-gray-400">Visibility: {team.visibility}</p>
                     <p class="text-sm text-gray-600 dark:text-gray-400">Members: {member_count}</p>
-                    {f'<p class="text-sm text-gray-600 dark:text-gray-400">{team.description}</p>' if team.description else ""}
+                    {f'<p class="text-sm text-gray-600 dark:text-gray-400">{safe_description}</p>' if team.description else ""}
                 </div>
                 <div class="flex space-x-2">
                     <button
@@ -3626,28 +4692,50 @@ async def admin_create_team(
             </div>
             <div id="team-details-{team.id}" class="mt-4"></div>
         </div>
-        <script>
-            // Reset the team creation form after successful creation
-            setTimeout(() => {{
-                const form = document.querySelector('form[hx-post*="/admin/teams"]');
-                if (form) {{
-                    form.reset();
-                }}
-            }}, 500);
-        </script>
         """
 
-        return HTMLResponse(content=team_html, status_code=201)
+        response = HTMLResponse(content=team_html, status_code=201)
+        response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"resetTeamCreateForm": True, "delayMs": 500}}).decode()
+        return response
 
+    except (ValidationError, CoreValidationError) as e:
+        LOGGER.warning(f"Validation error creating team: {e}")
+        # Extract user-friendly error message from Pydantic validation error
+        error_messages = []
+        for error in e.errors():
+            msg = error.get("msg", "Invalid value")
+            # Clean up common Pydantic prefixes
+            if msg.startswith("Value error, "):
+                msg = msg[13:]
+            error_messages.append(f"{msg}")
+        error_text = "; ".join(error_messages) if error_messages else "Invalid input"
+        response = HTMLResponse(
+            content=f'<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">{html.escape(error_text)}</div>',
+            status_code=400,
+        )
+        # Retarget to error container instead of teams list
+        response.headers["HX-Retarget"] = "#create-team-error"
+        response.headers["HX-Reswap"] = "innerHTML"
+        return response
     except IntegrityError as e:
         LOGGER.error(f"Error creating team for admin {user}: {e}")
         if "UNIQUE constraint failed: email_teams.slug" in str(e):
-            return HTMLResponse(content='<div class="text-red-500">A team with this name already exists. Please choose a different name.</div>', status_code=400)
-
-        return HTMLResponse(content=f'<div class="text-red-500">Database error creating team: {str(e)}</div>', status_code=400)
+            error_content = '<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">A team with this name already exists. Please choose a different name.</div>'
+        else:
+            error_content = f'<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">Database error: {html.escape(str(e))}</div>'
+        response = HTMLResponse(content=error_content, status_code=400)
+        response.headers["HX-Retarget"] = "#create-team-error"
+        response.headers["HX-Reswap"] = "innerHTML"
+        return response
     except Exception as e:
         LOGGER.error(f"Error creating team for admin {user}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error creating team: {str(e)}</div>', status_code=400)
+        response = HTMLResponse(
+            content=f'<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">Error creating team: {html.escape(str(e))}</div>',
+            status_code=400,
+        )
+        response.headers["HX-Retarget"] = "#create-team-error"
+        response.headers["HX-Reswap"] = "innerHTML"
+        return response
 
 
 @admin_router.get("/teams/{team_id}/members")
@@ -3655,19 +4743,174 @@ async def admin_create_team(
 async def admin_view_team_members(
     team_id: str,
     request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> HTMLResponse:
-    """View team members via admin UI.
+    """View and manage team members via admin UI (unified view).
+
+    This replaces the old separate "view members" and "add members" screens with a unified
+    interface that shows all users with checkboxes. Members are pre-checked and can be
+    unchecked to remove them. Non-members can be checked to add them.
 
     Args:
         team_id: ID of the team to view members for
+        request: FastAPI request object
+        page: Page number (1-indexed).
+        per_page: Items per page.
+        db: Database session
+        user: Current authenticated user context
+
+    Returns:
+        HTMLResponse: Rendered unified team members management view
+    """
+    if not settings.email_auth_enabled:
+        response = HTMLResponse(
+            content='<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md mb-4">Email authentication is disabled</div>',
+            status_code=403,
+        )
+        response.headers["HX-Retarget"] = "#edit-team-error"
+        response.headers["HX-Reswap"] = "innerHTML"
+        return response
+
+    try:
+        # Get root_path from request
+        root_path = request.scope.get("root_path", "")
+
+        # Get current user context for logging and authorization
+        user_email = get_user_email(user)
+        LOGGER.info(f"User {user_email} viewing/managing members for team {team_id}")
+
+        # First-Party
+        team_service = TeamManagementService(db)
+        EmailAuthService(db)
+
+        # Get team details
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        # Check if current user is team owner
+        current_user_role = await team_service.get_user_role_in_team(user_email, team_id)
+        is_team_owner = current_user_role == "owner"
+
+        # Escape team name to prevent XSS
+        safe_team_name = html.escape(team.name)
+
+        # Build the two-section management interface with form
+        interface_html = f"""
+        <div class="mb-4">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-medium text-gray-900 dark:text-white">
+                    Team Members: {safe_team_name}
+                </h3>
+                <button onclick="document.getElementById('team-edit-modal').classList.add('hidden')"
+                        class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round"
+                            stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+                    <h4 class="text-sm font-semibold text-gray-900 dark:text-white">
+                        Manage Team Members • Change roles • Add or remove members
+                    </h4>
+                </div>
+
+                <form id="team-members-form-{team.id}" data-team-id="{team.id}"
+                      hx-post="{root_path}/admin/teams/{team.id}/add-member"
+                      hx-target="#team-edit-modal-content"
+                      hx-swap="innerHTML"
+                      class="px-6 py-4">
+
+                    <!-- Search box -->
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Search Users</label>
+                        <input
+                            type="text"
+                            id="user-search-{team.id}"
+                            data-team-id="{team.id}"
+                            placeholder="Search by name or email..."
+                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white"
+                            oninput="debouncedServerSideUserSearch('{team.id}', this.value)"
+                        />
+                    </div>
+
+                    <!-- Current Members Section -->
+                    <div class="mb-6">
+                        <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Current Members</h5>
+                        <div
+                            id="team-members-container-{team.id}"
+                            class="border border-gray-300 dark:border-gray-600 rounded-md p-3 max-h-32 overflow-y-auto dark:bg-gray-700"
+                            data-per-page="{per_page}"
+                            hx-get="{root_path}/admin/teams/{team.id}/members/partial?page={page}&per_page={per_page}"
+                            hx-trigger="load delay:100ms"
+                            hx-target="this"
+                            hx-swap="innerHTML"
+                        >
+                            <!-- Current members will be loaded here via HTMX -->
+                        </div>
+                    </div>
+
+                    <!-- Users to Add Section -->
+                    <div class="mb-4">
+                        <h5 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Users to Add</h5>
+                        <div
+                            id="team-non-members-container-{team.id}"
+                            class="border border-gray-300 dark:border-gray-600 rounded-md p-3 max-h-32 overflow-y-auto dark:bg-gray-700"
+                            data-per-page="{per_page}"
+                            hx-get="{root_path}/admin/teams/{team.id}/non-members/partial?page=1&per_page={per_page}"
+                            hx-trigger="load delay:200ms"
+                            hx-target="this"
+                            hx-swap="innerHTML"
+                        >
+                            <!-- Non-members will be loaded here via HTMX -->
+                        </div>
+                    </div>
+
+                    <!-- Submit button (only for team owners) -->
+                    {"" if not is_team_owner else '''
+                    <div class="flex justify-end space-x-3 pt-4 border-t border-gray-200 dark:border-gray-700">
+                        <button type="submit"
+                                class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                            Save Changes
+                        </button>
+                    </div>
+                    '''}
+                </form>
+            </div>
+        </div>
+        """  # nosec B608 - HTML template f-string, not SQL (uses SQLAlchemy ORM for DB)
+
+        return HTMLResponse(content=interface_html)
+
+    except Exception as e:
+        LOGGER.error(f"Error viewing team members {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading members: {html.escape(str(e))}</div>', status_code=500)
+
+
+@admin_router.get("/teams/{team_id}/members/add")
+@require_permission("teams.manage_members")
+async def admin_add_team_members_view(
+    team_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> HTMLResponse:
+    """Show add members interface with paginated user selector.
+
+    Args:
+        team_id: ID of the team to add members to
         request: FastAPI request object
         db: Database session
         user: Current authenticated user context
 
     Returns:
-        HTMLResponse: Rendered team members view
+        HTMLResponse: Rendered add members interface
     """
     if not settings.email_auth_enabled:
         return HTMLResponse(content='<div class="text-red-500">Email authentication is disabled</div>', status_code=403)
@@ -3678,7 +4921,7 @@ async def admin_view_team_members(
 
         # Get current user context for logging and authorization
         user_email = get_user_email(user)
-        LOGGER.info(f"User {user_email} viewing members for team {team_id}")
+        LOGGER.info(f"User {user_email} adding members to team {team_id}")
 
         # First-Party
         team_service = TeamManagementService(db)
@@ -3688,209 +4931,102 @@ async def admin_view_team_members(
         if not team:
             return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
 
-        # Get team members
-        members = await team_service.get_team_members(team_id)
-
-        # Count owners to determine if this is the last owner
-        owner_count = sum(1 for _, membership in members if membership.role == "owner")
-
         # Check if current user is team owner
         current_user_role = await team_service.get_user_role_in_team(user_email, team_id)
-        is_team_owner = current_user_role == "owner"
+        if current_user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can add members</div>', status_code=403)
 
-        # Build member table with inline role editing for team owners
-        members_html = """
-        <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-            <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-                <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Team Members</h4>
-            </div>
-            <div class="divide-y divide-gray-200 dark:divide-gray-700">
-        """
+        # Get current team members to exclude from selection
+        team_members = await team_service.get_team_members(team_id)
+        member_emails = {team_user.email for team_user, membership in team_members}
+        # Use orjson to safely serialize the list for JavaScript consumption (prevents XSS/injection)
+        member_emails_json = orjson.dumps(list(member_emails)).decode()  # nosec B105 - JSON array of emails, not password
 
-        for member_user, membership in members:
-            role_display = membership.role.replace("_", " ").title() if membership.role else "Member"
-            is_last_owner = membership.role == "owner" and owner_count == 1
-            is_current_user = member_user.email == user_email
+        # Escape team name to prevent XSS
+        safe_team_name = html.escape(team.name)
 
-            # Role selection - only show for team owners and not for last owner
-            if is_team_owner and not is_last_owner:
-                role_selector = f"""
-                    <select
-                        name="role"
-                        class="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        hx-post="{root_path}/admin/teams/{team_id}/update-member-role"
-                        hx-vals='{{"user_email": "{member_user.email}"}}'
-                        hx-target="#team-edit-modal-content"
-                        hx-swap="innerHTML"
-                        hx-trigger="change">
-                        <option value="member" {"selected" if membership.role == "member" else ""}>Member</option>
-                        <option value="owner" {"selected" if membership.role == "owner" else ""}>Owner</option>
-                    </select>
-                """
-            else:
-                # Show static role badge
-                role_color = "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200" if membership.role == "owner" else "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
-                role_selector = f'<span class="px-2 py-1 text-xs font-medium {role_color} rounded-full">{role_display}</span>'
-
-            # Remove button - hide for current user and last owner
-            if is_team_owner and not is_current_user and not is_last_owner:
-                remove_button = f"""
-                    <button
-                        class="text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 focus:outline-none"
-                        hx-post="{root_path}/admin/teams/{team_id}/remove-member"
-                        hx-vals='{{"user_email": "{member_user.email}"}}'
-                        hx-confirm="Remove {member_user.email} from this team?"
-                        hx-target="#team-edit-modal-content"
-                        hx-swap="innerHTML"
-                        title="Remove member">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
-                        </svg>
-                    </button>
-                """
-            else:
-                remove_button = ""
-
-            # Special indicators
-            indicators = []
-            if is_current_user:
-                indicators.append('<span class="inline-flex items-center px-2 py-1 text-xs font-medium bg-blue-100 text-blue-800 rounded-full dark:bg-blue-900 dark:text-blue-200">You</span>')
-            if is_last_owner:
-                indicators.append(
-                    '<span class="inline-flex items-center px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 rounded-full dark:bg-yellow-900 dark:text-yellow-200">Last Owner</span>'
-                )
-
-            members_html += f"""
-                <div class="px-6 py-4 flex items-center justify-between">
-                    <div class="flex items-center space-x-4 flex-1">
-                        <div class="flex-shrink-0">
-                            <div class="w-8 h-8 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
-                                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">{member_user.email[0].upper()}</span>
-                            </div>
-                        </div>
-                        <div class="min-w-0 flex-1">
-                            <div class="flex items-center space-x-2">
-                                <p class="text-sm font-medium text-gray-900 dark:text-white truncate">{member_user.full_name or member_user.email}</p>
-                                {" ".join(indicators)}
-                            </div>
-                            <p class="text-sm text-gray-500 dark:text-gray-400 truncate">{member_user.email}</p>
-                            <p class="text-xs text-gray-400 dark:text-gray-500">Joined: {membership.joined_at.strftime("%b %d, %Y") if membership.joined_at else "Unknown"}</p>
-                        </div>
-                    </div>
-                    <div class="flex items-center space-x-3">
-                        {role_selector}
-                        {remove_button}
-                    </div>
-                </div>
-            """
-
-        members_html += """
-            </div>
-        </div>
-        """
-
-        if not members:
-            members_html = '<div class="text-center py-8 text-gray-500 dark:text-gray-400">No members found</div>'
-
-        # Add member management interface
-        management_html = f"""
+        # Build add members interface with paginated user selector
+        add_members_html = f"""
         <div class="mb-4">
             <div class="flex justify-between items-center mb-4">
-                <h3 class="text-lg font-medium text-gray-900 dark:text-white">Manage Members: {team.name}</h3>
-                <button onclick="document.getElementById('team-edit-modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                </button>
-            </div>"""
+                <h3 class="text-lg font-medium text-gray-900 dark:text-white">Add Members to: {safe_team_name}</h3>
+                <div class="flex items-center space-x-2">
+                    <button onclick="loadTeamMembersView('{team.id}')" class="px-3 py-1 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700">
+                        ← Back to Members
+                    </button>
+                    <button onclick="document.getElementById('team-edit-modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
 
-        # Show Add Member interface for team owners
-        if is_team_owner:
-            management_html += f"""
-            <div class="mb-6">
-                <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-                    <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-                        <div class="flex items-center justify-between">
-                            <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Add New Member</h4>
+            <div class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+                    <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Select Users to Add</h4>
+                </div>
+
+                <div class="px-6 py-4">
+                    <form id="add-members-form-{team.id}" data-team-id="{team.id}" hx-post="{root_path}/admin/teams/{team.id}/add-member" hx-target="#team-edit-modal-content" hx-swap="innerHTML">
+                        <!-- Search box -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Search Users</label>
+                            <input
+                                type="text"
+                                id="user-search-{team.id}"
+                                data-team-id="{team.id}"
+                                data-search-url="{root_path}/admin/users/search"
+                                data-search-limit="10"
+                                placeholder="Search by name or email..."
+                                class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 text-gray-900 dark:text-white"
+                                autocomplete="off"
+                            />
+                            <div id="user-search-loading-{team.id}" class="mt-2 text-sm text-gray-500 dark:text-gray-400 hidden">Searching...</div>
+                            <div id="user-search-results-{team.id}" data-member-emails="{html.escape(member_emails_json)}" class="mt-2"></div>
+                        </div>
+
+                        <!-- User selector with infinite scroll -->
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Available Users</label>
+                            <div
+                                id="user-selector-container-{team.id}"
+                                class="border border-gray-300 dark:border-gray-600 rounded-md p-3 max-h-32 overflow-y-auto dark:bg-gray-700"
+                                hx-get="{root_path}/admin/users/partial?page=1&per_page=20&render=selector&team_id={team.id}"
+                                hx-trigger="load"
+                                hx-swap="innerHTML"
+                                hx-target="#user-selector-container-{team.id}"
+                            >
+                                <!-- User selector items will be loaded here via HTMX -->
+                            </div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                Note: Users already in the team will be ignored if selected.
+                            </p>
+                        </div>
+
+                        <!-- Action buttons -->
+                        <div class="flex justify-between items-center">
+                            <div id="selected-count-{team.id}" class="text-sm text-gray-600 dark:text-gray-400">
+                                No users selected
+                            </div>
                             <button
-                                id="toggle-add-member-{team.id}"
-                                class="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 focus:outline-none"
-                                onclick="document.getElementById('add-member-form-{team.id}').classList.toggle('hidden'); this.textContent = this.textContent === 'Show' ? 'Hide' : 'Show';">
-                                Show
+                                type="submit"
+                                class="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200"
+                            >
+                                Add Selected Members
                             </button>
                         </div>
-                    </div>
-                    <div id="add-member-form-{team.id}" class="hidden px-6 py-4">
-                        <form hx-post="{root_path}/admin/teams/{team.id}/add-member" hx-target="#team-edit-modal-content" hx-swap="innerHTML">
-                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                <div class="md:col-span-2">
-                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Select User</label>
-                                    <select name="user_email" required
-                                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 text-gray-900 dark:text-white">
-                                        <option value="">Choose a user to add...</option>"""
-
-            # Get available users (not already members of this team)
-            try:
-                auth_service = EmailAuthService(db)
-                all_users = await auth_service.get_all_users()
-
-                # Get current team members
-                team_management_service = TeamManagementService(db)
-                team_members = await team_management_service.get_team_members(team.id)
-                member_emails = {team_user.email for team_user, membership in team_members}
-
-                # Filter out existing members
-                available_users = [team_user for team_user in all_users if team_user.email not in member_emails]
-
-                for team_user in available_users:
-                    management_html += f'<option value="{team_user.email}">{team_user.full_name} ({team_user.email})</option>'
-            except Exception as e:
-                LOGGER.error(f"Error loading available users for team {team.id}: {e}")
-
-            management_html += """                        </select>
-                                </div>
-                                <div>
-                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Role</label>
-                                    <select name="role" required
-                                            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 text-gray-900 dark:text-white">
-                                        <option value="member">Member</option>
-                                        <option value="owner">Owner</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="mt-4 flex justify-end space-x-3">
-                                <button type="submit"
-                                        class="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200">
-                                    Add Member
-                                </button>
-                            </div>
-                        </form>
-                    </div>
+                    </form>
                 </div>
-            </div>"""
-        else:
-            management_html += """
-            <div class="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900 rounded-lg border border-yellow-200 dark:border-yellow-700">
-                <div class="flex items-center gap-2">
-                    <svg class="w-5 h-5 text-yellow-600 dark:text-yellow-400" fill="currentColor" viewBox="0 0 20 20">
-                        <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
-                    </svg>
-                    <span class="text-sm font-medium text-yellow-800 dark:text-yellow-200">Private Team - Member Access</span>
-                </div>
-                <p class="text-xs text-yellow-600 dark:text-yellow-400 mt-1">
-                    You are a member of this private team. Only team owners can directly add new members. Use the team invitation system to request access for others.
-                </p>
-            </div>"""
-
-        management_html += """
+            </div>
         </div>
-        """
+        """  # nosec B608 - HTML template f-string, not SQL (uses SQLAlchemy ORM for DB)
 
-        return HTMLResponse(content=f'{management_html}<div class="space-y-2">{members_html}</div>')
+        return HTMLResponse(content=add_members_html)
 
     except Exception as e:
-        LOGGER.error(f"Error viewing team members {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error loading members: {str(e)}</div>', status_code=500)
+        LOGGER.error(f"Error loading add members view for team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading add members view: {html.escape(str(e))}</div>', status_code=500)
 
 
 @admin_router.get("/teams/{team_id}/edit")
@@ -3922,14 +5058,18 @@ async def admin_get_team_edit(
         if not team:
             return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
 
+        safe_team_name = html.escape(team.name, quote=True)
+        safe_description = html.escape(team.description or "")
         edit_form = rf"""
         <div class="space-y-4">
             <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Edit Team</h3>
-            <form method="post" action="{root_path}/admin/teams/{team_id}/update" hx-post="{root_path}/admin/teams/{team_id}/update" hx-target="#team-edit-modal-content" class="space-y-4">
+            <div id="edit-team-error"></div>
+            <form method="post" action="{root_path}/admin/teams/{team_id}/update" hx-post="{root_path}/admin/teams/{team_id}/update" hx-target="#edit-team-error" hx-swap="innerHTML" class="space-y-4" data-team-validation="true">
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Name</label>
-                    <input type="text" name="name" value="{team.name}" required
+                    <input type="text" name="name" value="{safe_team_name}" required
                            class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Letters, numbers, spaces, underscores, periods, and dashes only</p>
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Slug</label>
@@ -3940,7 +5080,7 @@ async def admin_get_team_edit(
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
                     <textarea name="description" rows="3"
-                              class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">{team.description or ""}</textarea>
+                              class="mt-1 px-1.5 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">{safe_description}</textarea>
                 </div>
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Visibility</label>
@@ -3967,7 +5107,7 @@ async def admin_get_team_edit(
 
     except Exception as e:
         LOGGER.error(f"Error getting team edit form for {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error loading team: {str(e)}</div>', status_code=500)
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading team: {html.escape(str(e))}</div>', status_code=500)
 
 
 @admin_router.post("/teams/{team_id}/update")
@@ -4002,15 +5142,57 @@ async def admin_update_team(
         name_val = form.get("name")
         desc_val = form.get("description")
         vis_val = form.get("visibility", "private")
-        name = name_val if isinstance(name_val, str) else None
-        description = desc_val if isinstance(desc_val, str) and desc_val != "" else None
+        # Trim before presence check for consistent error messages
+        name = name_val.strip() if isinstance(name_val, str) else None
+        description = desc_val.strip() if isinstance(desc_val, str) and desc_val.strip() != "" else None
         visibility = vis_val if isinstance(vis_val, str) else "private"
 
         if not name:
             is_htmx = request.headers.get("HX-Request") == "true"
             if is_htmx:
-                return HTMLResponse(content='<div class="text-red-500">Team name is required</div>', status_code=400)
+                response = HTMLResponse(
+                    content='<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md mb-4">Team name is required</div>',
+                    status_code=400,
+                )
+                response.headers["HX-Retarget"] = "#edit-team-error"
+                response.headers["HX-Reswap"] = "innerHTML"
+                return response
             error_msg = urllib.parse.quote("Team name is required")
+            return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
+
+        # Validate name and description for XSS (same validation as schema)
+        if not re.match(settings.validation_name_pattern, name):
+            is_htmx = request.headers.get("HX-Request") == "true"
+            if is_htmx:
+                response = HTMLResponse(
+                    content='<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md mb-4">Team name can only contain letters, numbers, spaces, underscores, periods, and dashes</div>',
+                    status_code=400,
+                )
+                response.headers["HX-Retarget"] = "#edit-team-error"
+                response.headers["HX-Reswap"] = "innerHTML"
+                return response
+            error_msg = urllib.parse.quote("Team name contains invalid characters")
+            return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
+
+        try:
+            SecurityValidator.validate_no_xss(name, "Team name")
+            if re.search(SecurityValidator.DANGEROUS_JS_PATTERN, name, re.IGNORECASE):
+                raise ValueError("Team name contains script patterns that may cause security issues")
+            if description:
+                SecurityValidator.validate_no_xss(description, "Team description")
+                if re.search(SecurityValidator.DANGEROUS_JS_PATTERN, description, re.IGNORECASE):
+                    raise ValueError("Team description contains script patterns that may cause security issues")
+        except ValueError as ve:
+            is_htmx = request.headers.get("HX-Request") == "true"
+            if is_htmx:
+                response = HTMLResponse(
+                    content=f'<div class="text-red-500 p-3 bg-red-50 dark:bg-red-900/20 rounded-md mb-4">{html.escape(str(ve))}</div>',
+                    status_code=400,
+                )
+                response.headers["HX-Retarget"] = "#edit-team-error"
+                response.headers["HX-Reswap"] = "innerHTML"
+                return response
+            error_msg = urllib.parse.quote(str(ve))
             return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
 
         # Update team
@@ -4025,17 +5207,11 @@ async def admin_update_team(
             success_html = """
             <div class="text-green-500 text-center p-4">
                 <p>Team updated successfully</p>
-                <script>
-                    setTimeout(() => {
-                        // Close the modal
-                        hideTeamEditModal();
-                        // Refresh the teams list
-                        htmx.trigger(document.getElementById('teams-list'), 'load');
-                    }, 1500);
-                </script>
             </div>
             """
-            return HTMLResponse(content=success_html)
+            response = HTMLResponse(content=success_html)
+            response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"closeTeamEditModal": True, "refreshTeamsList": True, "delayMs": 1500}}).decode()
+            return response
         # For regular form submission, redirect to admin page with teams section
         return RedirectResponse(url=f"{root_path}/admin/#teams", status_code=303)
 
@@ -4046,7 +5222,7 @@ async def admin_update_team(
         is_htmx = request.headers.get("HX-Request") == "true"
 
         if is_htmx:
-            return HTMLResponse(content=f'<div class="text-red-500">Error updating team: {str(e)}</div>', status_code=400)
+            return HTMLResponse(content=f'<div class="text-red-500">Error updating team: {html.escape(str(e))}</div>', status_code=400)
         # For regular form submission, redirect to admin page with error parameter
         error_msg = urllib.parse.quote(f"Error updating team: {str(e)}")
         return RedirectResponse(url=f"{root_path}/admin/?error={error_msg}#teams", status_code=303)
@@ -4085,39 +5261,35 @@ async def admin_delete_team(
         await team_service.delete_team(team_id, deleted_by=user_email)
 
         # Return success message with script to refresh teams list
+        safe_team_name = html.escape(team_name)
         success_html = f"""
         <div class="text-green-500 text-center p-4">
-            <p>Team "{team_name}" deleted successfully</p>
-            <script>
-                setTimeout(() => {{
-                    // Refresh the entire teams list
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
-                        target: '#unified-teams-list',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
+            <p>Team "{safe_team_name}" deleted successfully</p>
         </div>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+        response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"refreshUnifiedTeamsList": True, "delayMs": 1000}}).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error deleting team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error deleting team: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error deleting team: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/add-member")
 @require_permission("teams.manage_members")
-async def admin_add_team_member(
+async def admin_add_team_members(
     team_id: str,
     request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> HTMLResponse:
-    """Add member to team via admin UI.
+    """Add member(s) to team via admin UI.
+
+    Supports both single user (user_email field) and multiple users (associatedUsers field).
 
     Args:
-        team_id: ID of the team to add member to
+        team_id: ID of the team to add member(s) to
         request: FastAPI request object
         db: Database session
         user: Current authenticated user context
@@ -4146,48 +5318,180 @@ async def admin_add_team_member(
                 return HTMLResponse(content='<div class="text-red-500">Only team owners can add members to private teams. Use the invitation system instead.</div>', status_code=403)
 
         form = await request.form()
-        email_val = form.get("user_email")
-        role_val = form.get("role", "member")
-        user_email = email_val if isinstance(email_val, str) else None
-        role = role_val if isinstance(role_val, str) else "member"
 
-        if not user_email:
-            return HTMLResponse(content='<div class="text-red-500">User email is required</div>', status_code=400)
+        # Get loaded members - these are members that were visible in the form (for safe removal with pagination)
+        loaded_members_list = form.getlist("loadedMembers")
+        loaded_members = {email.strip() for email in loaded_members_list if isinstance(email, str) and email.strip()}
 
-        # Check if user exists
-        target_user = await auth_service.get_user_by_email(user_email)
-        if not target_user:
-            return HTMLResponse(content=f'<div class="text-red-500">User {user_email} not found</div>', status_code=400)
+        # Check if this is single user or multiple users
+        single_user_email = form.get("user_email")
+        multiple_user_emails = form.getlist("associatedUsers")
 
-        # Add member to team
-        await team_service.add_member_to_team(team_id=team_id, user_email=user_email, role=role, invited_by=user_email_from_jwt)
+        # Determine which mode we're in
+        if single_user_email:
+            # Single user mode (legacy form) - get single role
+            user_emails = [single_user_email] if isinstance(single_user_email, str) else []
+            default_role = form.get("role", "member")
+            default_role = default_role if isinstance(default_role, str) else "member"
+        elif multiple_user_emails:
+            # Multiple users mode (new paginated selector)
+            seen = set()
+            user_emails = []
+            for email in multiple_user_emails:
+                if not isinstance(email, str):
+                    continue
+                cleaned = email.strip()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                user_emails.append(cleaned)
+            default_role = "member"  # Default if no per-user role specified
+        else:
+            return HTMLResponse(content='<div class="text-red-500">No users selected</div>', status_code=400)
 
-        # Return success message with script to refresh modal
+        # Get current team members
+        team_members = await team_service.get_team_members(team_id)
+        existing_member_emails = {team_user.email for team_user, membership in team_members}
+
+        # Build a map of existing member roles
+        existing_member_roles = {}
+        owner_count = team_service.count_team_owners(team_id)
+        for team_user, membership in team_members:
+            email = team_user.email
+            is_last_owner = membership.role == "owner" and owner_count == 1
+            existing_member_roles[email] = {"role": membership.role, "is_last_owner": is_last_owner}
+
+        # Track results
+        added = []
+        updated = []
+        removed = []
+        errors = []
+
+        # Process submitted users (checked boxes)
+        submitted_user_emails = set(user_emails)
+
+        # 1. Handle additions and updates for checked users
+        for user_email in user_emails:
+            if not isinstance(user_email, str):
+                continue
+
+            user_email = user_email.strip()
+            if not user_email:
+                continue
+
+            try:
+                # Check if user exists
+                target_user = await auth_service.get_user_by_email(user_email)
+                if not target_user:
+                    errors.append(f"{user_email} (user not found)")
+                    continue
+
+                # Get per-user role from form (format: role_<url-encoded-email>)
+                encoded_email = urllib.parse.quote(user_email, safe="")
+                user_role_key = f"role_{encoded_email}"
+                user_role_val = form.get(user_role_key, default_role)
+                user_role = user_role_val if isinstance(user_role_val, str) else default_role
+
+                if user_email in existing_member_emails:
+                    # User is already a member - check if role changed
+                    current_role = existing_member_roles[user_email]["role"]
+                    if current_role != user_role:
+                        # Don't allow changing role of last owner
+                        if existing_member_roles[user_email]["is_last_owner"]:
+                            errors.append(f"{user_email} (cannot change role of last owner)")
+                            continue
+                        # Update role
+                        await team_service.update_member_role(team_id=team_id, user_email=user_email, new_role=user_role, updated_by=user_email_from_jwt)
+                        updated.append(f"{user_email} (role: {user_role})")
+                else:
+                    # New member - add them
+                    await team_service.add_member_to_team(team_id=team_id, user_email=user_email, role=user_role, invited_by=user_email_from_jwt)
+                    added.append(user_email)
+
+            except Exception as member_error:
+                LOGGER.error(f"Error processing {user_email} for team {team_id}: {member_error}")
+                errors.append(f"{user_email} ({str(member_error)})")
+
+        # 2. Handle removals - only remove members who were LOADED in the form AND unchecked
+        # This prevents accidentally removing members from pages that weren't loaded yet (infinite scroll safety)
+        for existing_email in existing_member_emails:
+            # Only consider removal if the member was visible in the form (in loadedMembers)
+            if existing_email not in loaded_members:
+                continue  # Member wasn't loaded in form, skip (safe for pagination)
+            if existing_email in submitted_user_emails:
+                continue  # Member is checked, don't remove
+
+            member_info = existing_member_roles.get(existing_email, {})
+
+            # Validate removal is allowed - server-side protection
+            # Current user cannot be removed
+            if existing_email == user_email_from_jwt:
+                errors.append(f"{existing_email} (cannot remove yourself)")
+                continue
+            # Last owner cannot be removed
+            if member_info.get("is_last_owner", False):
+                errors.append(f"{existing_email} (cannot remove last owner)")
+                continue
+
+            # This member was unchecked and removal is allowed - remove them
+            try:
+                await team_service.remove_member_from_team(team_id=team_id, user_email=existing_email, removed_by=user_email_from_jwt)
+                removed.append(existing_email)
+            except Exception as removal_error:
+                LOGGER.error(f"Error removing {existing_email} from team {team_id}: {removal_error}")
+                errors.append(f"{existing_email} (removal failed: {str(removal_error)})")
+
+        # Build result message
+        result_parts = []
+        if added:
+            result_parts.append(f'<p class="text-green-600 dark:text-green-400">✓ Added {len(added)} member(s)</p>')
+        if updated:
+            result_parts.append(f'<p class="text-blue-600 dark:text-blue-400">↻ Updated {len(updated)} member(s)</p>')
+        if removed:
+            result_parts.append(f'<p class="text-orange-600 dark:text-orange-400">− Removed {len(removed)} member(s)</p>')
+        if errors:
+            result_parts.append(f'<p class="text-red-600 dark:text-red-400">✗ {len(errors)} error(s)</p>')
+            for error in errors[:5]:  # Show first 5 errors
+                result_parts.append(f'<p class="text-xs text-red-500 dark:text-red-400 ml-4">• {error}</p>')
+            if len(errors) > 5:
+                result_parts.append(f'<p class="text-xs text-red-500 dark:text-red-400 ml-4">... and {len(errors) - 5} more</p>')
+
+        if not result_parts:
+            result_parts.append('<p class="text-gray-600 dark:text-gray-400">No changes made</p>')
+
+        result_html = "\n".join(result_parts)
+
+        # Return success message and close modal
         success_html = f"""
-        <div class="text-green-500 text-center p-4">
-            <p>Member {user_email} added successfully</p>
-            <script>
-                setTimeout(() => {{
-                    // Reload the manage members modal content
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
-                        target: '#team-edit-modal-content',
-                        swap: 'innerHTML'
-                    }});
-
-                    // Also refresh the teams list to update member counts
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
-                        target: '#unified-teams-list',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
+        <div class="text-center p-4">
+            {result_html}
         </div>
+        <script>
+            // Close modal after showing success message briefly
+            setTimeout(() => {{
+                const modal = document.getElementById('team-edit-modal');
+                if (modal) {{
+                    modal.classList.add('hidden');
+                }}
+            }}, 1000);
+        </script>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+
+        # Trigger refresh of teams list (but don't reopen modal)
+        response.headers["HX-Trigger"] = orjson.dumps(
+            {
+                "adminTeamAction": {
+                    "teamId": team_id,
+                    "refreshUnifiedTeamsList": True,
+                }
+            }
+        ).decode()
+        return response
 
     except Exception as e:
-        LOGGER.error(f"Error adding member to team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error adding member: {str(e)}</div>', status_code=400)
+        LOGGER.error(f"Error adding member(s) to team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-red-500">Error adding member(s): {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/update-member-role")
@@ -4245,34 +5549,25 @@ async def admin_update_team_member_role(
         success_html = f"""
         <div class="text-green-500 text-center p-4">
             <p>Role updated successfully for {user_email}</p>
-            <script>
-                setTimeout(() => {{
-                    // Reload the manage members modal content to show updated roles
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
-                        target: '#team-edit-modal-content',
-                        swap: 'innerHTML'
-                    }});
-
-                    // Close any open modals
-                    const roleModal = document.getElementById('role-assignment-modal');
-                    if (roleModal) {{
-                        roleModal.classList.add('hidden');
-                    }}
-
-                    // Refresh teams list if visible
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
-                        target: '#unified-teams-list',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
         </div>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+        response.headers["HX-Trigger"] = orjson.dumps(
+            {
+                "adminTeamAction": {
+                    "teamId": team_id,
+                    "refreshTeamMembers": True,
+                    "refreshUnifiedTeamsList": True,
+                    "closeRoleModal": True,
+                    "delayMs": 1000,
+                }
+            }
+        ).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error updating member role in team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error updating role: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error updating role: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/remove-member")
@@ -4326,34 +5621,30 @@ async def admin_remove_team_member(
                 return HTMLResponse(content='<div class="text-red-500">Failed to remove member from team</div>', status_code=400)
         except ValueError as e:
             # Handle specific business logic errors (like last owner)
-            return HTMLResponse(content=f'<div class="text-red-500">{str(e)}</div>', status_code=400)
+            return HTMLResponse(content=f'<div class="text-red-500">{html.escape(str(e))}</div>', status_code=400)
 
         # Return success message with script to refresh modal
         success_html = f"""
         <div class="text-green-500 text-center p-4">
             <p>Member {user_email} removed successfully</p>
-            <script>
-                setTimeout(() => {{
-                    // Reload the manage members modal content
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/members', {{
-                        target: '#team-edit-modal-content',
-                        swap: 'innerHTML'
-                    }});
-
-                    // Also refresh the teams list to update member counts
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
-                        target: '#unified-teams-list',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
         </div>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+        response.headers["HX-Trigger"] = orjson.dumps(
+            {
+                "adminTeamAction": {
+                    "teamId": team_id,
+                    "refreshTeamMembers": True,
+                    "refreshUnifiedTeamsList": True,
+                    "delayMs": 1000,
+                }
+            }
+        ).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error removing member from team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error removing member: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error removing member: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/leave")
@@ -4413,26 +5704,15 @@ async def admin_leave_team(
         success_html = """
         <div class="text-green-500 text-center p-4">
             <p>Successfully left the team</p>
-            <script>
-                setTimeout(() => {{
-                    // Refresh the unified teams list
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams?unified=true', {{
-                        target: '#unified-teams-list',
-                        swap: 'innerHTML'
-                    }});
-
-                    // Close any open modals
-                    const modals = document.querySelectorAll('[id$="-modal"]');
-                    modals.forEach(modal => modal.classList.add('hidden'));
-                }}, 1500);
-            </script>
         </div>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+        response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"refreshUnifiedTeamsList": True, "closeAllModals": True, "delayMs": 1500}}).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error leaving team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error leaving team: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error leaving team: {html.escape(str(e))}</div>', status_code=400)
 
 
 # ============================================================================ #
@@ -4518,7 +5798,7 @@ async def admin_create_join_request(
 
     except Exception as e:
         LOGGER.error(f"Error creating join request for team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error creating join request: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error creating join request: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.delete("/teams/{team_id}/join-request/{request_id}")
@@ -4565,7 +5845,7 @@ async def admin_cancel_join_request(
 
     except Exception as e:
         LOGGER.error(f"Error canceling join request {request_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error canceling join request: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error canceling join request: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.get("/teams/{team_id}/join-requests")
@@ -4619,13 +5899,16 @@ async def admin_list_join_requests(
 
         requests_html = ""
         for req in join_requests:
+            safe_email = html.escape(req.user_email)
+            safe_message = html.escape(req.message) if req.message else ""
+            safe_status = html.escape(req.status.upper())
             requests_html += f"""
             <div class="flex justify-between items-center p-4 border border-gray-200 dark:border-gray-600 rounded-lg mb-3">
                 <div>
-                    <p class="font-medium text-gray-900 dark:text-white">{req.user_email}</p>
+                    <p class="font-medium text-gray-900 dark:text-white">{safe_email}</p>
                     <p class="text-sm text-gray-600 dark:text-gray-400">Requested: {req.requested_at.strftime("%Y-%m-%d %H:%M") if req.requested_at else "Unknown"}</p>
-                    {f'<p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Message: {req.message}</p>' if req.message else ""}
-                    <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300">{req.status.upper()}</span>
+                    {f'<p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Message: {safe_message}</p>' if req.message else ""}
+                    <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300">{safe_status}</span>
                 </div>
                 <div class="flex gap-2">
                     <button onclick="approveJoinRequest('{team_id}', '{req.id}')"
@@ -4640,10 +5923,11 @@ async def admin_list_join_requests(
             </div>
             """
 
+        safe_team_name = html.escape(team.name)
         return HTMLResponse(
             content=f"""
         <div class="space-y-4">
-            <h3 class="text-lg font-medium text-gray-900 dark:text-white mb-4">Join Requests for {team.name}</h3>
+            <h3 class="text-lg font-medium text-gray-900 dark:text-white mb-4">Join Requests for {safe_team_name}</h3>
             {requests_html}
         </div>
         """,
@@ -4652,7 +5936,7 @@ async def admin_list_join_requests(
 
     except Exception as e:
         LOGGER.error(f"Error listing join requests for team {team_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error loading join requests: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading join requests: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/join-requests/{request_id}/approve")
@@ -4691,27 +5975,20 @@ async def admin_approve_join_request(
         if not member:
             return HTMLResponse(content='<div class="text-red-500">Join request not found</div>', status_code=404)
 
-        return HTMLResponse(
+        response = HTMLResponse(
             content=f"""
         <div class="text-green-600 text-center p-4">
             <p>Join request approved! {member.user_email} is now a team member.</p>
-            <script>
-                setTimeout(() => {{
-                    // Refresh the join requests list
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/join-requests', {{
-                        target: '#team-join-requests-modal-content',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
         </div>
         """,
             status_code=200,
         )
+        response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"teamId": team_id, "refreshJoinRequests": True, "delayMs": 1000}}).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error approving join request {request_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error approving join request: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error approving join request: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/teams/{team_id}/join-requests/{request_id}/reject")
@@ -4750,27 +6027,20 @@ async def admin_reject_join_request(
         if not success:
             return HTMLResponse(content='<div class="text-red-500">Join request not found</div>', status_code=404)
 
-        return HTMLResponse(
-            content=f"""
+        response = HTMLResponse(
+            content="""
         <div class="text-green-600 text-center p-4">
             <p>Join request rejected.</p>
-            <script>
-                setTimeout(() => {{
-                    // Refresh the join requests list
-                    htmx.ajax('GET', window.ROOT_PATH + '/admin/teams/{team_id}/join-requests', {{
-                        target: '#team-join-requests-modal-content',
-                        swap: 'innerHTML'
-                    }});
-                }}, 1000);
-            </script>
         </div>
         """,
             status_code=200,
         )
+        response.headers["HX-Trigger"] = orjson.dumps({"adminTeamAction": {"teamId": team_id, "refreshJoinRequests": True, "delayMs": 1000}}).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error rejecting join request {request_id}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error rejecting join request: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error rejecting join request: {html.escape(str(e))}</div>', status_code=400)
 
 
 # ============================================================================ #
@@ -4778,140 +6048,538 @@ async def admin_reject_join_request(
 # ============================================================================ #
 
 
+def _render_user_card_html(user_obj, current_user_email: str, admin_count: int, root_path: str) -> str:
+    """Render a single user card HTML snippet matching the users list template.
+
+    Args:
+        user_obj: User record to render.
+        current_user_email: Email of the current user for "You" badge logic.
+        admin_count: Count of active admins to protect the last admin.
+        root_path: Application root path for HTMX endpoints.
+
+    Returns:
+        HTML snippet for the user card.
+    """
+    encoded_email = urllib.parse.quote(user_obj.email, safe="")
+    display_name = html.escape(user_obj.full_name or "N/A")
+    safe_email = html.escape(user_obj.email)
+    auth_provider = html.escape(user_obj.auth_provider or "unknown")
+    created_at = user_obj.created_at.strftime("%Y-%m-%d %H:%M") if user_obj.created_at else "Unknown"
+
+    is_current_user = user_obj.email == current_user_email
+    is_last_admin = bool(user_obj.is_admin and user_obj.is_active and admin_count == 1)
+
+    badges = []
+    if user_obj.is_admin:
+        badges.append('<span class="px-2 py-1 text-xs font-semibold bg-purple-100 text-purple-800 rounded-full ' + 'dark:bg-purple-900 dark:text-purple-200">Admin</span>')
+    if user_obj.is_active:
+        badges.append('<span class="px-2 py-1 text-xs font-semibold text-green-600 bg-gray-100 dark:bg-gray-700 rounded-full">Active</span>')
+    else:
+        badges.append('<span class="px-2 py-1 text-xs font-semibold text-red-600 bg-gray-100 dark:bg-gray-700 rounded-full">Inactive</span>')
+    if is_current_user:
+        badges.append('<span class="px-2 py-1 text-xs font-semibold bg-blue-100 text-blue-800 rounded-full ' + 'dark:bg-blue-900 dark:text-blue-200">You</span>')
+    if is_last_admin:
+        badges.append('<span class="px-2 py-1 text-xs font-semibold bg-yellow-100 text-yellow-800 rounded-full ' + 'dark:bg-yellow-900 dark:text-yellow-200">Last Admin</span>')
+    if user_obj.password_change_required:
+        badges.append(
+            '<span class="px-2 py-1 text-xs font-semibold bg-orange-100 text-orange-800 rounded-full '
+            'dark:bg-orange-900 dark:text-orange-200"><i class="fas fa-key mr-1"></i>Password Change Required</span>'
+        )
+
+    actions = [
+        f'<button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 '
+        f"dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 "
+        f"dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
+        f'focus:ring-blue-500" hx-get="{root_path}/admin/users/{encoded_email}/edit" '
+        f'hx-target="#user-edit-modal-content">Edit</button>'
+    ]
+
+    if not is_current_user and not is_last_admin:
+        if user_obj.is_active:
+            actions.append(
+                f'<button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 '
+                f"dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 "
+                f"dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
+                f'focus:ring-orange-500" hx-post="{root_path}/admin/users/{encoded_email}/deactivate" '
+                f'hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>'
+            )
+        else:
+            actions.append(
+                f'<button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 '
+                f"dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 "
+                f"dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
+                f'focus:ring-green-500" hx-post="{root_path}/admin/users/{encoded_email}/activate" '
+                f'hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>'
+            )
+
+        if user_obj.password_change_required:
+            actions.append(
+                '<span class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 bg-orange-50 '
+                'dark:bg-orange-900/20 border border-orange-300 dark:border-orange-600 rounded-md">Password Change Required</span>'
+            )
+        else:
+            actions.append(
+                f'<button class="px-3 py-1 text-sm font-medium text-yellow-600 dark:text-yellow-400 hover:text-yellow-800 '
+                f"dark:hover:text-yellow-300 border border-yellow-300 dark:border-yellow-600 hover:border-yellow-500 "
+                f"dark:hover:border-yellow-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
+                f'focus:ring-yellow-500" hx-post="{root_path}/admin/users/{encoded_email}/force-password-change" '
+                f'hx-confirm="Force this user to change their password on next login?" hx-target="closest .user-card" '
+                f'hx-swap="outerHTML">Force Password Change</button>'
+            )
+
+        actions.append(
+            f'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 '
+            f"dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 "
+            f"dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 "
+            f'focus:ring-red-500" hx-delete="{root_path}/admin/users/{encoded_email}" '
+            f'hx-confirm="Are you sure you want to delete this user? This action cannot be undone." '
+            f'hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>'
+        )
+
+    return f"""
+    <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
+      <div class="flex justify-between items-start">
+        <div class="flex-1">
+          <div class="flex items-center gap-2 mb-2">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{display_name}</h3>
+            {' '.join(badges)}
+          </div>
+          <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {safe_email}</p>
+          <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {auth_provider}</p>
+          <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {created_at}</p>
+        </div>
+        <div class="flex gap-2 ml-4">
+          {' '.join(actions)}
+        </div>
+      </div>
+    </div>
+    """
+
+
 @admin_router.get("/users")
 @require_permission("admin.user_management")
 async def admin_list_users(
     request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Response:
-    """List users for admin UI via HTMX.
+    """
+    List users for the admin UI with pagination support.
+
+    This endpoint retrieves a paginated list of users from the database.
+    Uses offset-based (page/per_page) pagination.
+    Supports JSON response for dropdown population when format=json query parameter is provided.
 
     Args:
         request: FastAPI request object
+        page: Page number (1-indexed). Default: 1.
+        per_page: Items per page. Default: 50.
+        db: Database session dependency
+        user: Authenticated user dependency
+
+    Returns:
+        Dict with 'data', 'pagination', and 'links' keys containing paginated users,
+        or JSON response for dropdown population.
+    """
+    if not settings.email_auth_enabled:
+        return HTMLResponse(
+            content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled. User management requires email auth.</p></div>',
+            status_code=200,
+        )
+
+    LOGGER.debug(f"User {get_user_email(user)} requested user list (page={page}, per_page={per_page})")
+
+    auth_service = EmailAuthService(db)
+
+    # Check if JSON response is requested (for dropdown population)
+    accept_header = request.headers.get("accept", "")
+    is_json_request = "application/json" in accept_header or request.query_params.get("format") == "json"
+
+    if is_json_request:
+        # Return JSON for dropdown population - always return first page with 100 users
+        paginated_result = await auth_service.list_users(page=1, per_page=100)
+        users_data = [{"email": user_obj.email, "full_name": user_obj.full_name, "is_active": user_obj.is_active, "is_admin": user_obj.is_admin} for user_obj in paginated_result.data]
+        return ORJSONResponse(content={"users": users_data})
+
+    # List users with page-based pagination
+    paginated_result = await auth_service.list_users(page=page, per_page=per_page)
+
+    # End the read-only transaction early to avoid idle-in-transaction under load
+    db.commit()
+
+    # Return standardized paginated response (for legacy compatibility)
+    return ORJSONResponse(
+        content={
+            "data": [{"email": u.email, "full_name": u.full_name, "is_active": u.is_active, "is_admin": u.is_admin} for u in paginated_result.data],
+            "pagination": paginated_result.pagination.model_dump() if paginated_result.pagination else None,
+            "links": paginated_result.links.model_dump() if paginated_result.links else None,
+        }
+    )
+
+
+@admin_router.get("/users/partial", response_class=HTMLResponse)
+@require_permission("admin.user_management")
+async def admin_users_partial_html(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    render: Optional[str] = Query(None, description="Render mode: 'selector' for user selector items, 'controls' for pagination controls"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Response:
+    """
+    Return paginated users as HTML partial for HTMX requests.
+
+    This endpoint returns rendered HTML for the users list with pagination controls,
+    designed for HTMX-based dynamic updates.
+
+    Args:
+        request: FastAPI request object
+        page: Page number (1-indexed). Default: 1.
+        per_page: Items per page. Default: 50.
+        render: Render mode - 'selector' returns user selector items, 'controls' returns pagination controls.
+        team_id: Optional team ID to pre-select members in selector mode
         db: Database session
         user: Current authenticated user context
 
     Returns:
-        Response: HTML or JSON response with users list
+        Response: HTML response with users list and pagination controls
     """
     try:
         if not settings.email_auth_enabled:
-            return HTMLResponse(content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled. User management requires email auth.</p></div>', status_code=200)
-
-        # Get root_path from request
-        root_path = request.scope.get("root_path", "")
-
-        # First-Party
+            return HTMLResponse(
+                content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled. User management requires email auth.</p></div>',
+                status_code=200,
+            )
 
         auth_service = EmailAuthService(db)
 
-        # List all users (admin endpoint)
-        users = await auth_service.list_users()
+        # List users with page-based pagination
+        paginated_result = await auth_service.list_users(page=page, per_page=per_page)
+        users_db = paginated_result.data
+        pagination = typing_cast(PaginationMeta, paginated_result.pagination)
 
-        # Check if JSON response is requested (for dropdown population)
-        accept_header = request.headers.get("accept", "")
-        is_json_request = "application/json" in accept_header or request.query_params.get("format") == "json"
-
-        if is_json_request:
-            # Return JSON for dropdown population
-            users_data = []
-            for user_obj in users:
-                users_data.append({"email": user_obj.email, "full_name": user_obj.full_name, "is_active": user_obj.is_active, "is_admin": user_obj.is_admin})
-            return ORJSONResponse(content={"users": users_data})
-
-        # Generate HTML for users
-        users_html = ""
+        # Get current user email
         current_user_email = get_user_email(user)
 
-        # Check how many active admins we have to determine if we should hide buttons for last admin
+        # Check how many active admins we have
         admin_count = await auth_service.count_active_admin_users()
 
-        for user_obj in users:
-            status_class = "text-green-600" if user_obj.is_active else "text-red-600"
-            status_text = "Active" if user_obj.is_active else "Inactive"
-            admin_badge = '<span class="px-2 py-1 text-xs font-semibold bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Admin</span>' if user_obj.is_admin else ""
+        # Prepare user data for template with additional flags
+        users_data = []
+        for user_obj in users_db:
             is_current_user = user_obj.email == current_user_email
             is_last_admin = user_obj.is_admin and user_obj.is_active and admin_count == 1
 
-            # Build activate/deactivate buttons (hide for current user and last admin)
-            activate_deactivate_button = ""
-            if not is_current_user and not is_last_admin:
-                if not user_obj.is_active:
-                    activate_deactivate_button = f'<button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500" hx-post="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/activate" hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>'
-                else:
-                    activate_deactivate_button = f'<button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>'
-
-            # Build delete button (hide for current user and last admin)
-            delete_button = ""
-            if not is_current_user and not is_last_admin:
-                delete_button = f'<button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>'
-
-            # Build force password change button/indicator
-            password_change_button_html = ""  # nosec B105 - HTML content, not password
-            if not is_current_user:
-                if user_obj.password_change_required:
-                    # HTML content for password change required indicator
-                    password_change_required_html = (  # nosec B105 - HTML content, not password
-                        '<span class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 '
-                        "bg-orange-50 dark:bg-orange-900/20 border border-orange-300 dark:border-orange-600 "
-                        'rounded-md">Password Change Required</span>'
-                    )
-                    password_change_button_html = password_change_required_html
-                else:
-                    password_change_button_html = (
-                        f'<button class="px-3 py-1 text-sm font-medium text-yellow-600 dark:text-yellow-400 '
-                        f"hover:text-yellow-800 dark:hover:text-yellow-300 border border-yellow-300 dark:border-yellow-600 "
-                        f"hover:border-yellow-500 dark:hover:border-yellow-400 rounded-md focus:outline-none focus:ring-2 "
-                        f'focus:ring-offset-2 focus:ring-yellow-500" hx-post="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/force-password-change" '
-                        f'hx-confirm="Force this user to change their password on next login?" hx-target="closest .user-card" '
-                        f'hx-swap="outerHTML">Force Password Change</button>'
-                    )
-
-            # Password change required badge
-            password_badge = (
-                '<span class="px-2 py-1 text-xs font-semibold bg-orange-100 text-orange-800 rounded-full dark:bg-orange-900 dark:text-orange-200"><i class="fas fa-key mr-1"></i>Password Change Required</span>'
-                if user_obj.password_change_required
-                else ""
+            users_data.append(
+                {
+                    "email": user_obj.email,
+                    "full_name": user_obj.full_name,
+                    "is_active": user_obj.is_active,
+                    "is_admin": user_obj.is_admin,
+                    "auth_provider": user_obj.auth_provider,
+                    "created_at": user_obj.created_at,
+                    "password_change_required": user_obj.password_change_required,
+                    "is_current_user": is_current_user,
+                    "is_last_admin": is_last_admin,
+                }
             )
 
-            users_html += f"""
-            <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
-                <div class="flex justify-between items-start">
-                    <div class="flex-1">
-                        <div class="flex items-center gap-2 mb-2">
-                            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name or "N/A"}</h3>
-                            {admin_badge}
-                            <span class="px-2 py-1 text-xs font-semibold {status_class} bg-gray-100 dark:bg-gray-700 rounded-full">{status_text}</span>
-                            {'<span class="px-2 py-1 text-xs font-semibold bg-blue-100 text-blue-800 rounded-full dark:bg-blue-900 dark:text-blue-200">You</span>' if is_current_user else ""}
-                            {'<span class="px-2 py-1 text-xs font-semibold bg-yellow-100 text-yellow-800 rounded-full dark:bg-yellow-900 dark:text-yellow-200">Last Admin</span>' if is_last_admin else ""}
-                            {password_badge}
-                        </div>
-                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
-                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
-                        <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M")}</p>
-                    </div>
-                    <div class="flex gap-2 ml-4">
-                        <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                                hx-get="{root_path}/admin/users/{urllib.parse.quote(user_obj.email, safe="")}/edit" hx-target="#user-edit-modal-content">
-                            Edit
-                        </button>
-                        {activate_deactivate_button}
-                        {password_change_button_html}
-                        {delete_button}
-                    </div>
-                </div>
-            </div>
-            """
+        # Get team members if team_id is provided (for pre-selection in team member addition)
+        team_member_emails = set()
+        team_member_data = {}
+        current_user_is_team_owner = False
 
-        if not users_html:
-            users_html = '<div class="text-center py-8"><p class="text-gray-500 dark:text-gray-400">No users found.</p></div>'
+        if team_id and render == "selector":
+            team_service = TeamManagementService(db)
+            try:
+                team_members = await team_service.get_team_members(team_id)
+                team_member_emails = {team_user.email for team_user, membership in team_members}
 
-        return HTMLResponse(content=users_html)
+                # Build enhanced member data from the same query result (no extra DB calls!)
+                # Count owners in-memory
+                owner_count = sum(1 for _, membership in team_members if membership.role == "owner")
+
+                # Build member data dict and find current user's role
+                for team_user, membership in team_members:
+                    email = team_user.email
+                    is_last_owner = membership.role == "owner" and owner_count == 1
+                    team_member_data[email] = type("MemberData", (), {"role": membership.role, "joined_at": membership.joined_at, "is_last_owner": is_last_owner})()
+
+                    # Check if current user is owner (in-memory check)
+                    if email == current_user_email and membership.role == "owner":
+                        current_user_is_team_owner = True
+
+            except Exception as e:
+                LOGGER.warning(f"Could not fetch team members for team {team_id}: {e}")
+
+        # End the read-only transaction early to avoid idle-in-transaction under load
+        db.commit()
+
+        if render == "selector":
+            return request.app.state.templates.TemplateResponse(
+                "team_members_selector.html",
+                {
+                    "request": request,
+                    "data": users_data,
+                    "pagination": pagination.model_dump(),
+                    "root_path": request.scope.get("root_path", ""),
+                    "team_member_emails": team_member_emails,
+                    "team_member_data": team_member_data,
+                    "current_user_email": current_user_email,
+                    "current_user_is_team_owner": current_user_is_team_owner,
+                    "team_id": team_id,
+                },
+            )
+
+        if render == "controls":
+            base_url = f"{settings.app_root_path}/admin/users/partial"
+            return request.app.state.templates.TemplateResponse(
+                "pagination_controls.html",
+                {
+                    "request": request,
+                    "pagination": pagination.model_dump(),
+                    "base_url": base_url,
+                    "hx_target": "#users-list-container",
+                    "hx_indicator": "#users-loading",
+                    "hx_swap": "outerHTML",
+                    "query_params": {},
+                    "root_path": request.scope.get("root_path", ""),
+                },
+            )
+
+        # Render template with paginated data
+        return request.app.state.templates.TemplateResponse(
+            "users_partial.html",
+            {
+                "request": request,
+                "data": users_data,
+                "pagination": pagination.model_dump(),
+                "root_path": request.scope.get("root_path", ""),
+                "current_user_email": current_user_email,
+            },
+        )
 
     except Exception as e:
-        LOGGER.error(f"Error listing users for admin {user}: {e}")
-        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading users: {str(e)}</p></div>', status_code=200)
+        LOGGER.error(f"Error loading users partial for admin {user}: {e}")
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading users: {html.escape(str(e))}</p></div>', status_code=200)
+
+
+@admin_router.get("/teams/{team_id}/members/partial", response_class=HTMLResponse)
+@require_permission("teams.manage_members")
+async def admin_team_members_partial_html(
+    team_id: str,
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Response:
+    """Return paginated team members for two-section layout (top section).
+
+    Args:
+        team_id: Team identifier.
+        request: FastAPI request object.
+        page: Page number (1-indexed). Default: 1.
+        per_page: Items per page. Default: 50.
+        db: Database session.
+        user: Current authenticated user context.
+
+    Returns:
+        Response: HTML response with team members and pagination data.
+    """
+    try:
+        if not settings.email_auth_enabled:
+            return HTMLResponse(
+                content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled.</p></div>',
+                status_code=200,
+            )
+
+        team_service = TeamManagementService(db)
+        current_user_email = get_user_email(user)
+
+        try:
+            team_id = _normalize_team_id(team_id)
+        except ValueError:
+            return HTMLResponse(content='<div class="text-red-500">Invalid team ID</div>', status_code=400)
+
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        current_user_role = await team_service.get_user_role_in_team(current_user_email, team_id)
+        if current_user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can manage members</div>', status_code=403)
+
+        # Get paginated team members
+        paginated_result = await team_service.get_team_members(team_id, page=page, per_page=per_page)
+        members = paginated_result["data"]
+        pagination = paginated_result["pagination"]
+
+        # Count owners for is_last_owner check - must count ALL owners, not just current page
+        owner_count = team_service.count_team_owners(team_id)
+
+        # End the read-only transaction early
+        db.commit()
+
+        root_path = request.scope.get("root_path", "")
+        next_page_url = f"{root_path}/admin/teams/{team_id}/members/partial?page={pagination.page + 1}&per_page={pagination.per_page}"
+        return request.app.state.templates.TemplateResponse(
+            "team_users_selector.html",
+            {
+                "request": request,
+                "data": members,  # List of (user, membership) tuples
+                "pagination": pagination.model_dump(),
+                "root_path": root_path,
+                "current_user_email": current_user_email,
+                "current_user_is_team_owner": True,  # Already verified above
+                "owner_count": owner_count,
+                "team_id": team_id,
+                "is_members_list": True,
+                "scroll_trigger_id": "members-scroll-trigger",
+                "next_page_url": next_page_url,
+            },
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error loading team members partial for team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading members: {html.escape(str(e))}</p></div>', status_code=200)
+
+
+@admin_router.get("/teams/{team_id}/non-members/partial", response_class=HTMLResponse)
+@require_permission("teams.manage_members")
+async def admin_team_non_members_partial_html(
+    team_id: str,
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Response:
+    """Return paginated non-members for two-section layout (bottom section).
+
+    Args:
+        team_id: Team identifier.
+        request: FastAPI request object.
+        page: Page number (1-indexed). Default: 1.
+        per_page: Items per page. Default: 50.
+        db: Database session.
+        user: Current authenticated user context.
+
+    Returns:
+        Response: HTML response with non-members and pagination data.
+    """
+    try:
+        if not settings.email_auth_enabled:
+            return HTMLResponse(
+                content='<div class="text-center py-8"><p class="text-gray-500">Email authentication is disabled.</p></div>',
+                status_code=200,
+            )
+
+        auth_service = EmailAuthService(db)
+        team_service = TeamManagementService(db)
+        current_user_email = get_user_email(user)
+
+        try:
+            team_id = _normalize_team_id(team_id)
+        except ValueError:
+            return HTMLResponse(content='<div class="text-red-500">Invalid team ID</div>', status_code=400)
+
+        team = await team_service.get_team_by_id(team_id)
+        if not team:
+            return HTMLResponse(content='<div class="text-red-500">Team not found</div>', status_code=404)
+
+        current_user_role = await team_service.get_user_role_in_team(current_user_email, team_id)
+        if current_user_role != "owner":
+            return HTMLResponse(content='<div class="text-red-500">Only team owners can manage members</div>', status_code=403)
+
+        # Get paginated non-members
+        paginated_result = await auth_service.list_users_not_in_team(team_id, page=page, per_page=per_page)
+        users = paginated_result.data
+        pagination = typing_cast(PaginationMeta, paginated_result.pagination)
+
+        # End the read-only transaction early
+        db.commit()
+
+        root_path = request.scope.get("root_path", "")
+        next_page_url = f"{root_path}/admin/teams/{team_id}/non-members/partial?page={pagination.page + 1}&per_page={pagination.per_page}"
+        return request.app.state.templates.TemplateResponse(
+            "team_users_selector.html",
+            {
+                "request": request,
+                "data": users,  # List of user objects
+                "pagination": pagination.model_dump(),
+                "root_path": root_path,
+                "current_user_email": current_user_email,
+                "current_user_is_team_owner": True,  # Already verified above
+                "owner_count": 0,  # Not relevant for non-members
+                "team_id": team_id,
+                "is_members_list": False,
+                "scroll_trigger_id": "non-members-scroll-trigger",
+                "next_page_url": next_page_url,
+            },
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error loading team non-members partial for team {team_id}: {e}")
+        return HTMLResponse(content=f'<div class="text-center py-8"><p class="text-red-500">Error loading non-members: {html.escape(str(e))}</p></div>', status_code=200)
+
+
+@admin_router.get("/users/search", response_class=JSONResponse)
+@require_any_permission(["admin.user_management", "teams.manage_members"])
+async def admin_search_users(
+    q: str = Query("", description="Search query"),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Maximum number of results to return"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """
+    Search users by email or full name.
+
+    This endpoint searches users for use in search functionality like team member selection.
+
+    Args:
+        q (str): Search query string to match against email or full name
+        limit (int): Maximum number of results to return
+        db (Session): Database session dependency
+        user: Current user making the request
+
+    Returns:
+        JSONResponse: Dictionary containing list of matching users and count
+    """
+    if not settings.email_auth_enabled:
+        return {"users": [], "count": 0}
+
+    user_email = get_user_email(user)
+    search_query = q.strip().lower()
+
+    if not search_query:
+        # If no search query, return empty list
+        return {"users": [], "count": 0}
+
+    LOGGER.debug(f"User {user_email} searching users with query: {search_query}")
+
+    auth_service = EmailAuthService(db)
+
+    # Use list_users with search parameter
+    users_result = await auth_service.list_users(search=search_query, limit=limit)
+    users_list = users_result.data
+
+    # Format results for JSON response
+    results = [
+        {
+            "email": user_obj.email,
+            "full_name": user_obj.full_name or "",
+            "is_active": user_obj.is_active,
+            "is_admin": user_obj.is_admin,
+        }
+        for user_obj in users_list
+    ]
+
+    return {"users": results, "count": len(results)}
 
 
 @admin_router.post("/users")
@@ -4932,9 +6600,6 @@ async def admin_create_user(
         HTMLResponse: Success message or error response
     """
     try:
-        # Get root path for URL construction
-        root_path = request.scope.get("root_path", "") if request else ""
-
         form = await request.form()
 
         # Validate password strength
@@ -4953,47 +6618,24 @@ async def admin_create_user(
             email=str(form.get("email", "")), password=password, full_name=str(form.get("full_name", "")), is_admin=form.get("is_admin") == "on", auth_provider="local"
         )
 
-        # If the user was created with the default password, force password change
-        if password == settings.default_user_password.get_secret_value():  # nosec B105
+        # If the user was created with the default password, optionally force password change
+        if (
+            settings.password_change_enforcement_enabled and getattr(settings, "require_password_change_for_default_password", True) and password == settings.default_user_password.get_secret_value()
+        ):  # nosec B105
             new_user.password_change_required = True
             db.commit()
 
         LOGGER.info(f"Admin {user} created user: {new_user.email}")
 
-        # Generate HTML for the new user
-        status_class = "text-green-600"
-        status_text = "Active"
-        admin_badge = '<span class="px-2 py-1 text-xs font-semibold bg-purple-100 text-purple-800 rounded-full dark:bg-purple-900 dark:text-purple-200">Admin</span>' if new_user.is_admin else ""
-
-        user_html = f"""
-        <div class="border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
-            <div class="flex justify-between items-start">
-                <div class="flex-1">
-                    <div class="flex items-center gap-2 mb-2">
-                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{new_user.full_name or "N/A"}</h3>
-                        {admin_badge}
-                        <span class="px-2 py-1 text-xs font-semibold {status_class} bg-gray-100 dark:bg-gray-700 rounded-full">{status_text}</span>
-                    </div>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {new_user.email}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {new_user.auth_provider}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {new_user.created_at.strftime("%Y-%m-%d %H:%M")}</p>
-                </div>
-                <div class="flex gap-2 ml-4">
-                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                            hx-get="{root_path}/admin/users/{new_user.email}/edit" hx-target="#user-edit-modal-content">
-                        Edit
-                    </button>
-                    <button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{new_user.email.replace("@", "%40")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .border">Deactivate</button>
-                </div>
-            </div>
-        </div>
-        """
-
-        return HTMLResponse(content=user_html, status_code=201)
+        # Return HX-Trigger header to refresh the users list
+        # This will trigger a reload of the users-list-container
+        response = HTMLResponse(content='<div class="text-green-500">User created successfully!</div>', status_code=201)
+        response.headers["HX-Trigger"] = "userCreated"
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error creating user by admin {user}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error creating user: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error creating user: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.get("/users/{user_email}/edit")
@@ -5124,106 +6766,15 @@ async def admin_get_user_edit(
                     <div id="password-match-message" class="mt-1 text-sm text-red-600 hidden">Passwords do not match</div>
                 </div>
                 {password_requirements_html}
-
-                <script>
-                // Password policy settings injected from backend
-                const passwordPolicy = {{
-                    minLength: {settings.password_min_length},
-                    requireUppercase: {'true' if settings.password_require_uppercase else 'false'},
-                    requireLowercase: {'true' if settings.password_require_lowercase else 'false'},
-                    requireNumbers: {'true' if settings.password_require_numbers else 'false'},
-                    requireSpecial: {'true' if settings.password_require_special else 'false'}
-                }};
-
-                // (No debug output) passwordPolicy available in JS for logic below
-
-                function updateRequirementIcon(elementId, isValid) {{
-                    const req = document.getElementById(elementId);
-                    if (req) {{
-                        const icon = req.querySelector('span');
-                        if (isValid) {{
-                            icon.className = 'inline-flex items-center justify-center w-4 h-4 bg-green-500 text-white rounded-full text-xs mr-2';
-                            icon.textContent = '✓';
-                        }} else {{
-                            icon.className = 'inline-flex items-center justify-center w-4 h-4 bg-gray-400 text-white rounded-full text-xs mr-2';
-                            icon.textContent = '✗';
-                        }}
-                    }}
-                }}
-
-                function validatePasswordRequirements() {{
-                    const password = document.getElementById('password-field')?.value || '';
-
-                    // Check length requirement (always required)
-                    const lengthCheck = password.length >= passwordPolicy.minLength;
-                    updateRequirementIcon('req-length', lengthCheck);
-
-                    // Check uppercase requirement (if enabled)
-                    const uppercaseCheck = !passwordPolicy.requireUppercase || /[A-Z]/.test(password);
-                    updateRequirementIcon('req-uppercase', uppercaseCheck);
-
-                    // Check lowercase requirement (if enabled)
-                    const lowercaseCheck = !passwordPolicy.requireLowercase || /[a-z]/.test(password);
-                    updateRequirementIcon('req-lowercase', lowercaseCheck);
-
-                    // Check numbers requirement (if enabled)
-                    const numbersCheck = !passwordPolicy.requireNumbers || /[0-9]/.test(password);
-                    updateRequirementIcon('req-numbers', numbersCheck);
-
-                    // Check special character requirement (if enabled) - matches backend set
-                    const specialCheck = !passwordPolicy.requireSpecial || /[!@#$%^&*()_+\\-\\=\\[\\]{{}};:'"\\\\|,.<>`~\\/\\?]/.test(password);
-                    updateRequirementIcon('req-special', specialCheck);
-
-                    // Enable/disable submit button based on active requirements
-                    const submitButton = document.querySelector('#user-edit-modal-content button[type="submit"]');
-                    const allRequirementsMet = lengthCheck && uppercaseCheck && lowercaseCheck && numbersCheck && specialCheck;
-                    const passwordEmpty = password.length === 0;
-
-                    if (submitButton) {{
-                        // Allow submission if password is empty (keep current) or if all requirements are met
-                        if (passwordEmpty || allRequirementsMet) {{
-                            submitButton.disabled = false;
-                            submitButton.className = 'px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500';
-                        }} else {{
-                            submitButton.disabled = true;
-                            submitButton.className = 'px-4 py-2 text-sm font-medium text-white bg-gray-400 border border-transparent rounded-md cursor-not-allowed';
-                        }}
-                    }}
-                }}
-
-                function validatePasswordMatch() {{
-                    const password = document.getElementById('password-field')?.value || '';
-                    const confirmPassword = document.getElementById('confirm-password-field')?.value || '';
-                    const matchMessage = document.getElementById('password-match-message');
-
-                    if (password && confirmPassword && password !== confirmPassword) {{
-                        matchMessage?.classList.remove('hidden');
-                    }} else {{
-                        matchMessage?.classList.add('hidden');
-                    }}
-                }}
-
-                // Initialize validation when the form is present (supports HTMX-injected content)
-                (function initPasswordValidation() {{
-                    if (document.getElementById('password-field')) {{
-                        validatePasswordRequirements();
-                        validatePasswordMatch();
-                    }}
-                }})();
-
-                // Re-run validation after HTMX swaps content into the DOM (modal loaded via HTMX)
-                document.addEventListener('htmx:afterSwap', function(event) {{
-                    try {{
-                        const target = event.detail && event.detail.target ? event.detail.target : null;
-                        if (target && (target.querySelector('#password-field') || target.id === 'user-edit-modal-content')) {{
-                            validatePasswordRequirements();
-                            validatePasswordMatch();
-                        }}
-                    }} catch (e) {{
-                        // Ignore errors from HTMX event handling
-                    }}
-                }});
-                </script>
+                <div
+                    id="password-policy-data"
+                    class="hidden"
+                    data-min-length="{settings.password_min_length}"
+                    data-require-uppercase="{'true' if settings.password_require_uppercase else 'false'}"
+                    data-require-lowercase="{'true' if settings.password_require_lowercase else 'false'}"
+                    data-require-numbers="{'true' if settings.password_require_numbers else 'false'}"
+                    data-require-special="{'true' if settings.password_require_special else 'false'}"
+                ></div>
                 <div class="flex justify-end space-x-3">
                     <button type="button" onclick="hideUserEditModal()"
                             class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700">
@@ -5241,7 +6792,7 @@ async def admin_get_user_edit(
 
     except Exception as e:
         LOGGER.error(f"Error getting user edit form for {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error loading user: {str(e)}</div>', status_code=500)
+        return HTMLResponse(content=f'<div class="text-red-500">Error loading user: {html.escape(str(e))}</div>', status_code=500)
 
 
 @admin_router.post("/users/{user_email}/update")
@@ -5309,21 +6860,15 @@ async def admin_update_user(
         success_html = """
         <div class="text-green-500 text-center p-4">
             <p>User updated successfully</p>
-            <script>
-                setTimeout(() => {
-                    // Close the modal
-                    hideUserEditModal();
-                    // Refresh the users list
-                    htmx.trigger(document.getElementById('users-list'), 'load');
-                }, 1500);
-            </script>
         </div>
         """
-        return HTMLResponse(content=success_html)
+        response = HTMLResponse(content=success_html)
+        response.headers["HX-Trigger"] = orjson.dumps({"adminUserAction": {"closeUserEditModal": True, "refreshUsersList": True, "delayMs": 1500}}).decode()
+        return response
 
     except Exception as e:
         LOGGER.error(f"Error updating user {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error updating user: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error updating user: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/users/{user_email}/activate")
@@ -5360,37 +6905,15 @@ async def admin_activate_user(
         decoded_email = urllib.parse.unquote(user_email)
 
         # Get current user email from JWT (used for logging purposes)
-        get_user_email(user)
+        current_user_email = get_user_email(user)
 
         user_obj = await auth_service.activate_user(decoded_email)
-        user_html = f"""
-        <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
-            <div class="flex justify-between items-start">
-                <div class="flex-1">
-                    <div class="flex items-center gap-2 mb-2">
-                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name}</h3>
-                        <span class="px-2 py-1 text-xs font-semibold text-green-600 bg-gray-100 dark:bg-gray-700 rounded-full">Active</span>
-                    </div>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M") if user_obj.created_at else "Unknown"}</p>
-                </div>
-                <div class="flex gap-2 ml-4">
-                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                            hx-get="{root_path}/admin/users/{user_obj.email}/edit" hx-target="#user-edit-modal-content">
-                        Edit
-                    </button>
-                    <button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500" hx-post="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>
-                    <button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>
-                </div>
-            </div>
-        </div>
-        """
-        return HTMLResponse(content=user_html)
+        admin_count = await auth_service.count_active_admin_users()
+        return HTMLResponse(content=_render_user_card_html(user_obj, current_user_email, admin_count, root_path))
 
     except Exception as e:
         LOGGER.error(f"Error activating user {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error activating user: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error activating user: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/users/{user_email}/deactivate")
@@ -5438,34 +6961,12 @@ async def admin_deactivate_user(
             return HTMLResponse(content='<div class="text-red-500">Cannot deactivate the last remaining admin user</div>', status_code=400)
 
         user_obj = await auth_service.deactivate_user(decoded_email)
-        user_html = f"""
-        <div class="user-card border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800">
-            <div class="flex justify-between items-start">
-                <div class="flex-1">
-                    <div class="flex items-center gap-2 mb-2">
-                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{user_obj.full_name}</h3>
-                        <span class="px-2 py-1 text-xs font-semibold text-red-600 bg-gray-100 dark:bg-gray-700 rounded-full">Inactive</span>
-                    </div>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">📧 {user_obj.email}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">🔐 Provider: {user_obj.auth_provider}</p>
-                    <p class="text-sm text-gray-600 dark:text-gray-400">📅 Created: {user_obj.created_at.strftime("%Y-%m-%d %H:%M") if user_obj.created_at else "Unknown"}</p>
-                </div>
-                <div class="flex gap-2 ml-4">
-                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                            hx-get="{root_path}/admin/users/{user_obj.email}/edit" hx-target="#user-edit-modal-content">
-                        Edit
-                    </button>
-                    <button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500" hx-post="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}/activate" hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>
-                    <button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>
-                </div>
-            </div>
-        </div>
-        """
-        return HTMLResponse(content=user_html)
+        admin_count = await auth_service.count_active_admin_users()
+        return HTMLResponse(content=_render_user_card_html(user_obj, current_user_email, admin_count, root_path))
 
     except Exception as e:
         LOGGER.error(f"Error deactivating user {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error deactivating user: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error deactivating user: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.delete("/users/{user_email}")
@@ -5517,7 +7018,7 @@ async def admin_delete_user(
 
     except Exception as e:
         LOGGER.error(f"Error deleting user {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error deleting user: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error deleting user: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.post("/users/{user_email}/force-password-change")
@@ -5589,71 +7090,18 @@ async def admin_force_password_change(
 
         LOGGER.info(f"Admin {current_user_email} forced password change for user {decoded_email}")
 
-        # Return updated user card with status indicator
-        user_html = f"""
-        <div class="user-card bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 border border-gray-200 dark:border-gray-700 hover:shadow-lg transition-shadow duration-200">
-            <div class="flex items-start justify-between">
-                <div class="flex items-center space-x-4">
-                    <div class="w-12 h-12 bg-gradient-to-br from-blue-500 to-purple-600 rounded-full flex items-center justify-center text-white font-semibold text-lg">
-                        {user_obj.get_display_name()[0].upper()}
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{html.escape(user_obj.get_display_name())}</h3>
-                        <p class="text-sm text-gray-600 dark:text-gray-400">{html.escape(user_obj.email)}</p>
-                        <div class="flex items-center space-x-2 mt-1">
-                            <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium {'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300' if user_obj.is_active else 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300'}">
-                                {'Active' if user_obj.is_active else 'Inactive'}
-                            </span>
-                            {'<span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300">Admin</span>' if user_obj.is_admin else ''}
-                            {'<span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300"><i class="fas fa-key mr-1"></i>Password Change Required</span>' if user_obj.password_change_required else ''}
-                        </div>
-                    </div>
-                </div>
-                <div class="flex flex-col space-y-2">
-                    <button class="px-3 py-1 text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 border border-blue-300 dark:border-blue-600 hover:border-blue-500 dark:hover:border-blue-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                            hx-get="{root_path}/admin/users/{user_obj.email}/edit" hx-target="#user-edit-modal-content">
-                        Edit
-                    </button>
-                    {(
-                        '<button class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 hover:text-orange-800 '
-                        'dark:hover:text-orange-300 border border-orange-300 dark:border-orange-600 hover:border-orange-500 '
-                        'dark:hover:border-orange-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 '
-                        'focus:ring-orange-500" hx-post="' + root_path + '/admin/users/' + user_obj.email.replace("@", "%40") +
-                        '/deactivate" hx-confirm="Deactivate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Deactivate</button>'
-                        if user_obj.is_active else
-                        '<button class="px-3 py-1 text-sm font-medium text-green-600 dark:text-green-400 hover:text-green-800 '
-                        'dark:hover:text-green-300 border border-green-300 dark:border-green-600 hover:border-green-500 '
-                        'dark:hover:border-green-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 '
-                        'focus:ring-green-500" hx-post="' + root_path + '/admin/users/' + user_obj.email.replace("@", "%40") +
-                        '/activate" hx-confirm="Activate this user?" hx-target="closest .user-card" hx-swap="outerHTML">Activate</button>'
-                    )}
-                    {(
-                        '<button class="px-3 py-1 text-sm font-medium text-yellow-600 dark:text-yellow-400 hover:text-yellow-800 '
-                        'dark:hover:text-yellow-300 border border-yellow-300 dark:border-yellow-600 hover:border-yellow-500 '
-                        'dark:hover:border-yellow-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 '
-                        'focus:ring-yellow-500" hx-post="' + root_path + '/admin/users/' + user_obj.email.replace("@", "%40") +
-                        '/force-password-change" hx-confirm="Force this user to change their password on next login?" '
-                        'hx-target="closest .user-card" hx-swap="outerHTML">Force Password Change</button>'
-                        if not user_obj.password_change_required else
-                        '<span class="px-3 py-1 text-sm font-medium text-orange-600 dark:text-orange-400 bg-orange-50 '
-                        'dark:bg-orange-900/20 border border-orange-300 dark:border-orange-600 rounded-md">Password Change Required</span>'
-                    )}
-                    <button class="px-3 py-1 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 border border-red-300 dark:border-red-600 hover:border-red-500 dark:hover:border-red-400 rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" hx-delete="{root_path}/admin/users/{user_obj.email.replace("@", "%40")}" hx-confirm="Are you sure you want to delete this user? This action cannot be undone." hx-target="closest .user-card" hx-swap="outerHTML">Delete</button>
-                </div>
-            </div>
-        </div>
-        """
-        return HTMLResponse(content=user_html)
+        admin_count = await auth_service.count_active_admin_users()
+        return HTMLResponse(content=_render_user_card_html(user_obj, current_user_email, admin_count, root_path))
 
     except Exception as e:
         LOGGER.error(f"Error forcing password change for user {user_email}: {e}")
-        return HTMLResponse(content=f'<div class="text-red-500">Error forcing password change: {str(e)}</div>', status_code=400)
+        return HTMLResponse(content=f'<div class="text-red-500">Error forcing password change: {html.escape(str(e))}</div>', status_code=400)
 
 
 @admin_router.get("/tools", response_model=PaginatedResponse)
 async def admin_list_tools(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -5666,7 +7114,7 @@ async def admin_list_tools(
 
     Args:
         page (int): Page number (1-indexed). Default: 1.
-        per_page (int): Items per page (1-500). Default: 50.
+        per_page (int): Items per page. Default: 50.
         include_inactive (bool): Whether to include inactive tools in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -5687,6 +7135,9 @@ async def admin_list_tools(
         user_email=user_email,
     )
 
+    # End the read-only transaction early to avoid idle-in-transaction under load.
+    db.commit()
+
     # Return standardized paginated response
     return {
         "data": [tool.model_dump(by_alias=True) for tool in paginated_result["data"]],
@@ -5699,10 +7150,11 @@ async def admin_list_tools(
 async def admin_tools_partial_html(
     request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     render: Optional[str] = Query(None, description="Render mode: 'controls' for pagination controls only"),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -5715,9 +7167,10 @@ async def admin_tools_partial_html(
     Args:
         request (Request): FastAPI request object.
         page (int): Page number (1-indexed). Default: 1.
-        per_page (int): Items per page (1-500). Default: 50.
+        per_page (int): Items per page. Default: 50.
         include_inactive (bool): Whether to include inactive tools in the results.
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
         render (str): Render mode - 'controls' returns only pagination controls.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
@@ -5725,17 +7178,16 @@ async def admin_tools_partial_html(
     Returns:
         HTMLResponse with tools table rows and pagination controls.
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested tools HTML partial (page={page}, per_page={per_page}, render={render}, gateway_id={gateway_id})")
-
     user_email = get_user_email(user)
+    LOGGER.info(f"🔧 TOOLS PARTIAL REQUEST - User: {user_email}, team_id: {team_id}, page: {page}, render: {render}, referer: {request.headers.get('referer', 'none')}")
 
     # Build base query using tool_service's team filtering logic
     team_service = TeamManagementService(db)
     user_teams = await team_service.get_user_teams(user_email)
     team_ids = [team.id for team in user_teams]
 
-    # Build query
-    query = select(DbTool)
+    # Build query with eager loading for email_team to avoid N+1 queries
+    query = select(DbTool).options(joinedload(DbTool.email_team))
 
     # Apply gateway filter if provided. Support special sentinel 'null' to
     # request tools with NULL gateway_id (e.g., RestTool/no gateway).
@@ -5759,20 +7211,38 @@ async def admin_tools_partial_html(
     if not include_inactive:
         query = query.where(DbTool.enabled.is_(True))
 
-    # Build access conditions (same logic as tool_service.list_tools with user_email)
-    access_conditions = []
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (simpler, team-scoped view)
+    # When team_id is NOT specified, show all accessible items (owned + team + public)
+    if team_id:
+        # Team-specific view: only show tools from the specified team if user is a member
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
+                and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering tools by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions
+        access_conditions = []
 
-    # 1. User's personal tools (owner_email matches)
-    access_conditions.append(DbTool.owner_email == user_email)
+        # 1. User's personal tools (owner_email matches)
+        access_conditions.append(DbTool.owner_email == user_email)
 
-    # 2. Team tools where user is member
-    if team_ids:
-        access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
+        # 2. Team tools where user is member
+        if team_ids:
+            access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
 
-    # 3. Public tools
-    access_conditions.append(DbTool.visibility == "public")
+        # 3. Public tools
+        access_conditions.append(DbTool.visibility == "public")
 
-    query = query.where(or_(*access_conditions))
+        query = query.where(or_(*access_conditions))
 
     # Apply sorting: alphabetical by URL, then name, then ID (for UI display)
     # Different from JSON endpoint which uses created_at DESC
@@ -5785,6 +7255,8 @@ async def admin_tools_partial_html(
         query_params_dict["include_inactive"] = "true"
     if gateway_id:
         query_params_dict["gateway_id"] = gateway_id
+    if team_id:
+        query_params_dict["team_id"] = team_id
 
     paginated_result = await paginate_query(
         db=db,
@@ -5802,23 +7274,21 @@ async def admin_tools_partial_html(
     pagination = paginated_result["pagination"]
     links = paginated_result["links"]
 
-    # Batch fetch team names for the tools to avoid N+1 queries
-    team_ids_set = {t.team_id for t in tools_db if t.team_id}
-    team_map = {}
-    if team_ids_set:
-        teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids_set), EmailTeam.is_active.is_(True))).all()
-        team_map = {team.id: team.name for team in teams}
-
-    # Apply team names to DB objects before conversion
-    for t in tools_db:
-        t.team = team_map.get(t.team_id) if t.team_id else None
-
+    # Team names are loaded via joinedload(DbTool.email_team) in the query
     # Batch convert to Pydantic models using tool service
     # This eliminates the N+1 query problem from calling get_tool() in a loop
-    tools_pydantic = [tool_service.convert_tool_to_read(t, include_metrics=False, include_auth=False) for t in tools_db]
+    tools_pydantic = []
+    for t in tools_db:
+        try:
+            tools_pydantic.append(tool_service.convert_tool_to_read(t, include_metrics=False, include_auth=False))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert tool {getattr(t, 'id', 'unknown')} ({getattr(t, 'name', 'unknown')}): {e}")
 
     # Serialize tools
     data = jsonable_encoder(tools_pydantic)
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
 
     # If render=controls, return only pagination controls
     if render == "controls":
@@ -5862,10 +7332,116 @@ async def admin_tools_partial_html(
     )
 
 
+@admin_router.get("/tool-ops/partial", response_class=HTMLResponse)
+async def admin_tool_ops_partial(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    include_inactive: bool = False,
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """
+    Return HTML partial for tool operations table.
+
+    Args:
+        request (Request): The request object.
+        page (int): The page number. Defaults to 1.
+        per_page (int): The number of items per page. Defaults to settings.pagination_default_page_size.
+        include_inactive (bool): Whether to include inactive items. Defaults to False.
+        gateway_id (Optional[str]): The gateway ID to filter by. Defaults to None.
+        team_id (Optional[str]): The team ID to filter by. Defaults to None.
+        db (Session): The database session. Defaults to Depends(get_db).
+        user (Any): The current user. Defaults to Depends(get_current_user_with_permissions).
+
+    Returns:
+        HTMLResponse: The HTML partial for the tool operations table.
+    """
+    user_email = get_user_email(user)
+    LOGGER.debug(f"Tool ops partial request - team_id: {team_id}, page: {page}")
+
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [team.id for team in user_teams]
+
+    query = select(DbTool).options(joinedload(DbTool.email_team))
+
+    if gateway_id:
+        gateway_ids = [gid.strip() for gid in gateway_id.split(",") if gid.strip()]
+        if gateway_ids:
+            null_requested = any(gid.lower() == "null" for gid in gateway_ids)
+            non_null_ids = [gid for gid in gateway_ids if gid.lower() != "null"]
+            if non_null_ids and null_requested:
+                query = query.where(or_(DbTool.gateway_id.in_(non_null_ids), DbTool.gateway_id.is_(None)))
+                LOGGER.debug(f"Filtering tools by gateway IDs (including NULL): {non_null_ids} + NULL")
+            elif null_requested:
+                query = query.where(DbTool.gateway_id.is_(None))
+                LOGGER.debug("Filtering tools by NULL gateway_id (RestTool)")
+            else:
+                query = query.where(DbTool.gateway_id.in_(non_null_ids))
+                LOGGER.debug(f"Filtering tools by gateway IDs: {non_null_ids}")
+
+    if not include_inactive:
+        query = query.where(DbTool.enabled.is_(True))
+
+    if team_id:
+        if team_id in team_ids:
+            team_access = [
+                and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
+                and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering tools by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        access_conditions = []
+        access_conditions.append(DbTool.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
+        access_conditions.append(DbTool.visibility == "public")
+        query = query.where(or_(*access_conditions))
+
+    query = query.order_by(DbTool.url, DbTool.original_name, DbTool.id)
+
+    paginated_result = await paginate_query(
+        db=db,
+        query=query,
+        page=page,
+        per_page=per_page,
+        cursor=None,
+        base_url=f"{settings.app_root_path}/admin/tool-ops/partial",
+        query_params={
+            "include_inactive": "true" if include_inactive else "false",
+            "gateway_id": gateway_id or "",
+            "team_id": team_id or "",
+        },
+        use_cursor_threshold=False,
+    )
+
+    tools_db = paginated_result["data"]
+    tools_pydantic = [tool_service.convert_tool_to_read(t, include_metrics=False, include_auth=False) for t in tools_db]
+
+    db.commit()
+
+    return request.app.state.templates.TemplateResponse(
+        "toolops_partial.html",
+        {
+            "request": request,
+            "tools": tools_pydantic,
+            "root_path": request.scope.get("root_path", ""),
+        },
+    )
+
+
 @admin_router.get("/tools/ids", response_class=JSONResponse)
 async def admin_get_all_tool_ids(
     include_inactive: bool = False,
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -5877,6 +7453,7 @@ async def admin_get_all_tool_ids(
     Args:
         include_inactive (bool): Whether to include inactive tools in the results
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated. Accepts the literal value 'null' to indicate NULL gateway_id (local tools).
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session dependency
         user: Current user making the request
 
@@ -5913,11 +7490,28 @@ async def admin_get_all_tool_ids(
                 LOGGER.debug(f"Filtering tools by gateway IDs: {non_null_ids}")
 
     # Build access conditions
-    access_conditions = [DbTool.owner_email == user_email, DbTool.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
-
-    query = query.where(or_(*access_conditions))
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
+                and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering tool IDs by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter tool IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbTool.owner_email == user_email)
+        access_conditions.append(DbTool.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
 
     # Get all IDs
     tool_ids = [row[0] for row in db.execute(query).all()]
@@ -5929,8 +7523,9 @@ async def admin_get_all_tool_ids(
 async def admin_search_tools(
     q: str = Query("", description="Search query"),
     include_inactive: bool = False,
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of results to return"),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Maximum number of results to return"),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -5941,15 +7536,16 @@ async def admin_search_tools(
     returning both IDs and names for use in search functionality like the Add Server page.
 
     Args:
-        q (str): Search query string to match against tool names, IDs, or descriptions
-        include_inactive (bool): Whether to include inactive tools in the search results
-        limit (int): Maximum number of results to return (1-1000)
-        gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated
-        db (Session): Database session dependency
-        user: Current user making the request
+        q (str): Search query string to match against tool names, IDs, or descriptions.
+        include_inactive (bool): Whether to include inactive tools in the search results.
+        limit (int): Maximum number of results to return.
+        gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session.
+        user: Current user with permissions.
 
     Returns:
-        JSONResponse: Dictionary containing list of matching tools and count
+        JSONResponse: A JSON response containing a list of matching tools.
     """
     user_email = get_user_email(user)
     search_query = q.strip().lower()
@@ -5987,11 +7583,28 @@ async def admin_search_tools(
         query = query.where(DbTool.enabled.is_(True))
 
     # Build access conditions
-    access_conditions = [DbTool.owner_email == user_email, DbTool.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
-
-    query = query.where(or_(*access_conditions))
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbTool.team_id == team_id, DbTool.visibility.in_(["team", "public"])),
+                and_(DbTool.team_id == team_id, DbTool.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering tool search by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter tool search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbTool.owner_email == user_email)
+        access_conditions.append(DbTool.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbTool.team_id.in_(team_ids), DbTool.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
 
     # Add search conditions - search in display fields and description
     # Using the same priority as display: displayName -> customName -> original_name
@@ -6030,10 +7643,11 @@ async def admin_search_tools(
 async def admin_prompts_partial_html(
     request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     render: Optional[str] = Query(None),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6053,6 +7667,7 @@ async def admin_prompts_partial_html(
         include_inactive (bool): If True, include inactive prompts in results.
         render (Optional[str]): Render mode; one of None, "controls", "selector".
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session (dependency-injected).
         user: Authenticated user object from dependency injection.
 
@@ -6062,7 +7677,9 @@ async def admin_prompts_partial_html(
         items depending on ``render``. The response contains JSON-serializable
         encoded prompt data when templates expect it.
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested prompts HTML partial (page={page}, per_page={per_page}, include_inactive={include_inactive}, render={render}, gateway_id={gateway_id})")
+    LOGGER.debug(
+        f"User {get_user_email(user)} requested prompts HTML partial (page={page}, per_page={per_page}, include_inactive={include_inactive}, render={render}, gateway_id={gateway_id}, team_id={team_id})"
+    )
     # Normalize per_page within configured bounds
     per_page = max(settings.pagination_min_page_size, min(per_page, settings.pagination_max_page_size))
 
@@ -6095,13 +7712,31 @@ async def admin_prompts_partial_html(
     if not include_inactive:
         query = query.where(DbPrompt.enabled.is_(True))
 
-    # Access conditions: owner, team, public
-    access_conditions = [DbPrompt.owner_email == user_email]
-    if team_ids:
-        access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
-    access_conditions.append(DbPrompt.visibility == "public")
-
-    query = query.where(or_(*access_conditions))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show prompts from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbPrompt.team_id == team_id, DbPrompt.visibility.in_(["team", "public"])),
+                and_(DbPrompt.team_id == team_id, DbPrompt.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering prompts by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbPrompt.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
+        access_conditions.append(DbPrompt.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
     # Apply pagination ordering for cursor support
     query = query.order_by(desc(DbPrompt.created_at), desc(DbPrompt.id))
@@ -6112,6 +7747,8 @@ async def admin_prompts_partial_html(
         query_params["include_inactive"] = "true"
     if gateway_id:
         query_params["gateway_id"] = gateway_id
+    if team_id:
+        query_params["team_id"] = team_id
 
     # Use unified pagination function
     paginated_result = await paginate_query(
@@ -6143,10 +7780,18 @@ async def admin_prompts_partial_html(
 
     # Batch convert to Pydantic models using prompt service
     # This eliminates the N+1 query problem from calling get_prompt_details() in a loop
-    prompts_pydantic = [prompt_service.convert_prompt_to_read(p, include_metrics=False) for p in prompts_db]
+    prompts_pydantic = []
+    for p in prompts_db:
+        try:
+            prompts_pydantic.append(prompt_service.convert_prompt_to_read(p, include_metrics=False))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert prompt {getattr(p, 'id', 'unknown')} ({getattr(p, 'name', 'unknown')}): {e}")
 
     data = jsonable_encoder(prompts_pydantic)
     base_url = f"{settings.app_root_path}/admin/prompts/partial"
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
 
     if render == "controls":
         return request.app.state.templates.TemplateResponse(
@@ -6187,14 +7832,487 @@ async def admin_prompts_partial_html(
     )
 
 
+@admin_router.get("/gateways/partial", response_class=HTMLResponse)
+async def admin_gateways_partial_html(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    include_inactive: bool = False,
+    render: Optional[str] = Query(None),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return paginated gateways HTML partials for the admin UI.
+
+    This HTMX endpoint returns only the partial HTML used by the admin UI for
+    gateways. It supports three render modes:
+
+    - default: full table partial (rows + controls)
+    - ``render="controls"``: return only pagination controls
+    - ``render="selector"``: return selector items for infinite scroll
+
+    Args:
+        request (Request): FastAPI request object used by the template engine.
+        page (int): Page number (1-indexed).
+        per_page (int): Number of items per page (bounded by settings).
+        include_inactive (bool): If True, include inactive gateways in results.
+        render (Optional[str]): Render mode; one of None, "controls", "selector".
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (dependency-injected).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        Union[HTMLResponse, TemplateResponse]: A rendered template response
+        containing either the table partial, pagination controls, or selector
+        items depending on ``render``. The response contains JSON-serializable
+        encoded gateway data when templates expect it.
+    """
+    user_email = get_user_email(user)
+    LOGGER.info(f"🔷 GATEWAYS PARTIAL REQUEST - User: {user_email}, team_id: {team_id}, page: {page}, render: {render}, referer: {request.headers.get('referer', 'none')}")
+    # Normalize per_page within configured bounds
+    per_page = max(settings.pagination_min_page_size, min(per_page, settings.pagination_max_page_size))
+
+    # Team scoping
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    # Build base query
+    query = select(DbGateway).options(joinedload(DbGateway.email_team))
+
+    if not include_inactive:
+        query = query.where(DbGateway.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (simpler, team-scoped view)
+    # When team_id is NOT specified, show all accessible items (owned + team + public)
+    if team_id:
+        # Team-specific view: only show gateways from the specified team if user is a member
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbGateway.team_id == team_id, DbGateway.visibility.in_(["team", "public"])),
+                and_(DbGateway.team_id == team_id, DbGateway.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering gateways by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions
+        access_conditions = []
+        access_conditions.append(DbGateway.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbGateway.team_id.in_(team_ids), DbGateway.visibility.in_(["team", "public"])))
+        access_conditions.append(DbGateway.visibility == "public")
+
+        query = query.where(or_(*access_conditions))
+
+    # Apply pagination ordering for cursor support
+    query = query.order_by(desc(DbGateway.created_at), desc(DbGateway.id))
+
+    # Build query params for pagination links
+    query_params = {}
+    if include_inactive:
+        query_params["include_inactive"] = "true"
+    if team_id:
+        query_params["team_id"] = team_id
+
+    # Use unified pagination function
+    paginated_result = await paginate_query(
+        db=db,
+        query=query,
+        page=page,
+        per_page=per_page,
+        cursor=None,  # HTMX partials use page-based navigation
+        base_url=f"{settings.app_root_path}/admin/gateways/partial",
+        query_params=query_params,
+        use_cursor_threshold=False,  # Disable auto-cursor switching for UI
+    )
+
+    # Extract paginated gateways (DbGateway objects)
+    gateways_db = paginated_result["data"]
+    pagination = paginated_result["pagination"]
+    links = paginated_result["links"]
+
+    # Batch convert to Pydantic models using gateway service
+    # This eliminates the N+1 query problem from calling get_gateway_details() in a loop
+    gateways_pydantic = []
+    for g in gateways_db:
+        try:
+            gateways_pydantic.append(gateway_service.convert_gateway_to_read(g))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert gateway {getattr(g, 'id', 'unknown')} ({getattr(g, 'name', 'unknown')}): {e}")
+    data = jsonable_encoder(gateways_pydantic)
+    base_url = f"{settings.app_root_path}/admin/gateways/partial"
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
+
+    LOGGER.info(f"🔷 GATEWAYS PARTIAL RESPONSE - Returning {len(data)} gateways, render mode: {render or 'default'}, team_id used in query: {team_id}")
+
+    if render == "controls":
+        return request.app.state.templates.TemplateResponse(
+            "pagination_controls.html",
+            {
+                "request": request,
+                "pagination": pagination.model_dump(),
+                "base_url": base_url,
+                "hx_target": "#gateways-table-body",
+                "hx_indicator": "#gateways-loading",
+                "query_params": query_params,
+                "root_path": request.scope.get("root_path", ""),
+            },
+        )
+
+    if render == "selector":
+        return request.app.state.templates.TemplateResponse(
+            "gateways_selector_items.html",
+            {"request": request, "data": data, "pagination": pagination.model_dump(), "root_path": request.scope.get("root_path", "")},
+        )
+
+    return request.app.state.templates.TemplateResponse(
+        "gateways_partial.html",
+        {
+            "request": request,
+            "data": data,
+            "pagination": pagination.model_dump(),
+            "links": links.model_dump() if links else None,
+            "root_path": request.scope.get("root_path", ""),
+            "include_inactive": include_inactive,
+        },
+    )
+
+
+@admin_router.get("/gateways/ids", response_class=JSONResponse)
+async def admin_get_all_gateways_ids(
+    include_inactive: bool = False,
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return all gateway IDs accessible to the current user (select-all helper).
+
+    This endpoint is used by UI "Select All" helpers to fetch only the IDs
+    of gateways the requesting user can access (owner, team, or public).
+
+    Args:
+        include_inactive (bool): When True include prompts that are inactive.
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing two keys:
+            - "prompt_ids": List[str] of accessible prompt IDs.
+            - "count": int number of IDs returned.
+    """
+    user_email = get_user_email(user)
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbGateway.id)
+
+    if not include_inactive:
+        query = query.where(DbGateway.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbGateway.team_id == team_id, DbGateway.visibility.in_(["team", "public"])),
+                and_(DbGateway.team_id == team_id, DbGateway.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering gateway IDs by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter gateway IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbGateway.owner_email == user_email)
+        access_conditions.append(DbGateway.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbGateway.team_id.in_(team_ids), DbGateway.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
+
+    gateway_ids = [row[0] for row in db.execute(query).all()]
+    return {"gateway_ids": gateway_ids, "count": len(gateway_ids)}
+
+
+@admin_router.get("/gateways/search", response_class=JSONResponse)
+async def admin_search_gateways(
+    q: str = Query("", description="Search query"),
+    include_inactive: bool = False,
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Search gateways by name or description for selector search.
+
+    Performs a case-insensitive search over prompt names and descriptions
+    and returns a limited list of matching gateways suitable for selector
+    UIs (id, name, description).
+
+    Args:
+        q (str): Search query string.
+        include_inactive (bool): When True include gateways that are inactive.
+        limit (int): Maximum number of results to return (bounded by the query parameter).
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing:
+            - "gateways": List[dict] where each dict has keys "id", "name", "description".
+            - "count": int number of matched gateways returned.
+    """
+    user_email = get_user_email(user)
+    search_query = q.strip().lower()
+    if not search_query:
+        return {"gateways": [], "count": 0}
+
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbGateway.id, DbGateway.name, DbGateway.url, DbGateway.description)
+
+    if not include_inactive:
+        query = query.where(DbGateway.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbGateway.team_id == team_id, DbGateway.visibility.in_(["team", "public"])),
+                and_(DbGateway.team_id == team_id, DbGateway.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering gateway search by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter gateway search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbGateway.owner_email == user_email)
+        access_conditions.append(DbGateway.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbGateway.team_id.in_(team_ids), DbGateway.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
+
+    search_conditions = [
+        func.lower(DbGateway.name).contains(search_query),
+        func.lower(coalesce(DbGateway.url, "")).contains(search_query),
+        func.lower(coalesce(DbGateway.description, "")).contains(search_query),
+    ]
+    query = query.where(or_(*search_conditions))
+
+    query = query.order_by(
+        case(
+            (func.lower(DbGateway.name).startswith(search_query), 1),
+            (func.lower(coalesce(DbGateway.url, "")).startswith(search_query), 1),
+            else_=2,
+        ),
+        func.lower(DbGateway.name),
+    ).limit(limit)
+
+    results = db.execute(query).all()
+    gateways = []
+    for row in results:
+        gateways.append(
+            {
+                "id": row.id,
+                "name": row.name,
+                "url": row.url,
+                "description": row.description,
+            }
+        )
+
+    return {"gateways": gateways, "count": len(gateways)}
+
+
+@admin_router.get("/servers/ids", response_class=JSONResponse)
+async def admin_get_all_server_ids(
+    include_inactive: bool = False,
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return all server IDs accessible to the current user (select-all helper).
+
+    This endpoint is used by UI "Select All" helpers to fetch only the IDs
+    of servers the requesting user can access (owner, team, or public).
+
+    Args:
+        include_inactive (bool): When True include servers that are inactive.
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing two keys:
+            - "server_ids": List[str] of accessible server IDs.
+            - "count": int number of IDs returned.
+    """
+    user_email = get_user_email(user)
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbServer.id)
+
+    if not include_inactive:
+        query = query.where(DbServer.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show servers from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbServer.team_id == team_id, DbServer.visibility.in_(["team", "public"])),
+                and_(DbServer.team_id == team_id, DbServer.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering server IDs by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter server IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbServer.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbServer.team_id.in_(team_ids), DbServer.visibility.in_(["team", "public"])))
+        access_conditions.append(DbServer.visibility == "public")
+        query = query.where(or_(*access_conditions))
+
+    server_ids = [row[0] for row in db.execute(query).all()]
+    return {"server_ids": server_ids, "count": len(server_ids)}
+
+
+@admin_router.get("/servers/search", response_class=JSONResponse)
+async def admin_search_servers(
+    q: str = Query("", description="Search query"),
+    include_inactive: bool = False,
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Search servers by name or description for selector search.
+
+    Performs a case-insensitive search over prompt names and descriptions
+    and returns a limited list of matching servers suitable for selector
+    UIs (id, name, description).
+
+    Args:
+        q (str): Search query string.
+        include_inactive (bool): When True include servers that are inactive.
+        limit (int): Maximum number of results to return (bounded by the query parameter).
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing:
+            - "servers": List[dict] where each dict has keys "id", "name", "description".
+            - "count": int number of matched servers returned.
+    """
+    user_email = get_user_email(user)
+    search_query = q.strip().lower()
+    if not search_query:
+        return {"servers": [], "count": 0}
+
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbServer.id, DbServer.name, DbServer.description)
+
+    if not include_inactive:
+        query = query.where(DbServer.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show servers from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbServer.team_id == team_id, DbServer.visibility.in_(["team", "public"])),
+                and_(DbServer.team_id == team_id, DbServer.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering server search by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter server search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbServer.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbServer.team_id.in_(team_ids), DbServer.visibility.in_(["team", "public"])))
+        access_conditions.append(DbServer.visibility == "public")
+        query = query.where(or_(*access_conditions))
+
+    search_conditions = [
+        func.lower(DbServer.name).contains(search_query),
+        func.lower(coalesce(DbServer.description, "")).contains(search_query),
+    ]
+    query = query.where(or_(*search_conditions))
+
+    query = query.order_by(
+        case(
+            (func.lower(DbServer.name).startswith(search_query), 1),
+            else_=2,
+        ),
+        func.lower(DbServer.name),
+    ).limit(limit)
+
+    results = db.execute(query).all()
+    servers = []
+    for row in results:
+        servers.append(
+            {
+                "id": row.id,
+                "name": row.name,
+                "description": row.description,
+            }
+        )
+
+    return {"servers": servers, "count": len(servers)}
+
+
 @admin_router.get("/resources/partial", response_class=HTMLResponse)
 async def admin_resources_partial_html(
     request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     render: Optional[str] = Query(None, description="Render mode: 'controls' for pagination controls only"),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6213,6 +8331,7 @@ async def admin_resources_partial_html(
             pagination controls. Other supported value: "selector" for selector
             items used by infinite scroll selectors.
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session (dependency-injected).
         user: Authenticated user object from dependency injection.
 
@@ -6222,7 +8341,9 @@ async def admin_resources_partial_html(
         items depending on the ``render`` parameter.
     """
 
-    LOGGER.debug(f"[RESOURCES FILTER DEBUG] User {get_user_email(user)} requested resources HTML partial (page={page}, per_page={per_page}, render={render}, gateway_id={gateway_id})")
+    LOGGER.debug(
+        f"[RESOURCES FILTER DEBUG] User {get_user_email(user)} requested resources HTML partial (page={page}, per_page={per_page}, render={render}, gateway_id={gateway_id}, team_id={team_id})"
+    )
 
     # Normalize per_page
     per_page = max(settings.pagination_min_page_size, min(per_page, settings.pagination_max_page_size))
@@ -6259,13 +8380,31 @@ async def admin_resources_partial_html(
     if not include_inactive:
         query = query.where(DbResource.enabled.is_(True))
 
-    # Access conditions: owner, team, public
-    access_conditions = [DbResource.owner_email == user_email]
-    if team_ids:
-        access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
-    access_conditions.append(DbResource.visibility == "public")
-
-    query = query.where(or_(*access_conditions))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show resources from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbResource.team_id == team_id, DbResource.visibility.in_(["team", "public"])),
+                and_(DbResource.team_id == team_id, DbResource.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering resources by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbResource.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
+        access_conditions.append(DbResource.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
     # Add sorting for consistent pagination
     query = query.order_by(desc(DbResource.created_at), desc(DbResource.id))
@@ -6276,6 +8415,8 @@ async def admin_resources_partial_html(
         query_params["include_inactive"] = "true"
     if gateway_id:
         query_params["gateway_id"] = gateway_id
+    if team_id:
+        query_params["team_id"] = team_id
 
     # Use unified pagination function
     paginated_result = await paginate_query(
@@ -6306,9 +8447,17 @@ async def admin_resources_partial_html(
         r.team = team_map.get(r.team_id) if r.team_id else None
 
     # Batch convert to Pydantic models using resource service
-    resources_pydantic = [resource_service.convert_resource_to_read(r, include_metrics=False) for r in resources_db]
+    resources_pydantic = []
+    for r in resources_db:
+        try:
+            resources_pydantic.append(resource_service.convert_resource_to_read(r, include_metrics=False))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert resource {getattr(r, 'id', 'unknown')} ({getattr(r, 'name', 'unknown')}): {e}")
 
     data = jsonable_encoder(resources_pydantic)
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
 
     if render == "controls":
         return request.app.state.templates.TemplateResponse(
@@ -6353,6 +8502,7 @@ async def admin_resources_partial_html(
 async def admin_get_all_prompt_ids(
     include_inactive: bool = False,
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6364,6 +8514,7 @@ async def admin_get_all_prompt_ids(
     Args:
         include_inactive (bool): When True include prompts that are inactive.
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated. Accepts the literal value 'null' to indicate NULL gateway_id (local prompts).
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session (injected dependency).
         user: Authenticated user object from dependency injection.
 
@@ -6398,11 +8549,32 @@ async def admin_get_all_prompt_ids(
     if not include_inactive:
         query = query.where(DbPrompt.enabled.is_(True))
 
-    access_conditions = [DbPrompt.owner_email == user_email, DbPrompt.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show prompts from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbPrompt.team_id == team_id, DbPrompt.visibility.in_(["team", "public"])),
+                and_(DbPrompt.team_id == team_id, DbPrompt.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering prompt IDs by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter prompt IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbPrompt.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
+        access_conditions.append(DbPrompt.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
-    query = query.where(or_(*access_conditions))
     prompt_ids = [row[0] for row in db.execute(query).all()]
     return {"prompt_ids": prompt_ids, "count": len(prompt_ids)}
 
@@ -6411,6 +8583,7 @@ async def admin_get_all_prompt_ids(
 async def admin_get_all_resource_ids(
     include_inactive: bool = False,
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6422,6 +8595,7 @@ async def admin_get_all_resource_ids(
     Args:
         include_inactive (bool): Whether to include inactive resources in the results.
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated. Accepts the literal value 'null' to indicate NULL gateway_id (local resources).
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session dependency.
         user: Authenticated user object from dependency injection.
 
@@ -6456,11 +8630,32 @@ async def admin_get_all_resource_ids(
     if not include_inactive:
         query = query.where(DbResource.enabled.is_(True))
 
-    access_conditions = [DbResource.owner_email == user_email, DbResource.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show resources from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbResource.team_id == team_id, DbResource.visibility.in_(["team", "public"])),
+                and_(DbResource.team_id == team_id, DbResource.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering resource IDs by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter resource IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbResource.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
+        access_conditions.append(DbResource.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
-    query = query.where(or_(*access_conditions))
     resource_ids = [row[0] for row in db.execute(query).all()]
     return {"resource_ids": resource_ids, "count": len(resource_ids)}
 
@@ -6469,8 +8664,9 @@ async def admin_get_all_resource_ids(
 async def admin_search_resources(
     q: str = Query("", description="Search query"),
     include_inactive: bool = False,
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6485,6 +8681,7 @@ async def admin_search_resources(
         include_inactive (bool): When True include resources that are inactive.
         limit (int): Maximum number of results to return (bounded by the query parameter).
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session (injected dependency).
         user: Authenticated user object from dependency injection.
 
@@ -6523,10 +8720,31 @@ async def admin_search_resources(
     if not include_inactive:
         query = query.where(DbResource.enabled.is_(True))
 
-    access_conditions = [DbResource.owner_email == user_email, DbResource.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
-    query = query.where(or_(*access_conditions))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show resources from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbResource.team_id == team_id, DbResource.visibility.in_(["team", "public"])),
+                and_(DbResource.team_id == team_id, DbResource.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering resource search by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter resource search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbResource.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbResource.team_id.in_(team_ids), DbResource.visibility.in_(["team", "public"])))
+        access_conditions.append(DbResource.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
     search_conditions = [func.lower(DbResource.name).contains(search_query), func.lower(coalesce(DbResource.description, "")).contains(search_query)]
     query = query.where(or_(*search_conditions))
@@ -6551,8 +8769,9 @@ async def admin_search_resources(
 async def admin_search_prompts(
     q: str = Query("", description="Search query"),
     include_inactive: bool = False,
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -6567,6 +8786,7 @@ async def admin_search_prompts(
         include_inactive (bool): When True include prompts that are inactive.
         limit (int): Maximum number of results to return (bounded by the query parameter).
         gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
         db (Session): Database session (injected dependency).
         user: Authenticated user object from dependency injection.
 
@@ -6605,11 +8825,31 @@ async def admin_search_prompts(
     if not include_inactive:
         query = query.where(DbPrompt.enabled.is_(True))
 
-    access_conditions = [DbPrompt.owner_email == user_email, DbPrompt.visibility == "public"]
-    if team_ids:
-        access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
-
-    query = query.where(or_(*access_conditions))
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show prompts from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbPrompt.team_id == team_id, DbPrompt.visibility.in_(["team", "public"])),
+                and_(DbPrompt.team_id == team_id, DbPrompt.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering prompt search by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter prompt search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbPrompt.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbPrompt.team_id.in_(team_ids), DbPrompt.visibility.in_(["team", "public"])))
+        access_conditions.append(DbPrompt.visibility == "public")
+        query = query.where(or_(*access_conditions))
 
     search_conditions = [
         func.lower(DbPrompt.original_name).contains(search_query),
@@ -6641,6 +8881,343 @@ async def admin_search_prompts(
         )
 
     return {"prompts": prompts, "count": len(prompts)}
+
+
+@admin_router.get("/a2a/partial", response_class=HTMLResponse)
+async def admin_a2a_partial_html(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
+    include_inactive: bool = False,
+    render: Optional[str] = Query(None),
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID(s), comma-separated"),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return paginated a2a agents HTML partials for the admin UI.
+
+    This HTMX endpoint returns only the partial HTML used by the admin UI for
+    a2a agents. It supports three render modes:
+
+    - default: full table partial (rows + controls)
+    - ``render="controls"``: return only pagination controls
+    - ``render="selector"``: return selector items for infinite scroll
+
+    Args:
+        request (Request): FastAPI request object used by the template engine.
+        page (int): Page number (1-indexed).
+        per_page (int): Number of items per page (bounded by settings).
+        include_inactive (bool): If True, include inactive a2a agents in results.
+        render (Optional[str]): Render mode; one of None, "controls", "selector".
+        gateway_id (Optional[str]): Filter by gateway ID(s), comma-separated.
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (dependency-injected).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        Union[HTMLResponse, TemplateResponse]: A rendered template response
+        containing either the table partial, pagination controls, or selector
+        items depending on ``render``. The response contains JSON-serializable
+        encoded a2a agent data when templates expect it.
+    """
+    LOGGER.debug(
+        f"User {get_user_email(user)} requested a2a_agents HTML partial (page={page}, per_page={per_page}, include_inactive={include_inactive}, render={render}, gateway_id={gateway_id}, team_id={team_id})"
+    )
+    # Normalize per_page within configured bounds
+    per_page = max(settings.pagination_min_page_size, min(per_page, settings.pagination_max_page_size))
+
+    user_email = get_user_email(user)
+
+    # Team scoping
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    # Build base query
+    query = select(DbA2AAgent)
+
+    # Note: A2A agents don't have gateway_id field, they connect directly via endpoint_url
+    # The gateway_id parameter is ignored for A2A agents
+
+    if not include_inactive:
+        query = query.where(DbA2AAgent.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        # Team-specific view: only show a2a agents from the specified team
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.visibility.in_(["team", "public"])),
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering a2a agents by team_id: {team_id}")
+        else:
+            # User is not a member of this team, return no results using SQLAlchemy's false()
+            LOGGER.warning(f"User {user_email} attempted to filter by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbA2AAgent.owner_email == user_email)
+        if team_ids:
+            access_conditions.append(and_(DbA2AAgent.team_id.in_(team_ids), DbA2AAgent.visibility.in_(["team", "public"])))
+        access_conditions.append(DbA2AAgent.visibility == "public")
+        query = query.where(or_(*access_conditions))
+
+    # Apply pagination ordering for cursor support
+    query = query.order_by(desc(DbA2AAgent.created_at), desc(DbA2AAgent.id))
+
+    # Build query params for pagination links
+    query_params = {}
+    if include_inactive:
+        query_params["include_inactive"] = "true"
+    if gateway_id:
+        query_params["gateway_id"] = gateway_id
+    if team_id:
+        query_params["team_id"] = team_id
+
+    # Use unified pagination function
+    paginated_result = await paginate_query(
+        db=db,
+        query=query,
+        page=page,
+        per_page=per_page,
+        cursor=None,  # HTMX partials use page-based navigation
+        base_url=f"{settings.app_root_path}/admin/a2a/partial",
+        query_params=query_params,
+        use_cursor_threshold=False,  # Disable auto-cursor switching for UI
+    )
+
+    # Extract paginated a2a_agents (DbA2AAgent objects)
+    a2a_agents_db = paginated_result["data"]
+    pagination = paginated_result["pagination"]
+    links = paginated_result["links"]
+
+    # Batch fetch team names for the a2a_agents to avoid N+1 queries
+    team_ids_set = {p.team_id for p in a2a_agents_db if p.team_id}
+    team_map = {}
+    if team_ids_set:
+        teams = db.execute(select(EmailTeam.id, EmailTeam.name).where(EmailTeam.id.in_(team_ids_set), EmailTeam.is_active.is_(True))).all()
+        team_map = {team.id: team.name for team in teams}
+
+    # Apply team names to DB objects before conversion
+    for p in a2a_agents_db:
+        p.team = team_map.get(p.team_id) if p.team_id else None
+
+    # Batch convert to Pydantic models using a2a service
+    # This eliminates the N+1 query problem from calling get_a2a_details() in a loop
+    a2a_agents_pydantic = []
+    for a in a2a_agents_db:
+        try:
+            a2a_agents_pydantic.append(a2a_service.convert_agent_to_read(a, include_metrics=False))
+        except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
+            LOGGER.exception(f"Failed to convert a2a agent {getattr(a, 'id', 'unknown')} ({getattr(a, 'name', 'unknown')}): {e}")
+    data = jsonable_encoder(a2a_agents_pydantic)
+    base_url = f"{settings.app_root_path}/admin/a2a/partial"
+
+    # End the read-only transaction before template rendering to avoid idle-in-transaction timeouts.
+    db.commit()
+
+    if render == "controls":
+        return request.app.state.templates.TemplateResponse(
+            "pagination_controls.html",
+            {
+                "request": request,
+                "pagination": pagination.model_dump(),
+                "base_url": base_url,
+                "hx_target": "#agents-table-body",
+                "hx_indicator": "#agents-loading",
+                "query_params": query_params,
+                "root_path": request.scope.get("root_path", ""),
+            },
+        )
+
+    if render == "selector":
+        return request.app.state.templates.TemplateResponse(
+            "agents_selector_items.html",
+            {
+                "request": request,
+                "data": data,
+                "pagination": pagination.model_dump(),
+                "root_path": request.scope.get("root_path", ""),
+                "gateway_id": gateway_id,
+            },
+        )
+
+    return request.app.state.templates.TemplateResponse(
+        "agents_partial.html",
+        {
+            "request": request,
+            "data": data,
+            "pagination": pagination.model_dump(),
+            "links": links.model_dump() if links else None,
+            "root_path": request.scope.get("root_path", ""),
+            "include_inactive": include_inactive,
+        },
+    )
+
+
+@admin_router.get("/a2a/ids", response_class=JSONResponse)
+async def admin_get_all_agent_ids(
+    include_inactive: bool = False,
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Return all agent IDs accessible to the current user (select-all helper).
+
+    This endpoint is used by UI "Select All" helpers to fetch only the IDs
+    of a2a agents the requesting user can access (owner, team, or public).
+
+    Args:
+        include_inactive (bool): When True include a2a agents that are inactive.
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing two keys:
+            - "agent_ids": List[str] of accessible agent IDs.
+            - "count": int number of IDs returned.
+    """
+    user_email = get_user_email(user)
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbA2AAgent.id)
+
+    if not include_inactive:
+        query = query.where(DbA2AAgent.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.visibility.in_(["team", "public"])),
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering A2A agent IDs by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter A2A agent IDs by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbA2AAgent.owner_email == user_email)
+        access_conditions.append(DbA2AAgent.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbA2AAgent.team_id.in_(team_ids), DbA2AAgent.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
+
+    agent_ids = [row[0] for row in db.execute(query).all()]
+    return {"agent_ids": agent_ids, "count": len(agent_ids)}
+
+
+@admin_router.get("/a2a/search", response_class=JSONResponse)
+async def admin_search_a2a_agents(
+    q: str = Query("", description="Search query"),
+    include_inactive: bool = False,
+    limit: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+):
+    """Search a2a agents by name or description for selector search.
+
+    Performs a case-insensitive search over prompt names and descriptions
+    and returns a limited list of matching a2a agents suitable for selector
+    UIs (id, name, description).
+
+    Args:
+        q (str): Search query string.
+        include_inactive (bool): When True include a2a agents that are inactive.
+        limit (int): Maximum number of results to return (bounded by the query parameter).
+        team_id (Optional[str]): Filter by team ID.
+        db (Session): Database session (injected dependency).
+        user: Authenticated user object from dependency injection.
+
+    Returns:
+        dict: A dictionary containing:
+            - "agents": List[dict] where each dict has keys "id", "name", "description".
+            - "count": int number of matched a2a agents returned.
+    """
+    user_email = get_user_email(user)
+    search_query = q.strip().lower()
+    if not search_query:
+        return {"agents": [], "count": 0}
+
+    team_service = TeamManagementService(db)
+    user_teams = await team_service.get_user_teams(user_email)
+    team_ids = [t.id for t in user_teams]
+
+    query = select(DbA2AAgent.id, DbA2AAgent.name, DbA2AAgent.endpoint_url, DbA2AAgent.description)
+
+    if not include_inactive:
+        query = query.where(DbA2AAgent.enabled.is_(True))
+
+    # Build access conditions
+    # When team_id is specified, show ONLY items from that team (team-scoped view)
+    # Otherwise, show all accessible items (All Teams view)
+    if team_id:
+        if team_id in team_ids:
+            # Apply visibility check: team/public resources + user's own resources (including private)
+            team_access = [
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.visibility.in_(["team", "public"])),
+                and_(DbA2AAgent.team_id == team_id, DbA2AAgent.owner_email == user_email),
+            ]
+            query = query.where(or_(*team_access))
+            LOGGER.debug(f"Filtering A2A agent search by team_id: {team_id}")
+        else:
+            LOGGER.warning(f"User {user_email} attempted to filter A2A agent search by team {team_id} but is not a member")
+            query = query.where(false())
+    else:
+        # All Teams view: apply standard access conditions (owner, team, public)
+        access_conditions = []
+        access_conditions.append(DbA2AAgent.owner_email == user_email)
+        access_conditions.append(DbA2AAgent.visibility == "public")
+        if team_ids:
+            access_conditions.append(and_(DbA2AAgent.team_id.in_(team_ids), DbA2AAgent.visibility.in_(["team", "public"])))
+        query = query.where(or_(*access_conditions))
+
+    search_conditions = [
+        func.lower(DbA2AAgent.name).contains(search_query),
+        func.lower(coalesce(DbA2AAgent.endpoint_url, "")).contains(search_query),
+        func.lower(coalesce(DbA2AAgent.description, "")).contains(search_query),
+    ]
+    query = query.where(or_(*search_conditions))
+
+    query = query.order_by(
+        case(
+            (func.lower(DbA2AAgent.name).startswith(search_query), 1),
+            (func.lower(coalesce(DbA2AAgent.endpoint_url, "")).startswith(search_query), 1),
+            else_=2,
+        ),
+        func.lower(DbA2AAgent.name),
+    ).limit(limit)
+
+    results = db.execute(query).all()
+    agents = []
+    for row in results:
+        agents.append(
+            {
+                "id": row.id,
+                "name": row.name,
+                "endpoint_url": row.endpoint_url,
+                "description": row.description,
+            }
+        )
+
+    return {"agents": agents, "count": len(agents)}
 
 
 @admin_router.get("/tools/{tool_id}", response_model=ToolRead)
@@ -6790,7 +9367,7 @@ async def admin_add_tool(
         >>> from starlette.datastructures import FormData
         >>> from sqlalchemy.exc import IntegrityError
         >>> from mcpgateway.utils.error_formatter import ErrorFormatter
-        >>> import json
+        >>> import orjson
 
         >>> mock_db = MagicMock()
         >>> mock_user = {"email": "test_user", "db": mock_db}
@@ -6810,7 +9387,7 @@ async def admin_add_tool(
 
         >>> async def test_admin_add_tool_success():
         ...     response = await admin_add_tool(mock_request_success, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and json.loads(response.body.decode())["success"] is True
+        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and orjson.loads(response.body.decode())["success"] is True
 
         >>> asyncio.run(test_admin_add_tool_success())
         True
@@ -6829,7 +9406,7 @@ async def admin_add_tool(
 
         >>> async def test_admin_add_tool_integrity_error():
         ...     response = await admin_add_tool(mock_request_conflict, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_add_tool_integrity_error())
         True
@@ -6845,7 +9422,7 @@ async def admin_add_tool(
 
         >>> async def test_admin_add_tool_validation_error():
         ...     response = await admin_add_tool(mock_request_missing, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_add_tool_validation_error())  # doctest: +ELLIPSIS
         True
@@ -6863,7 +9440,7 @@ async def admin_add_tool(
 
         >>> async def test_admin_add_tool_generic_exception():
         ...     response = await admin_add_tool(mock_request_generic_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_add_tool_generic_exception())
         True
@@ -7022,7 +9599,7 @@ async def admin_edit_tool(
         >>> from mcpgateway.services.tool_service import ToolError
         >>> from pydantic import ValidationError
         >>> from mcpgateway.utils.error_formatter import ErrorFormatter
-        >>> import json
+        >>> import orjson
 
         >>> mock_db = MagicMock()
         >>> mock_user = {"email": "test_user", "db": mock_db}
@@ -7046,7 +9623,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_success():
         ...     response = await admin_edit_tool(tool_id, mock_request_success, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and json.loads(response.body.decode())["success"] is True
+        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and orjson.loads(response.body.decode())["success"] is True
 
         >>> asyncio.run(test_admin_edit_tool_success())
         True
@@ -7065,7 +9642,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_inactive_checked():
         ...     response = await admin_edit_tool(tool_id, mock_request_inactive, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and json.loads(response.body.decode())["success"] is True
+        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and orjson.loads(response.body.decode())["success"] is True
 
         >>> asyncio.run(test_admin_edit_tool_inactive_checked())
         True
@@ -7084,7 +9661,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_integrity_error():
         ...     response = await admin_edit_tool(tool_id, mock_request_conflict, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_edit_tool_integrity_error())
         True
@@ -7103,7 +9680,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_tool_error():
         ...     response = await admin_edit_tool(tool_id, mock_request_tool_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_edit_tool_tool_error())
         True
@@ -7121,7 +9698,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_validation_error():
         ...     response = await admin_edit_tool(tool_id, mock_request_validation_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_edit_tool_validation_error())
         True
@@ -7140,7 +9717,7 @@ async def admin_edit_tool(
 
         >>> async def test_admin_edit_tool_unexpected_error():
         ...     response = await admin_edit_tool(tool_id, mock_request_unexpected, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and orjson.loads(response.body.decode())["success"] is False
 
         >>> asyncio.run(test_admin_edit_tool_unexpected_error())
         True
@@ -7342,8 +9919,8 @@ async def admin_delete_tool(tool_id: str, request: Request, db: Session = Depend
     return RedirectResponse(f"{root_path}/admin#tools", status_code=303)
 
 
-@admin_router.post("/tools/{tool_id}/toggle")
-async def admin_toggle_tool(
+@admin_router.post("/tools/{tool_id}/state")
+async def admin_set_tool_state(
     tool_id: str,
     request: Request,
     db: Session = Depends(get_db),
@@ -7382,14 +9959,14 @@ async def admin_toggle_tool(
         >>> form_data_activate = FormData([("activate", "true"), ("is_inactive_checked", "false")])
         >>> mock_request_activate = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_activate.form = AsyncMock(return_value=form_data_activate)
-        >>> original_toggle_tool_status = tool_service.toggle_tool_status
-        >>> tool_service.toggle_tool_status = AsyncMock()
+        >>> original_set_tool_state = tool_service.set_tool_state
+        >>> tool_service.set_tool_state = AsyncMock()
         >>>
-        >>> async def test_admin_toggle_tool_activate():
-        ...     result = await admin_toggle_tool(tool_id, mock_request_activate, mock_db, mock_user)
+        >>> async def test_admin_set_tool_state_activate():
+        ...     result = await admin_set_tool_state(tool_id, mock_request_activate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/admin#tools" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_tool_activate())
+        >>> asyncio.run(test_admin_set_tool_state_activate())
         True
         >>>
         >>> # Happy path: Deactivate tool
@@ -7397,11 +9974,11 @@ async def admin_toggle_tool(
         >>> mock_request_deactivate = MagicMock(spec=Request, scope={"root_path": "/api"})
         >>> mock_request_deactivate.form = AsyncMock(return_value=form_data_deactivate)
         >>>
-        >>> async def test_admin_toggle_tool_deactivate():
-        ...     result = await admin_toggle_tool(tool_id, mock_request_deactivate, mock_db, mock_user)
+        >>> async def test_admin_set_tool_state_deactivate():
+        ...     result = await admin_set_tool_state(tool_id, mock_request_deactivate, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/api/admin#tools" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_tool_deactivate())
+        >>> asyncio.run(test_admin_set_tool_state_deactivate())
         True
         >>>
         >>> # Edge case: Toggle with inactive checkbox checked
@@ -7409,21 +9986,21 @@ async def admin_toggle_tool(
         >>> mock_request_inactive = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_inactive.form = AsyncMock(return_value=form_data_inactive)
         >>>
-        >>> async def test_admin_toggle_tool_inactive_checked():
-        ...     result = await admin_toggle_tool(tool_id, mock_request_inactive, mock_db, mock_user)
+        >>> async def test_admin_set_tool_state_inactive_checked():
+        ...     result = await admin_set_tool_state(tool_id, mock_request_inactive, mock_db, mock_user)
         ...     return isinstance(result, RedirectResponse) and result.status_code == 303 and "/admin/?include_inactive=true#tools" in result.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_tool_inactive_checked())
+        >>> asyncio.run(test_admin_set_tool_state_inactive_checked())
         True
         >>>
         >>> # Error path: Simulate an exception during toggle
         >>> form_data_error = FormData([("activate", "true")])
         >>> mock_request_error = MagicMock(spec=Request, scope={"root_path": ""})
         >>> mock_request_error.form = AsyncMock(return_value=form_data_error)
-        >>> tool_service.toggle_tool_status = AsyncMock(side_effect=Exception("Toggle failed"))
+        >>> tool_service.set_tool_state = AsyncMock(side_effect=Exception("State change failed"))
         >>>
-        >>> async def test_admin_toggle_tool_exception():
-        ...     result = await admin_toggle_tool(tool_id, mock_request_error, mock_db, mock_user)
+        >>> async def test_admin_set_tool_state_exception():
+        ...     result = await admin_set_tool_state(tool_id, mock_request_error, mock_db, mock_user)
         ...     location_header = result.headers["location"]
         ...     return (
         ...         isinstance(result, RedirectResponse)
@@ -7433,11 +10010,11 @@ async def admin_toggle_tool(
         ...         and location_header.endswith("#tools")  # Ensure fragment is correct
         ...     )
         >>>
-        >>> asyncio.run(test_admin_toggle_tool_exception())
+        >>> asyncio.run(test_admin_set_tool_state_exception())
         True
         >>>
         >>> # Restore original method
-        >>> tool_service.toggle_tool_status = original_toggle_tool_status
+        >>> tool_service.set_tool_state = original_set_tool_state
     """
     error_message = None
     user_email = get_user_email(user)
@@ -7446,13 +10023,13 @@ async def admin_toggle_tool(
     activate = str(form.get("activate", "true")).lower() == "true"
     is_inactive_checked = str(form.get("is_inactive_checked", "false"))
     try:
-        await tool_service.toggle_tool_status(db, tool_id, activate, reachable=activate, user_email=user_email)
+        await tool_service.set_tool_state(db, tool_id, activate, reachable=activate, user_email=user_email)
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling tools {tool_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting tool state {tool_id}: {e}")
         error_message = str(e)
     except Exception as e:
-        LOGGER.error(f"Error toggling tool status: {e}")
-        error_message = "Failed to toggle tool status. Please try again."
+        LOGGER.error(f"Error setting tool state: {e}")
+        error_message = "Failed to set tool state. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -7584,7 +10161,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>> from pydantic import ValidationError
         >>> from sqlalchemy.exc import IntegrityError
         >>> from mcpgateway.utils.error_formatter import ErrorFormatter
-        >>> import json # Added import for json.loads
+        >>> import orjson
         >>>
         >>> mock_db = MagicMock()
         >>> mock_user = {"email": "test_user", "db": mock_db}
@@ -7606,7 +10183,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>> async def test_admin_add_gateway_success():
         ...     response = await admin_add_gateway(mock_request_success, mock_db, mock_user)
         ...     # Corrected: Access body and then parse JSON
-        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and json.loads(response.body)["success"] is True
+        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and orjson.loads(response.body)["success"] is True
         >>>
         >>> asyncio.run(test_admin_add_gateway_success())
         True
@@ -7619,7 +10196,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>>
         >>> async def test_admin_add_gateway_connection_error():
         ...     response = await admin_add_gateway(mock_request_conn_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 502 and json.loads(response.body)["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 502 and orjson.loads(response.body)["success"] is False
         >>>
         >>> asyncio.run(test_admin_add_gateway_connection_error())
         True
@@ -7632,7 +10209,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>>
         >>> async def test_admin_add_gateway_validation_error():
         ...     response = await admin_add_gateway(mock_request_validation_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 422 and orjson.loads(response.body.decode())["success"] is False
         >>>
         >>> asyncio.run(test_admin_add_gateway_validation_error())
         True
@@ -7646,7 +10223,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>>
         >>> async def test_admin_add_gateway_integrity_error():
         ...     response = await admin_add_gateway(mock_request_integrity_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 409 and orjson.loads(response.body.decode())["success"] is False
         >>>
         >>> asyncio.run(test_admin_add_gateway_integrity_error())
         True
@@ -7659,7 +10236,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         >>>
         >>> async def test_admin_add_gateway_runtime_error():
         ...     response = await admin_add_gateway(mock_request_runtime_error, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and json.loads(response.body.decode())["success"] is False
+        ...     return isinstance(response, JSONResponse) and response.status_code == 500 and orjson.loads(response.body.decode())["success"] is False
         >>>
         >>> asyncio.run(test_admin_add_gateway_runtime_error())
         True
@@ -7809,6 +10386,8 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
             auth_header_key=str(form.get("auth_header_key", "")),
             auth_header_value=str(form.get("auth_header_value", "")),
             auth_headers=auth_headers if auth_headers else None,
+            auth_query_param_key=str(form.get("auth_query_param_key", "")) or None,
+            auth_query_param_value=str(form.get("auth_query_param_value", "")) or None,
             oauth_config=oauth_config,
             one_time_auth=form.get("one_time_auth", False),
             passthrough_headers=passthrough_headers,
@@ -7826,9 +10405,9 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
         error_ctx = [str(err["ctx"]["error"]) for err in ex.errors()]
         return ORJSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
 
-    except RuntimeError as re:
-        # --- Getting only the custom message from the ValueError ---
-        error_ctx = [str(re)]
+    except RuntimeError as err:
+        # --- Getting only the custom message from the RuntimeError ---
+        error_ctx = [str(err)]
         return ORJSONResponse(content={"success": False, "message": "; ".join(error_ctx)}, status_code=422)
 
     user_email = get_user_email(user)
@@ -7852,6 +10431,7 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
             visibility=visibility,
             team_id=team_id_cast,
             owner_email=user_email,
+            initialize_timeout=settings.httpx_admin_read_timeout,
         )
 
         # Provide specific guidance for OAuth Authorization Code flow
@@ -7944,7 +10524,7 @@ async def admin_edit_gateway(
         >>>
         >>> async def test_admin_edit_gateway_success():
         ...     response = await admin_edit_gateway(gateway_id, mock_request_success, mock_db, mock_user)
-        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and json.loads(response.body)["success"] is True
+        ...     return isinstance(response, JSONResponse) and response.status_code == 200 and orjson.loads(response.body)["success"] is True
         >>>
         >>> asyncio.run(test_admin_edit_gateway_success())
         True
@@ -7974,8 +10554,8 @@ async def admin_edit_gateway(
         ...     return (
         ...         isinstance(response, JSONResponse)
         ...         and response.status_code == 500
-        ...         and json.loads(response.body)["success"] is False
-        ...         and "Update failed" in json.loads(response.body)["message"]
+        ...         and orjson.loads(response.body)["success"] is False
+        ...         and "Update failed" in orjson.loads(response.body)["message"]
         ...     )
         >>>
         >>> asyncio.run(test_admin_edit_gateway_exception())
@@ -7989,7 +10569,7 @@ async def admin_edit_gateway(
         >>>
         >>> async def test_admin_edit_gateway_validation_error():
         ...     response = await admin_edit_gateway(gateway_id, mock_request_validation_error, mock_db, mock_user)
-        ...     body = json.loads(response.body.decode())
+        ...     body = orjson.loads(response.body.decode())
         ...     return isinstance(response, JSONResponse) and response.status_code in (422,400) and body["success"] is False
         >>>
         >>> asyncio.run(test_admin_edit_gateway_validation_error())
@@ -8119,6 +10699,8 @@ async def admin_edit_gateway(
             auth_header_value=str(form.get("auth_header_value", "")),
             auth_value=str(form.get("auth_value", "")),
             auth_headers=auth_headers if auth_headers else None,
+            auth_query_param_key=str(form.get("auth_query_param_key", "")) or None,
+            auth_query_param_value=str(form.get("auth_query_param_value", "")) or None,
             one_time_auth=form.get("one_time_auth", False),
             passthrough_headers=passthrough_headers,
             oauth_config=oauth_config,
@@ -8331,10 +10913,23 @@ async def admin_test_resource(resource_uri: str, db: Session = Depends(get_db), 
         >>> # Restore original method
         >>> resource_service.read_resource = original_read_resource
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested details for resource ID {resource_uri}")
+    user_email = get_user_email(user)
+    LOGGER.debug(f"User {user_email} requested details for resource ID {resource_uri}")
+
+    # For admin UI, pass user email and token_teams=None
+    # Since admin UI requires admin permissions, the user should have full access
+    # via the admin bypass (is_admin + token_teams=None)
+    is_admin = user.get("is_admin", False) if isinstance(user, dict) else False
 
     try:
-        resource_content = await resource_service.read_resource(db, resource_uri=resource_uri)
+        # Admin users get unrestricted access (user_email=None, token_teams=None)
+        # Non-admin users get team-based access (user_email=email, token_teams=None for lookup)
+        resource_content = await resource_service.read_resource(
+            db,
+            resource_uri=resource_uri,
+            user=None if is_admin else user_email,
+            token_teams=None,
+        )
         return {"content": resource_content}
     except ResourceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -8810,8 +11405,8 @@ async def admin_delete_resource(resource_id: str, request: Request, db: Session 
     return RedirectResponse(f"{root_path}/admin#resources", status_code=303)
 
 
-@admin_router.post("/resources/{resource_id}/toggle")
-async def admin_toggle_resource(
+@admin_router.post("/resources/{resource_id}/state")
+async def admin_set_resource_state(
     resource_id: str,
     request: Request,
     db: Session = Depends(get_db),
@@ -8852,14 +11447,14 @@ async def admin_toggle_resource(
         >>> mock_request.form = AsyncMock(return_value=form_data)
         >>> mock_request.scope = {"root_path": ""}
         >>>
-        >>> original_toggle_resource_status = resource_service.toggle_resource_status
-        >>> resource_service.toggle_resource_status = AsyncMock()
+        >>> original_set_resource_state= resource_service.set_resource_state
+        >>> resource_service.set_resource_state = AsyncMock()
         >>>
-        >>> async def test_admin_toggle_resource():
-        ...     response = await admin_toggle_resource(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_resource_state():
+        ...     response = await admin_set_resource_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_resource())
+        >>> asyncio.run(test_admin_set_resource_state())
         True
         >>>
         >>> # Test with activate=false
@@ -8869,11 +11464,11 @@ async def admin_toggle_resource(
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_deactivate)
         >>>
-        >>> async def test_admin_toggle_resource_deactivate():
-        ...     response = await admin_toggle_resource(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_resource_state_deactivate():
+        ...     response = await admin_set_resource_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_resource_deactivate())
+        >>> asyncio.run(test_admin_set_resource_state_deactivate())
         True
         >>>
         >>> # Test with inactive checkbox checked
@@ -8883,28 +11478,28 @@ async def admin_toggle_resource(
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_inactive)
         >>>
-        >>> async def test_admin_toggle_resource_inactive():
-        ...     response = await admin_toggle_resource(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_resource_state_inactive():
+        ...     response = await admin_set_resource_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and "include_inactive=true" in response.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_resource_inactive())
+        >>> asyncio.run(test_admin_set_resource_state_inactive())
         True
         >>>
         >>> # Test exception handling
-        >>> resource_service.toggle_resource_status = AsyncMock(side_effect=Exception("Test error"))
+        >>> resource_service.set_resource_state = AsyncMock(side_effect=Exception("Test error"))
         >>> form_data_error = FormData([
         ...     ("activate", "true"),
         ...     ("is_inactive_checked", "false")
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_error)
         >>>
-        >>> async def test_admin_toggle_resource_exception():
-        ...     response = await admin_toggle_resource(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_resource_state_exception():
+        ...     response = await admin_set_resource_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_resource_exception())
+        >>> asyncio.run(test_admin_set_resource_state_exception())
         True
-        >>> resource_service.toggle_resource_status = original_toggle_resource_status
+        >>> resource_service.set_resource_state = original_set_resource_state
     """
     user_email = get_user_email(user)
     LOGGER.debug(f"User {user_email} is toggling resource ID {resource_id}")
@@ -8913,13 +11508,13 @@ async def admin_toggle_resource(
     activate = str(form.get("activate", "true")).lower() == "true"
     is_inactive_checked = str(form.get("is_inactive_checked", "false"))
     try:
-        await resource_service.toggle_resource_status(db, resource_id, activate, user_email=user_email)
+        await resource_service.set_resource_state(db, resource_id, activate, user_email=user_email)
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling resource status {resource_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting resource state {resource_id}: {e}")
         error_message = str(e)
     except Exception as e:
-        LOGGER.error(f"Error toggling resource status: {e}")
-        error_message = "Failed to toggle resource status. Please try again."
+        LOGGER.error(f"Error setting resource state: {e}")
+        error_message = "Failed to set resource state. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -9371,8 +11966,8 @@ async def admin_delete_prompt(prompt_id: str, request: Request, db: Session = De
     return RedirectResponse(f"{root_path}/admin#prompts", status_code=303)
 
 
-@admin_router.post("/prompts/{prompt_id}/toggle")
-async def admin_toggle_prompt(
+@admin_router.post("/prompts/{prompt_id}/state")
+async def admin_set_prompt_state(
     prompt_id: str,
     request: Request,
     db: Session = Depends(get_db),
@@ -9413,14 +12008,14 @@ async def admin_toggle_prompt(
         >>> mock_request.form = AsyncMock(return_value=form_data)
         >>> mock_request.scope = {"root_path": ""}
         >>>
-        >>> original_toggle_prompt_status = prompt_service.toggle_prompt_status
-        >>> prompt_service.toggle_prompt_status = AsyncMock()
+        >>> original_set_prompt_state = prompt_service.set_prompt_state
+        >>> prompt_service.set_prompt_state = AsyncMock()
         >>>
-        >>> async def test_admin_toggle_prompt():
-        ...     response = await admin_toggle_prompt(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_prompt_state():
+        ...     response = await admin_set_prompt_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_prompt())
+        >>> asyncio.run(test_admin_set_prompt_state())
         True
         >>>
         >>> # Test with activate=false
@@ -9430,11 +12025,11 @@ async def admin_toggle_prompt(
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_deactivate)
         >>>
-        >>> async def test_admin_toggle_prompt_deactivate():
-        ...     response = await admin_toggle_prompt(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_prompt_state_deactivate():
+        ...     response = await admin_set_prompt_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_prompt_deactivate())
+        >>> asyncio.run(test_admin_set_prompt_state_deactivate())
         True
         >>>
         >>> # Test with inactive checkbox checked
@@ -9444,28 +12039,28 @@ async def admin_toggle_prompt(
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_inactive)
         >>>
-        >>> async def test_admin_toggle_prompt_inactive():
-        ...     response = await admin_toggle_prompt(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_prompt_state_inactive():
+        ...     response = await admin_set_prompt_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and "include_inactive=true" in response.headers["location"]
         >>>
-        >>> asyncio.run(test_admin_toggle_prompt_inactive())
+        >>> asyncio.run(test_admin_set_prompt_state_inactive())
         True
         >>>
         >>> # Test exception handling
-        >>> prompt_service.toggle_prompt_status = AsyncMock(side_effect=Exception("Test error"))
+        >>> prompt_service.set_prompt_state = AsyncMock(side_effect=Exception("Test error"))
         >>> form_data_error = FormData([
         ...     ("activate", "true"),
         ...     ("is_inactive_checked", "false")
         ... ])
         >>> mock_request.form = AsyncMock(return_value=form_data_error)
         >>>
-        >>> async def test_admin_toggle_prompt_exception():
-        ...     response = await admin_toggle_prompt(1, mock_request, mock_db, mock_user)
+        >>> async def test_admin_set_prompt_state_exception():
+        ...     response = await admin_set_prompt_state(1, mock_request, mock_db, mock_user)
         ...     return isinstance(response, RedirectResponse) and response.status_code == 303
         >>>
-        >>> asyncio.run(test_admin_toggle_prompt_exception())
+        >>> asyncio.run(test_admin_set_prompt_state_exception())
         True
-        >>> prompt_service.toggle_prompt_status = original_toggle_prompt_status
+        >>> prompt_service.set_prompt_state = original_set_prompt_state
     """
     user_email = get_user_email(user)
     LOGGER.debug(f"User {user_email} is toggling prompt ID {prompt_id}")
@@ -9474,13 +12069,13 @@ async def admin_toggle_prompt(
     activate: bool = str(form.get("activate", "true")).lower() == "true"
     is_inactive_checked: str = str(form.get("is_inactive_checked", "false"))
     try:
-        await prompt_service.toggle_prompt_status(db, prompt_id, activate, user_email=user_email)
+        await prompt_service.set_prompt_state(db, prompt_id, activate, user_email=user_email)
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling prompt {prompt_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting prompt state {prompt_id}: {e}")
         error_message = str(e)
     except Exception as e:
-        LOGGER.error(f"Error toggling prompt status: {e}")
-        error_message = "Failed to toggle prompt status. Please try again."
+        LOGGER.error(f"Error setting prompt state: {e}")
+        error_message = "Failed to set prompt state. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -9658,6 +12253,7 @@ MetricsDict = Dict[str, Union[ToolMetrics, ResourceMetrics, ServerMetrics, Promp
 
 
 @admin_router.get("/metrics")
+@require_permission("admin.system_config")
 async def get_aggregated_metrics(
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -9697,11 +12293,12 @@ async def get_aggregated_metrics(
 
 
 @admin_router.get("/metrics/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def admin_metrics_partial_html(
     request: Request,
     entity_type: str = Query("tools", description="Entity type: tools, resources, prompts, or servers"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(10, ge=1, le=1000, description="Items per page"),
+    per_page: int = Query(10, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -9714,7 +12311,7 @@ async def admin_metrics_partial_html(
         request: FastAPI request object
         entity_type: Entity type (tools, resources, prompts, servers)
         page: Page number (1-indexed)
-        per_page: Items per page (1-1000)
+        per_page: Items per page
         db: Database session
         user: Authenticated user
 
@@ -9778,6 +12375,7 @@ async def admin_metrics_partial_html(
 
 
 @admin_router.post("/metrics/reset", response_model=Dict[str, object])
+@require_permission("admin.system_config")
 async def admin_reset_metrics(db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, object]:
     """
     Reset all metrics for tools, resources, servers, and prompts.
@@ -9793,9 +12391,10 @@ async def admin_reset_metrics(db: Session = Depends(get_db), user=Depends(get_cu
     Examples:
         >>> import asyncio
         >>> from unittest.mock import AsyncMock, MagicMock
+        >>> from mcpgateway.config import settings
         >>>
         >>> mock_db = MagicMock()
-        >>> mock_user = {"email": "test_user", "db": mock_db}
+        >>> mock_user = {"email": settings.platform_admin_email, "db": mock_db}
         >>>
         >>> original_reset_metrics_tool = tool_service.reset_metrics
         >>> original_reset_metrics_resource = resource_service.reset_metrics
@@ -9808,7 +12407,7 @@ async def admin_reset_metrics(db: Session = Depends(get_db), user=Depends(get_cu
         >>> prompt_service.reset_metrics = AsyncMock()
         >>>
         >>> async def test_admin_reset_metrics():
-        ...     result = await admin_reset_metrics(mock_db, mock_user)
+        ...     result = await admin_reset_metrics(db=mock_db, user=mock_user)
         ...     return result == {"message": "All metrics reset successfully", "success": True}
         >>>
         >>> import asyncio; asyncio.run(test_admin_reset_metrics())
@@ -9828,7 +12427,9 @@ async def admin_reset_metrics(db: Session = Depends(get_db), user=Depends(get_cu
 
 
 @admin_router.post("/gateways/test", response_model=GatewayTestResponse)
-async def admin_test_gateway(request: GatewayTestRequest, team_id: Optional[str] = Query(None), user=Depends(get_current_user_with_permissions), db: Session = Depends(get_db)) -> GatewayTestResponse:
+async def admin_test_gateway(
+    request: GatewayTestRequest, team_id: Optional[str] = Depends(_validated_team_id_param), user=Depends(get_current_user_with_permissions), db: Session = Depends(get_db)
+) -> GatewayTestResponse:
     """
     Test a gateway by sending a request to its URL.
     This endpoint allows administrators to test the connectivity and response
@@ -9896,7 +12497,7 @@ async def admin_test_gateway(request: GatewayTestRequest, team_id: Optional[str]
         ...         self.status_code = 200
         ...         self.text = "plain text response"
         ...     def json(self):
-        ...         raise json.JSONDecodeError("Invalid JSON", "doc", 0)
+        ...         raise ValueError("Invalid JSON")
         >>>
         >>> class MockClientTextOnly:
         ...     async def __aenter__(self):
@@ -10050,7 +12651,7 @@ async def admin_test_gateway(request: GatewayTestRequest, team_id: Optional[str]
         latency_ms = int((time.monotonic() - start_time) * 1000)
         try:
             response_body: Union[Dict[str, Any], str] = response.json()
-        except json.JSONDecodeError:
+        except ValueError:
             response_body = {"details": response.text}
 
         # Structured logging: Log successful gateway test
@@ -10170,6 +12771,7 @@ async def admin_events(request: Request, _user=Depends(get_current_user_with_per
     """
     # Create a shared queue to aggregate events from all services
     event_queue = asyncio.Queue()
+    heartbeat_interval = 15.0
 
     # Define a generic producer that feeds a specific stream into the queue
     async def stream_to_queue(generator, source_name: str):
@@ -10254,7 +12856,7 @@ async def admin_events(request: Request, _user=Depends(get_current_user_with_per
         Example:
             Basic doctest demonstrating SSE formatting from mock data:
 
-            >>> import json, asyncio
+            >>> import orjson, asyncio
             >>> class DummyRequest:
             ...     async def is_disconnected(self):
             ...         return False
@@ -10303,8 +12905,8 @@ async def admin_events(request: Request, _user=Depends(get_current_user_with_per
                 # We use asyncio.wait_for to allow checking request.is_disconnected periodically
                 # or simply rely on queue.get() which is efficient.
                 try:
-                    # Wait for an event
-                    event = await event_queue.get()
+                    # Wait for an event or send a keepalive to avoid idle timeouts
+                    event = await asyncio.wait_for(event_queue.get(), timeout=heartbeat_interval)
 
                     # SSE format
                     event_type = event.get("type", "message")
@@ -10314,6 +12916,8 @@ async def admin_events(request: Request, _user=Depends(get_current_user_with_per
 
                     # Mark task as done in queue (good practice)
                     event_queue.task_done()
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
 
                 except asyncio.CancelledError:
                     LOGGER.debug("SSE Event generator task cancelled")
@@ -10428,6 +13032,24 @@ async def admin_list_tags(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve tags: {str(e)}")
 
 
+async def _read_request_json(request: Request) -> Any:
+    """Read JSON payload using orjson, falling back to request.json for mocks.
+
+    Args:
+        request: Incoming FastAPI request to read JSON from.
+
+    Returns:
+        Parsed JSON payload (dict/list/etc.).
+    """
+    body = await request.body()
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        if body:
+            return orjson.loads(body)
+    elif isinstance(body, str) and body:
+        return orjson.loads(body)
+    return await request.json()
+
+
 @admin_router.post("/tools/import/")
 @admin_router.post("/tools/import")
 @rate_limit(requests_per_minute=settings.mcpgateway_bulk_import_rate_limit)
@@ -10463,7 +13085,7 @@ async def admin_import_tools(
         ctype = (request.headers.get("content-type") or "").lower()
         if "application/json" in ctype:
             try:
-                payload = await request.json()
+                payload = await _read_request_json(request)
             except Exception as ex:
                 LOGGER.exception("Invalid JSON body")
                 return ORJSONResponse({"success": False, "message": f"Invalid JSON: {ex}"}, status_code=422)
@@ -10592,6 +13214,7 @@ async def admin_import_tools(
 
 
 @admin_router.get("/logs")
+@require_permission("admin.system_config")
 async def admin_get_logs(
     entity_type: Optional[str] = None,
     entity_id: Optional[str] = None,
@@ -10682,6 +13305,7 @@ async def admin_get_logs(
 
 
 @admin_router.get("/logs/stream")
+@require_permission("admin.system_config")
 async def admin_stream_logs(
     request: Request,
     entity_type: Optional[str] = None,
@@ -10768,6 +13392,7 @@ async def admin_stream_logs(
 
 
 @admin_router.get("/logs/file")
+@require_permission("admin.system_config")
 async def admin_get_log_file(
     filename: Optional[str] = None,
     user=Depends(get_current_user_with_permissions),  # pylint: disable=unused-argument
@@ -10812,20 +13437,22 @@ async def admin_get_log_file(
         if not (file_path.suffix in [".log", ".jsonl", ".json"] or file_path.stem.startswith(Path(settings.log_file).stem)):
             raise HTTPException(403, "Not a log file")
 
-        # Return file for download using Response with file content
+        # Return file for download using FileResponse (streams asynchronously)
+        # Pre-stat the file to catch issues early and provide Content-Length
         try:
-            with open(file_path, "rb") as f:
-                file_content = f.read()
-
-            return Response(
-                content=file_content,
+            file_stat = file_path.stat()
+            LOGGER.info(f"Serving log file download: {file_path.name} ({file_stat.st_size} bytes)")
+            return FileResponse(
+                path=file_path,
                 media_type="application/octet-stream",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{file_path.name}"',
-                },
+                filename=file_path.name,
+                stat_result=file_stat,
             )
+        except FileNotFoundError:
+            LOGGER.error(f"Log file disappeared before streaming: {filename}")
+            raise HTTPException(404, f"Log file not found: {filename}")
         except Exception as e:
-            LOGGER.error(f"Error reading file for download: {e}")
+            LOGGER.error(f"Error preparing file for download: {e}")
             raise HTTPException(500, f"Error reading file for download: {e}")
 
     # List available log files
@@ -10888,6 +13515,7 @@ async def admin_get_log_file(
 
 
 @admin_router.get("/logs/export")
+@require_permission("admin.system_config")
 async def admin_export_logs(
     export_format: str = Query("json", alias="format"),
     entity_type: Optional[str] = None,
@@ -10971,7 +13599,7 @@ async def admin_export_logs(
 
     if export_format == "json":
         # Export as JSON
-        content = json.dumps(logs, indent=2, default=str)
+        content = orjson.dumps(logs, default=str, option=orjson.OPT_INDENT_2).decode()
         return Response(
             content=content,
             media_type="application/json",
@@ -11017,6 +13645,7 @@ async def admin_export_logs(
 
 
 @admin_router.get("/export/configuration")
+@require_permission("admin.system_config")
 async def admin_export_configuration(
     request: Request,  # pylint: disable=unused-argument
     types: Optional[str] = None,
@@ -11085,7 +13714,7 @@ async def admin_export_configuration(
         filename = f"mcpgateway-config-export-{timestamp}.json"
 
         # Return as downloadable file
-        content = json.dumps(export_data, indent=2, ensure_ascii=False)
+        content = orjson.dumps(export_data, option=orjson.OPT_INDENT_2).decode()
         return Response(
             content=content,
             media_type="application/json",
@@ -11103,6 +13732,7 @@ async def admin_export_configuration(
 
 
 @admin_router.post("/export/selective")
+@require_permission("admin.system_config")
 async def admin_export_selective(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
     """
     Export selected entities via Admin UI with entity selection.
@@ -11130,7 +13760,7 @@ async def admin_export_selective(request: Request, db: Session = Depends(get_db)
     try:
         LOGGER.info(f"Admin user {user} requested selective configuration export")
 
-        body = await request.json()
+        body = await _read_request_json(request)
         entity_selections = body.get("entity_selections", {})
         include_dependencies = body.get("include_dependencies", True)
 
@@ -11148,7 +13778,7 @@ async def admin_export_selective(request: Request, db: Session = Depends(get_db)
         filename = f"mcpgateway-selective-export-{timestamp}.json"
 
         # Return as downloadable file
-        content = json.dumps(export_data, indent=2, ensure_ascii=False)
+        content = orjson.dumps(export_data, option=orjson.OPT_INDENT_2).decode()
         return Response(
             content=content,
             media_type="application/json",
@@ -11166,6 +13796,7 @@ async def admin_export_selective(request: Request, db: Session = Depends(get_db)
 
 
 @admin_router.post("/import/preview")
+@require_permission("admin.system_config")
 async def admin_import_preview(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
     """
     Preview import file to show available items for selective import.
@@ -11192,7 +13823,7 @@ async def admin_import_preview(request: Request, db: Session = Depends(get_db), 
 
         # Parse request data
         try:
-            data = await request.json()
+            data = await _read_request_json(request)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
@@ -11219,6 +13850,7 @@ async def admin_import_preview(request: Request, db: Session = Depends(get_db), 
 
 
 @admin_router.post("/import/configuration")
+@require_permission("admin.system_config")
 async def admin_import_configuration(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
     """
     Import configuration via Admin UI.
@@ -11246,7 +13878,7 @@ async def admin_import_configuration(request: Request, db: Session = Depends(get
     try:
         LOGGER.info(f"Admin user {user} requested configuration import")
 
-        body = await request.json()
+        body = await _read_request_json(request)
         import_data = body.get("import_data")
         if not import_data:
             raise HTTPException(status_code=400, detail="Missing import_data in request body")
@@ -11282,6 +13914,7 @@ async def admin_import_configuration(request: Request, db: Session = Depends(get
 
 
 @admin_router.get("/import/status/{import_id}")
+@require_permission("admin.system_config")
 async def admin_get_import_status(import_id: str, user=Depends(get_current_user_with_permissions)):
     """Get import status via Admin UI.
 
@@ -11305,6 +13938,7 @@ async def admin_get_import_status(import_id: str, user=Depends(get_current_user_
 
 
 @admin_router.get("/import/status")
+@require_permission("admin.system_config")
 async def admin_list_import_statuses(user=Depends(get_current_user_with_permissions)):
     """List all import statuses via Admin UI.
 
@@ -11426,7 +14060,7 @@ async def admin_get_agent(
 @admin_router.get("/a2a", response_model=PaginatedResponse)
 async def admin_list_a2a_agents(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=500, description="Items per page"),
+    per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -11440,7 +14074,7 @@ async def admin_list_a2a_agents(
 
     Args:
         page (int): Page number (1-indexed) for offset pagination.
-        per_page (int): Number of items per page (1-500).
+        per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive agents in the results.
         db (Session): Database session dependency.
         user (dict): Authenticated user dependency.
@@ -11696,6 +14330,8 @@ async def admin_add_a2a_agent(
             auth_headers=auth_headers if auth_headers else None,
             oauth_config=oauth_config,
             auth_value=form.get("auth_value") if form.get("auth_value") else None,
+            auth_query_param_key=str(form.get("auth_query_param_key", "")) or None,
+            auth_query_param_value=str(form.get("auth_query_param_value", "")) or None,
             tags=tags,
             visibility=form.get("visibility", "private"),
             team_id=team_id,
@@ -11816,7 +14452,7 @@ async def admin_edit_a2a_agent(
         >>>
         >>> async def test_admin_edit_a2a_agent_success():
         ...     response = await admin_edit_a2a_agent(agent_id, mock_request_success, mock_db, mock_user)
-        ...     body = json.loads(response.body)
+        ...     body = orjson.loads(response.body)
         ...     return isinstance(response, JSONResponse) and response.status_code == 200 and body["success"] is True
         >>>
         >>> asyncio.run(test_admin_edit_a2a_agent_success())
@@ -11836,7 +14472,7 @@ async def admin_edit_a2a_agent(
         >>>
         >>> async def test_admin_edit_a2a_agent_exception():
         ...     response = await admin_edit_a2a_agent(agent_id, mock_request_error, mock_db, mock_user)
-        ...     body = json.loads(response.body)
+        ...     body = orjson.loads(response.body)
         ...     return isinstance(response, JSONResponse) and response.status_code == 500 and body["success"] is False and "Update failed" in body["message"]
         >>>
         >>> asyncio.run(test_admin_edit_a2a_agent_exception())
@@ -11855,7 +14491,7 @@ async def admin_edit_a2a_agent(
         >>>
         >>> async def test_admin_edit_a2a_agent_validation():
         ...     response = await admin_edit_a2a_agent(agent_id, mock_request_validation, mock_db, mock_user)
-        ...     body = json.loads(response.body)
+        ...     body = orjson.loads(response.body)
         ...     return isinstance(response, JSONResponse) and response.status_code in (422, 400) and body["success"] is False
         >>>
         >>> asyncio.run(test_admin_edit_a2a_agent_validation())
@@ -12004,6 +14640,8 @@ async def admin_edit_a2a_agent(
             auth_header_key=str(form.get("auth_header_key", "")),
             auth_header_value=str(form.get("auth_header_value", "")),
             auth_value=str(form.get("auth_value", "")),
+            auth_query_param_key=str(form.get("auth_query_param_key", "")) or None,
+            auth_query_param_value=str(form.get("auth_query_param_value", "")) or None,
             auth_headers=auth_headers if auth_headers else None,
             passthrough_headers=passthrough_headers,
             oauth_config=oauth_config,
@@ -12035,8 +14673,8 @@ async def admin_edit_a2a_agent(
         return ORJSONResponse({"message": str(e), "success": False}, status_code=500)
 
 
-@admin_router.post("/a2a/{agent_id}/toggle")
-async def admin_toggle_a2a_agent(
+@admin_router.post("/a2a/{agent_id}/state")
+async def admin_set_a2a_agent_state(
     agent_id: str,
     request: Request,
     db: Session = Depends(get_db),
@@ -12068,21 +14706,21 @@ async def admin_toggle_a2a_agent(
 
         user_email = get_user_email(user)
 
-        await a2a_service.toggle_agent_status(db, agent_id, activate, user_email=user_email)
+        await a2a_service.set_agent_state(db, agent_id, activate, user_email=user_email)
         root_path = request.scope.get("root_path", "")
         return RedirectResponse(f"{root_path}/admin#a2a-agents", status_code=303)
 
     except PermissionError as e:
-        LOGGER.warning(f"Permission denied for user {user_email} toggling A2A agent status{agent_id}: {e}")
+        LOGGER.warning(f"Permission denied for user {user_email} setting A2A agent state {agent_id}: {e}")
         error_message = str(e)
     except A2AAgentNotFoundError as e:
-        LOGGER.error(f"A2A agent toggle failed - not found: {e}")
+        LOGGER.error(f"A2A agent state change failed - not found: {e}")
         root_path = request.scope.get("root_path", "")
         error_message = "A2A agent not found."
     except Exception as e:
-        LOGGER.error(f"Error toggling A2A agent: {e}")
+        LOGGER.error(f"Error setting A2A agent state: {e}")
         root_path = request.scope.get("root_path", "")
-        error_message = "Failed to toggle status of A2A agent. Please try again."
+        error_message = "Failed to set state of A2A agent. Please try again."
 
     root_path = request.scope.get("root_path", "")
 
@@ -12148,15 +14786,15 @@ async def admin_delete_a2a_agent(
 @admin_router.post("/a2a/{agent_id}/test")
 async def admin_test_a2a_agent(
     agent_id: str,
-    request: Request,  # pylint: disable=unused-argument
+    request: Request,
     db: Session = Depends(get_db),
-    user=Depends(get_current_user_with_permissions),  # pylint: disable=unused-argument
+    user=Depends(get_current_user_with_permissions),
 ) -> JSONResponse:
     """Test A2A agent via admin UI.
 
     Args:
         agent_id: Agent ID
-        request: FastAPI request object
+        request: FastAPI request object containing optional 'query' field
         db: Database session
         user: Authenticated user
 
@@ -12174,16 +14812,25 @@ async def admin_test_a2a_agent(
         # Get the agent by ID
         agent = await a2a_service.get_agent(db, agent_id)
 
+        # Parse request body to get user-provided query
+        default_message = "Hello from MCP Gateway Admin UI test!"
+        try:
+            body = await _read_request_json(request)
+            # Use 'or' to also handle empty string queries
+            user_query = (body.get("query") if body else None) or default_message
+        except Exception:
+            user_query = default_message
+
         # Prepare test parameters based on agent type and endpoint
         if agent.agent_type in ["generic", "jsonrpc"] or agent.endpoint_url.endswith("/"):
             # JSONRPC format for agents that expect it
             test_params = {
                 "method": "message/send",
-                "params": {"message": {"messageId": f"admin-test-{int(time.time())}", "role": "user", "parts": [{"type": "text", "text": "Hello from MCP Gateway Admin UI test!"}]}},
+                "params": {"message": {"messageId": f"admin-test-{int(time.time())}", "role": "user", "parts": [{"type": "text", "text": user_query}]}},
             }
         else:
             # Generic test format
-            test_params = {"message": "Hello from MCP Gateway Admin UI test!", "test": True, "timestamp": int(time.time())}
+            test_params = {"query": user_query, "message": user_query, "test": True, "timestamp": int(time.time())}
 
         # Invoke the agent
         result = await a2a_service.invoke_agent(
@@ -12208,7 +14855,7 @@ async def admin_test_a2a_agent(
 @admin_router.get("/grpc", response_model=PaginatedResponse)
 async def admin_list_grpc_services(
     include_inactive: bool = False,
-    team_id: Optional[str] = Query(None),
+    team_id: Optional[str] = Depends(_validated_team_id_param),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ):
@@ -12338,16 +14985,18 @@ async def admin_update_grpc_service(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@admin_router.post("/grpc/{service_id}/toggle")
-async def admin_toggle_grpc_service(
+@admin_router.post("/grpc/{service_id}/state")
+async def admin_set_grpc_service_state(
     service_id: str,
+    activate: Optional[bool] = Query(None, description="Set enabled state. If not provided, inverts current state."),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),  # pylint: disable=unused-argument
 ):
-    """Toggle a gRPC service's enabled status.
+    """Set a gRPC service's enabled state.
 
     Args:
         service_id: Service ID
+        activate: If provided, sets enabled to this value. If None, inverts current state (legacy behavior).
         db: Database session
         user: Authenticated user
 
@@ -12355,14 +15004,17 @@ async def admin_toggle_grpc_service(
         Updated gRPC service
 
     Raises:
-        HTTPException: If gRPC support is disabled or toggle fails
+        HTTPException: If gRPC support is disabled or state change fails
     """
     if not GRPC_AVAILABLE or not settings.mcpgateway_grpc_enabled:
         raise HTTPException(status_code=404, detail="gRPC support is not available or disabled")
 
     try:
-        service = await grpc_service_mgr.get_service(db, service_id)
-        result = await grpc_service_mgr.toggle_service(db, service_id, not service.enabled)
+        if activate is None:
+            # Legacy toggle behavior - invert current state
+            service = await grpc_service_mgr.get_service(db, service_id)
+            activate = not service.enabled
+        result = await grpc_service_mgr.set_service_state(db, service_id, activate)
         return ORJSONResponse(content=jsonable_encoder(result))
     except GrpcServiceNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -12734,7 +15386,7 @@ async def get_plugins_partial(request: Request, db: Session = Depends(get_db), u
         error_html = f"""
         <div class="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
             <strong class="font-bold">Error loading plugins:</strong>
-            <span class="block sm:inline">{str(e)}</span>
+            <span class="block sm:inline">{html.escape(str(e))}</span>
         </div>
         """
         return HTMLResponse(content=error_html, status_code=500)
@@ -13028,20 +15680,22 @@ async def list_catalog_servers(
 @require_permission("servers.create")
 async def register_catalog_server(
     server_id: str,
+    http_request: Request,
     request: Optional[CatalogServerRegisterRequest] = None,
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
-) -> CatalogServerRegisterResponse:
+) -> Union[CatalogServerRegisterResponse, HTMLResponse]:
     """Register a catalog server.
 
     Args:
         server_id: Catalog server ID to register
+        http_request: FastAPI request object (for HTMX detection)
         request: Optional registration parameters
         db: Database session
         _user: Authenticated user
 
     Returns:
-        Registration response with success status
+        Registration response with success status (JSON or HTML)
 
     Raises:
         HTTPException: If the catalog feature is disabled.
@@ -13049,7 +15703,78 @@ async def register_catalog_server(
     if not settings.mcpgateway_catalog_enabled:
         raise HTTPException(status_code=404, detail="Catalog feature is disabled")
 
-    return await catalog_service.register_catalog_server(catalog_id=server_id, request=request, db=db)
+    result = await catalog_service.register_catalog_server(catalog_id=server_id, request=request, db=db)
+
+    # Check if this is an HTMX request
+    is_htmx = http_request.headers.get("HX-Request") == "true"
+
+    if is_htmx:
+        # Return HTML fragment for HTMX - properly escape all dynamic values
+        safe_server_id = html.escape(server_id, quote=True)
+        safe_message = html.escape(result.message, quote=True)
+
+        if result.success:
+            # Check if this is an OAuth server requiring configuration (use explicit flag, not string matching)
+            if result.oauth_required:
+                # OAuth servers are registered but disabled until configured
+                button_fragment = f"""
+                <button
+                    class="w-full px-4 py-2 bg-yellow-600 text-white rounded-md cursor-default"
+                    disabled
+                    title="{safe_message}"
+                >
+                    <svg class="inline-block h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                    </svg>
+                    OAuth Config Required
+                </button>
+                """
+                # Trigger refresh - template will show yellow state from requires_oauth_config field
+                response = HTMLResponse(content=button_fragment)
+                response.headers["HX-Trigger-After-Swap"] = orjson.dumps({"catalogRegistrationSuccess": {"delayMs": 1500}}).decode()
+                return response
+            # Success: Show success button state
+            button_fragment = f"""
+            <button
+                class="w-full px-4 py-2 bg-green-600 text-white rounded-md cursor-default"
+                disabled
+                title="{safe_message}"
+            >
+                <svg class="inline-block h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                </svg>
+                Registered Successfully
+            </button>
+            """
+            # Only non-OAuth success triggers delayed table refresh
+            response = HTMLResponse(content=button_fragment)
+            response.headers["HX-Trigger-After-Swap"] = orjson.dumps({"catalogRegistrationSuccess": {"delayMs": 1500}}).decode()
+            return response
+        # Error: Show error state with retry button (no auto-refresh so retry persists)
+        error_msg = html.escape(result.error or result.message, quote=True)
+        button_fragment = f"""
+        <button
+            id="{safe_server_id}-register-btn"
+            class="w-full px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
+            hx-post="{settings.app_root_path}/admin/mcp-registry/{safe_server_id}/register"
+            hx-target="#{safe_server_id}-button-container"
+            hx-swap="innerHTML"
+            hx-disabled-elt="this"
+            hx-on::before-request="this.innerHTML = '<span class=\\'inline-flex items-center\\'><span class=\\'inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2\\'></span>Retrying...</span>'"
+            hx-on::response-error="this.innerHTML = '<span class=\\'inline-flex items-center\\'><svg class=\\'inline-block h-4 w-4 mr-2\\' fill=\\'none\\' stroke=\\'currentColor\\' viewBox=\\'0 0 24 24\\'><path stroke-linecap=\\'round\\' stroke-linejoin=\\'round\\' stroke-width=\\'2\\' d=\\'M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z\\'></path></svg>Network Error - Click to Retry</span>'"
+            title="{error_msg}"
+        >
+            <svg class="inline-block h-4 w-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+            </svg>
+            Failed - Click to Retry
+        </button>
+        """
+        # No HX-Trigger for errors - let the retry button persist
+        return HTMLResponse(content=button_fragment)
+
+    # Return JSON for non-HTMX requests (API clients)
+    return result
 
 
 @admin_router.get("/mcp-registry/{server_id}/status", response_model=CatalogServerStatusResponse)
@@ -13200,6 +15925,7 @@ async def catalog_partial(
 
 
 @admin_router.get("/system/stats")
+@require_permission("admin.system_config")
 async def get_system_stats(
     request: Request,
     db: Session = Depends(get_db),
@@ -13270,6 +15996,7 @@ async def get_system_stats(
 
 
 @admin_router.get("/support-bundle/generate")
+@require_permission("admin.system_config")
 async def admin_generate_support_bundle(
     log_lines: int = Query(default=1000, description="Number of log lines to include"),
     include_logs: bool = Query(default=True, description="Include log files"),
@@ -13320,30 +16047,21 @@ async def admin_generate_support_bundle(
         service = SupportBundleService()
         bundle_path = service.generate_bundle(config)
 
-        # Read bundle file
-        with open(bundle_path, "rb") as f:
-            bundle_content = f.read()
-
-        # Clean up temp file
-        try:
-            bundle_path.unlink()
-        except Exception as cleanup_error:
-            LOGGER.warning(f"Failed to cleanup temporary bundle file: {cleanup_error}")
-
-        # Return as downloadable file
+        # Return as downloadable file using FileResponse (streams asynchronously)
         timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         filename = f"mcpgateway-support-{timestamp}.zip"
 
-        LOGGER.info(f"Support bundle generated successfully for user {user}: {filename} ({len(bundle_content)} bytes)")
+        # Pre-stat for Content-Length header and logging
+        bundle_stat = bundle_path.stat()
+        LOGGER.info(f"Support bundle generated successfully for user {user}: {filename} ({bundle_stat.st_size} bytes)")
 
-        return Response(
-            content=bundle_content,
+        # Use BackgroundTask to clean up temp file after response is sent
+        return FileResponse(
+            path=bundle_path,
             media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(bundle_content)),
-                "X-Content-Type-Options": "nosniff",
-            },
+            filename=filename,
+            stat_result=bundle_stat,
+            background=BackgroundTask(lambda: bundle_path.unlink(missing_ok=True)),
         )
 
     except Exception as e:
@@ -13357,9 +16075,10 @@ async def admin_generate_support_bundle(
 
 
 @admin_router.get("/maintenance/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_maintenance_partial(
     request: Request,
-    user=Depends(get_current_user_with_permissions),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """Render the maintenance dashboard partial (platform admin only).
 
@@ -13372,7 +16091,7 @@ async def get_maintenance_partial(
 
     Args:
         request: FastAPI request object
-        user: Authenticated user with admin permissions
+        _user: Authenticated user with admin permissions
 
     Returns:
         HTMLResponse: Rendered maintenance dashboard template
@@ -13380,11 +16099,6 @@ async def get_maintenance_partial(
     Raises:
         HTTPException: 403 if user is not a platform admin
     """
-    # Check if user is platform admin
-    is_admin = user.get("is_admin", False) if isinstance(user, dict) else getattr(user, "is_admin", False)
-    if not is_admin:
-        raise HTTPException(status_code=403, detail="Platform administrator access required")
-
     root_path = request.scope.get("root_path", "")
 
     # Build payload with settings for the template
@@ -13408,6 +16122,7 @@ async def get_maintenance_partial(
 
 
 @admin_router.get("/observability/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_observability_partial(request: Request, _user=Depends(get_current_user_with_permissions)):
     """Render the observability dashboard partial.
 
@@ -13423,6 +16138,7 @@ async def get_observability_partial(request: Request, _user=Depends(get_current_
 
 
 @admin_router.get("/observability/metrics/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_observability_metrics_partial(request: Request, _user=Depends(get_current_user_with_permissions)):
     """Render the advanced metrics dashboard partial.
 
@@ -13438,6 +16154,7 @@ async def get_observability_metrics_partial(request: Request, _user=Depends(get_
 
 
 @admin_router.get("/observability/stats", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_observability_stats(request: Request, hours: int = Query(24, ge=1, le=168), _user=Depends(get_current_user_with_permissions)):
     """Get observability statistics for the dashboard.
 
@@ -13481,6 +16198,7 @@ async def get_observability_stats(request: Request, hours: int = Query(24, ge=1,
 
 
 @admin_router.get("/observability/traces", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_observability_traces(
     request: Request,
     time_range: str = Query("24h"),
@@ -13579,6 +16297,7 @@ async def get_observability_traces(
 
 
 @admin_router.get("/observability/trace/{trace_id}", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_observability_trace_detail(request: Request, trace_id: str, _user=Depends(get_current_user_with_permissions)):
     """Get detailed trace information with spans.
 
@@ -13611,6 +16330,7 @@ async def get_observability_trace_detail(request: Request, trace_id: str, _user=
 
 
 @admin_router.post("/observability/queries", response_model=dict)
+@require_permission("admin.system_config")
 async def save_observability_query(
     request: Request,  # pylint: disable=unused-argument
     name: str = Body(..., description="Name for the saved query"),
@@ -13661,6 +16381,7 @@ async def save_observability_query(
 
 
 @admin_router.get("/observability/queries", response_model=list)
+@require_permission("admin.system_config")
 async def list_observability_queries(request: Request, user=Depends(get_current_user_with_permissions)):  # pylint: disable=unused-argument
     """List saved observability queries for the current user.
 
@@ -13708,6 +16429,7 @@ async def list_observability_queries(request: Request, user=Depends(get_current_
 
 
 @admin_router.get("/observability/queries/{query_id}", response_model=dict)
+@require_permission("admin.system_config")
 async def get_observability_query(request: Request, query_id: int, user=Depends(get_current_user_with_permissions)):  # pylint: disable=unused-argument
     """Get a specific saved query by ID.
 
@@ -13754,6 +16476,7 @@ async def get_observability_query(request: Request, query_id: int, user=Depends(
 
 
 @admin_router.put("/observability/queries/{query_id}", response_model=dict)
+@require_permission("admin.system_config")
 async def update_observability_query(
     request: Request,  # pylint: disable=unused-argument
     query_id: int,
@@ -13826,6 +16549,7 @@ async def update_observability_query(
 
 
 @admin_router.delete("/observability/queries/{query_id}", status_code=204)
+@require_permission("admin.system_config")
 async def delete_observability_query(request: Request, query_id: int, user=Depends(get_current_user_with_permissions)):  # pylint: disable=unused-argument
     """Delete a saved query.
 
@@ -13858,6 +16582,7 @@ async def delete_observability_query(request: Request, query_id: int, user=Depen
 
 
 @admin_router.post("/observability/queries/{query_id}/use", response_model=dict)
+@require_permission("admin.system_config")
 async def track_query_usage(request: Request, query_id: int, user=Depends(get_current_user_with_permissions)):  # pylint: disable=unused-argument
     """Track usage of a saved query (increments use count and updates last_used_at).
 
@@ -13907,6 +16632,7 @@ async def track_query_usage(request: Request, query_id: int, user=Depends(get_cu
 
 
 @admin_router.get("/observability/metrics/percentiles", response_model=dict)
+@require_permission("admin.system_config")
 async def get_latency_percentiles(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14073,6 +16799,7 @@ def _get_latency_percentiles_python(db: Session, cutoff_time: datetime, interval
 
 
 @admin_router.get("/observability/metrics/timeseries", response_model=dict)
+@require_permission("admin.system_config")
 async def get_timeseries_metrics(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14398,6 +17125,7 @@ def _get_latency_heatmap_python(db: Session, cutoff_time: datetime, hours: int, 
 
 
 @admin_router.get("/observability/metrics/top-slow", response_model=dict)
+@require_permission("admin.system_config")
 async def get_top_slow_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14464,6 +17192,7 @@ async def get_top_slow_endpoints(
 
 
 @admin_router.get("/observability/metrics/top-volume", response_model=dict)
+@require_permission("admin.system_config")
 async def get_top_volume_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14528,6 +17257,7 @@ async def get_top_volume_endpoints(
 
 
 @admin_router.get("/observability/metrics/top-errors", response_model=dict)
+@require_permission("admin.system_config")
 async def get_top_error_endpoints(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14595,6 +17325,7 @@ async def get_top_error_endpoints(
 
 
 @admin_router.get("/observability/metrics/heatmap", response_model=dict)
+@require_permission("admin.system_config")
 async def get_latency_heatmap(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14641,6 +17372,7 @@ async def get_latency_heatmap(
 
 
 @admin_router.get("/observability/tools/usage", response_model=dict)
+@require_permission("admin.system_config")
 async def get_tool_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14665,20 +17397,23 @@ async def get_tool_usage(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Query tool invocations from spans
         # Note: Using $."tool.name" because the JSON key contains a dot
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        tool_name_expr = extract_json_field(ObservabilitySpan.attributes, '$."tool.name"', dialect_name=dialect_name)
         tool_usage = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').label("tool_name"),
+                tool_name_expr.label("tool_name"),
                 func.count(ObservabilitySpan.span_id).label("count"),  # pylint: disable=not-callable
             )
             .filter(
                 ObservabilitySpan.name == "tool.invoke",
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').isnot(None),
+                tool_name_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."tool.name"'))
+            .group_by(tool_name_expr)
             .order_by(func.count(ObservabilitySpan.span_id).desc())  # pylint: disable=not-callable
             .limit(limit)
             .all()
@@ -14708,6 +17443,7 @@ async def get_tool_usage(
 
 
 @admin_router.get("/observability/tools/performance", response_model=dict)
+@require_permission("admin.system_config")
 async def get_tool_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14733,63 +17469,16 @@ async def get_tool_performance(
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
 
-        # First, get all tool invocations with durations
-        tool_spans = (
-            db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').label("tool_name"),
-                ObservabilitySpan.duration_ms,
-            )
-            .filter(
-                ObservabilitySpan.name == "tool.invoke",
-                ObservabilitySpan.start_time >= cutoff_time_naive,
-                ObservabilitySpan.duration_ms.isnot(None),
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').isnot(None),
-            )
-            .all()
+        # Use shared helper to compute performance grouped by the JSON attribute
+        tools = _get_span_entity_performance(
+            db=db,
+            cutoff_time=cutoff_time,
+            cutoff_time_naive=cutoff_time_naive,
+            span_names=["tool.invoke"],
+            json_key="tool.name",
+            result_key="tool_name",
+            limit=limit,
         )
-
-        # Group by tool name and calculate percentiles
-        tool_durations = defaultdict(list)
-        for span in tool_spans:
-            tool_durations[span.tool_name].append(span.duration_ms)
-
-        # Calculate metrics for each tool
-        tools_data = []
-        for tool_name, durations in tool_durations.items():
-            durations_sorted = sorted(durations)
-            n = len(durations_sorted)
-
-            if n == 0:
-                continue
-
-            # Calculate percentiles
-            def percentile(data, p):
-                if not data:
-                    return 0
-                k = (len(data) - 1) * p
-                f = int(k)
-                c = min(f + 1, len(data) - 1)
-                if f == c:
-                    return data[f]
-                return data[f] * (c - k) + data[c] * (k - f)
-
-            tools_data.append(
-                {
-                    "tool_name": tool_name,
-                    "count": n,
-                    "avg_duration_ms": round(sum(durations) / n, 2),
-                    "min_duration_ms": round(min(durations), 2),
-                    "max_duration_ms": round(max(durations), 2),
-                    "p50": round(percentile(durations_sorted, 0.50), 2),
-                    "p90": round(percentile(durations_sorted, 0.90), 2),
-                    "p95": round(percentile(durations_sorted, 0.95), 2),
-                    "p99": round(percentile(durations_sorted, 0.99), 2),
-                }
-            )
-
-        # Sort by average duration descending and limit
-        tools_data.sort(key=lambda x: x["avg_duration_ms"], reverse=True)
-        tools = tools_data[:limit]
 
         return {"tools": tools, "time_range_hours": hours}
     except Exception as e:
@@ -14804,6 +17493,7 @@ async def get_tool_performance(
 
 
 @admin_router.get("/observability/tools/errors", response_model=dict)
+@require_permission("admin.system_config")
 async def get_tool_errors(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14828,20 +17518,23 @@ async def get_tool_errors(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Query tool error rates
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        tool_name_expr = extract_json_field(ObservabilitySpan.attributes, '$."tool.name"', dialect_name=dialect_name)
         tool_errors = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').label("tool_name"),
+                tool_name_expr.label("tool_name"),
                 func.count(ObservabilitySpan.span_id).label("total_count"),  # pylint: disable=not-callable
                 func.sum(case((ObservabilitySpan.status == "error", 1), else_=0)).label("error_count"),  # pylint: disable=not-callable
             )
             .filter(
                 ObservabilitySpan.name == "tool.invoke",
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').isnot(None),
+                tool_name_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."tool.name"'))
+            .group_by(tool_name_expr)
             .order_by(func.sum(case((ObservabilitySpan.status == "error", 1), else_=0)).desc())  # pylint: disable=not-callable
             .limit(limit)
             .all()
@@ -14870,6 +17563,7 @@ async def get_tool_errors(
 
 
 @admin_router.get("/observability/tools/chains", response_model=dict)
+@require_permission("admin.system_config")
 async def get_tool_chains(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14894,18 +17588,21 @@ async def get_tool_chains(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Get all tool invocations grouped by trace_id
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        tool_name_expr = extract_json_field(ObservabilitySpan.attributes, '$."tool.name"', dialect_name=dialect_name)
         tool_spans = (
             db.query(
                 ObservabilitySpan.trace_id,
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').label("tool_name"),
+                tool_name_expr.label("tool_name"),
                 ObservabilitySpan.start_time,
             )
             .filter(
                 ObservabilitySpan.name == "tool.invoke",
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."tool.name"').isnot(None),
+                tool_name_expr.isnot(None),
             )
             .order_by(ObservabilitySpan.trace_id, ObservabilitySpan.start_time)
             .all()
@@ -14944,6 +17641,7 @@ async def get_tool_chains(
 
 
 @admin_router.get("/observability/tools/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_tools_partial(
     request: Request,
     _user=Depends(get_current_user_with_permissions),
@@ -14973,6 +17671,7 @@ async def get_tools_partial(
 
 
 @admin_router.get("/observability/prompts/usage", response_model=dict)
+@require_permission("admin.system_config")
 async def get_prompt_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -14997,20 +17696,23 @@ async def get_prompt_usage(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Query prompt renders from spans (looking for prompts/get calls)
         # The prompt id should be in attributes as "prompt.id"
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        prompt_id_expr = extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"', dialect_name=dialect_name)
         prompt_usage = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').label("prompt_id"),
+                prompt_id_expr.label("prompt_id"),
                 func.count(ObservabilitySpan.span_id).label("count"),  # pylint: disable=not-callable
             )
             .filter(
                 ObservabilitySpan.name.in_(["prompt.get", "prompts.get", "prompt.render"]),
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').isnot(None),
+                prompt_id_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"'))
+            .group_by(prompt_id_expr)
             .order_by(func.count(ObservabilitySpan.span_id).desc())  # pylint: disable=not-callable
             .limit(limit)
             .all()
@@ -15040,6 +17742,7 @@ async def get_prompt_usage(
 
 
 @admin_router.get("/observability/prompts/performance", response_model=dict)
+@require_permission("admin.system_config")
 async def get_prompt_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -15065,63 +17768,16 @@ async def get_prompt_performance(
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
 
-        # First, get all prompt renders with durations
-        prompt_spans = (
-            db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').label("prompt_id"),
-                ObservabilitySpan.duration_ms,
-            )
-            .filter(
-                ObservabilitySpan.name.in_(["prompt.get", "prompts.get", "prompt.render"]),
-                ObservabilitySpan.start_time >= cutoff_time_naive,
-                ObservabilitySpan.duration_ms.isnot(None),
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').isnot(None),
-            )
-            .all()
+        # Use shared helper to compute performance grouped by the JSON attribute
+        prompts = _get_span_entity_performance(
+            db=db,
+            cutoff_time=cutoff_time,
+            cutoff_time_naive=cutoff_time_naive,
+            span_names=["prompt.get", "prompts.get", "prompt.render"],
+            json_key="prompt.id",
+            result_key="prompt_id",
+            limit=limit,
         )
-
-        # Group by prompt id and calculate percentiles
-        prompt_durations = defaultdict(list)
-        for span in prompt_spans:
-            prompt_durations[span.prompt_id].append(span.duration_ms)
-
-        # Calculate metrics for each prompt
-        prompts_data = []
-        for prompt_id, durations in prompt_durations.items():
-            durations_sorted = sorted(durations)
-            n = len(durations_sorted)
-
-            if n == 0:
-                continue
-
-            # Calculate percentiles
-            def percentile(data, p):
-                if not data:
-                    return 0
-                k = (len(data) - 1) * p
-                f = int(k)
-                c = min(f + 1, len(data) - 1)
-                if f == c:
-                    return data[f]
-                return data[f] * (c - k) + data[c] * (k - f)
-
-            prompts_data.append(
-                {
-                    "prompt_id": prompt_id,
-                    "count": n,
-                    "avg_duration_ms": round(sum(durations) / n, 2),
-                    "min_duration_ms": round(min(durations), 2),
-                    "max_duration_ms": round(max(durations), 2),
-                    "p50": round(percentile(durations_sorted, 0.50), 2),
-                    "p90": round(percentile(durations_sorted, 0.90), 2),
-                    "p95": round(percentile(durations_sorted, 0.95), 2),
-                    "p99": round(percentile(durations_sorted, 0.99), 2),
-                }
-            )
-
-        # Sort by average duration descending and limit
-        prompts_data.sort(key=lambda x: x["avg_duration_ms"], reverse=True)
-        prompts = prompts_data[:limit]
 
         return {"prompts": prompts, "time_range_hours": hours}
     except Exception as e:
@@ -15136,6 +17792,7 @@ async def get_prompt_performance(
 
 
 @admin_router.get("/observability/prompts/errors", response_model=dict)
+@require_permission("admin.system_config")
 async def get_prompts_errors(
     hours: int = Query(24, description="Time range in hours"),
     limit: int = Query(20, description="Maximum number of results"),
@@ -15155,20 +17812,23 @@ async def get_prompts_errors(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Get all prompt spans with their status
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        prompt_id_expr = extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"', dialect_name=dialect_name)
         prompt_stats = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').label("prompt_id"),
+                prompt_id_expr.label("prompt_id"),
                 func.count().label("total_count"),  # pylint: disable=not-callable
                 func.sum(case((ObservabilitySpan.status == "error", 1), else_=0)).label("error_count"),
             )
             .filter(
                 ObservabilitySpan.name == "prompt.render",
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"').isnot(None),
+                prompt_id_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."prompt.id"'))
+            .group_by(prompt_id_expr)
             .all()
         )
 
@@ -15194,6 +17854,7 @@ async def get_prompts_errors(
 
 
 @admin_router.get("/observability/prompts/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_prompts_partial(
     request: Request,
     _user=Depends(get_current_user_with_permissions),
@@ -15223,6 +17884,7 @@ async def get_prompts_partial(
 
 
 @admin_router.get("/observability/resources/usage", response_model=dict)
+@require_permission("admin.system_config")
 async def get_resource_usage(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -15247,20 +17909,23 @@ async def get_resource_usage(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Query resource reads from spans (looking for resources/read calls)
         # The resource URI should be in attributes
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        resource_uri_expr = extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"', dialect_name=dialect_name)
         resource_usage = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').label("resource_uri"),
+                resource_uri_expr.label("resource_uri"),
                 func.count(ObservabilitySpan.span_id).label("count"),  # pylint: disable=not-callable
             )
             .filter(
                 ObservabilitySpan.name.in_(["resource.read", "resources.read", "resource.fetch"]),
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').isnot(None),
+                resource_uri_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"'))
+            .group_by(resource_uri_expr)
             .order_by(func.count(ObservabilitySpan.span_id).desc())  # pylint: disable=not-callable
             .limit(limit)
             .all()
@@ -15290,6 +17955,7 @@ async def get_resource_usage(
 
 
 @admin_router.get("/observability/resources/performance", response_model=dict)
+@require_permission("admin.system_config")
 async def get_resource_performance(
     request: Request,  # pylint: disable=unused-argument
     hours: int = Query(24, ge=1, le=168, description="Time range in hours"),
@@ -15315,63 +17981,16 @@ async def get_resource_performance(
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
 
-        # First, get all resource reads with durations
-        resource_spans = (
-            db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').label("resource_uri"),
-                ObservabilitySpan.duration_ms,
-            )
-            .filter(
-                ObservabilitySpan.name.in_(["resource.read", "resources.read", "resource.fetch"]),
-                ObservabilitySpan.start_time >= cutoff_time_naive,
-                ObservabilitySpan.duration_ms.isnot(None),
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').isnot(None),
-            )
-            .all()
+        # Use shared helper to compute performance grouped by the JSON attribute
+        resources = _get_span_entity_performance(
+            db=db,
+            cutoff_time=cutoff_time,
+            cutoff_time_naive=cutoff_time_naive,
+            span_names=["resource.read", "resources.read", "resource.fetch"],
+            json_key="resource.uri",
+            result_key="resource_uri",
+            limit=limit,
         )
-
-        # Group by resource URI and calculate percentiles
-        resource_durations = defaultdict(list)
-        for span in resource_spans:
-            resource_durations[span.resource_uri].append(span.duration_ms)
-
-        # Calculate metrics for each resource
-        resources_data = []
-        for resource_uri, durations in resource_durations.items():
-            durations_sorted = sorted(durations)
-            n = len(durations_sorted)
-
-            if n == 0:
-                continue
-
-            # Calculate percentiles
-            def percentile(data, p):
-                if not data:
-                    return 0
-                k = (len(data) - 1) * p
-                f = int(k)
-                c = min(f + 1, len(data) - 1)
-                if f == c:
-                    return data[f]
-                return data[f] * (c - k) + data[c] * (k - f)
-
-            resources_data.append(
-                {
-                    "resource_uri": resource_uri,
-                    "count": n,
-                    "avg_duration_ms": round(sum(durations) / n, 2),
-                    "min_duration_ms": round(min(durations), 2),
-                    "max_duration_ms": round(max(durations), 2),
-                    "p50": round(percentile(durations_sorted, 0.50), 2),
-                    "p90": round(percentile(durations_sorted, 0.90), 2),
-                    "p95": round(percentile(durations_sorted, 0.95), 2),
-                    "p99": round(percentile(durations_sorted, 0.99), 2),
-                }
-            )
-
-        # Sort by average duration descending and limit
-        resources_data.sort(key=lambda x: x["avg_duration_ms"], reverse=True)
-        resources = resources_data[:limit]
 
         return {"resources": resources, "time_range_hours": hours}
     except Exception as e:
@@ -15386,6 +18005,7 @@ async def get_resource_performance(
 
 
 @admin_router.get("/observability/resources/errors", response_model=dict)
+@require_permission("admin.system_config")
 async def get_resources_errors(
     hours: int = Query(24, description="Time range in hours"),
     limit: int = Query(20, description="Maximum number of results"),
@@ -15405,20 +18025,23 @@ async def get_resources_errors(
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
         cutoff_time_naive = cutoff_time.replace(tzinfo=None)
+        dialect_name = db.get_bind().dialect.name
 
         # Get all resource spans with their status
+        # Create expression once and reuse to avoid PostgreSQL GROUP BY errors
+        resource_uri_expr = extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"', dialect_name=dialect_name)
         resource_stats = (
             db.query(
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').label("resource_uri"),
+                resource_uri_expr.label("resource_uri"),
                 func.count().label("total_count"),  # pylint: disable=not-callable
                 func.sum(case((ObservabilitySpan.status == "error", 1), else_=0)).label("error_count"),
             )
             .filter(
                 ObservabilitySpan.name.in_(["resource.read", "resources.read", "resource.fetch"]),
                 ObservabilitySpan.start_time >= cutoff_time_naive,
-                extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"').isnot(None),
+                resource_uri_expr.isnot(None),
             )
-            .group_by(extract_json_field(ObservabilitySpan.attributes, '$."resource.uri"'))
+            .group_by(resource_uri_expr)
             .all()
         )
 
@@ -15444,6 +18067,7 @@ async def get_resources_errors(
 
 
 @admin_router.get("/observability/resources/partial", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_resources_partial(
     request: Request,
     _user=Depends(get_current_user_with_permissions),
@@ -15473,6 +18097,7 @@ async def get_resources_partial(
 
 
 @admin_router.get("/performance/stats", response_class=HTMLResponse)
+@require_permission("admin.system_config")
 async def get_performance_stats(
     request: Request,
     db: Session = Depends(get_db),
@@ -15534,6 +18159,7 @@ async def get_performance_stats(
 
 
 @admin_router.get("/performance/system")
+@require_permission("admin.system_config")
 async def get_performance_system(
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -15559,6 +18185,7 @@ async def get_performance_system(
 
 
 @admin_router.get("/performance/workers")
+@require_permission("admin.system_config")
 async def get_performance_workers(
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -15584,6 +18211,7 @@ async def get_performance_workers(
 
 
 @admin_router.get("/performance/requests")
+@require_permission("admin.system_config")
 async def get_performance_requests(
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -15609,6 +18237,7 @@ async def get_performance_requests(
 
 
 @admin_router.get("/performance/cache")
+@require_permission("admin.system_config")
 async def get_performance_cache(
     db: Session = Depends(get_db),
     _user=Depends(get_current_user_with_permissions),
@@ -15634,6 +18263,7 @@ async def get_performance_cache(
 
 
 @admin_router.get("/performance/history")
+@require_permission("admin.system_config")
 async def get_performance_history(
     period_type: str = Query("hourly", description="Aggregation period: hourly or daily"),
     hours: int = Query(24, ge=1, le=168, description="Number of hours to look back"),

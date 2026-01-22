@@ -19,15 +19,15 @@ Environment variables:
 - SKIP_SSL_VERIFY: Disable SSL verification (default: False)
 - AUTH_REQUIRED: Require authentication (default: True)
 - TRANSPORT_TYPE: Transport mechanisms (default: "all")
-- FEDERATION_ENABLED: Enable gateway federation (default: True)
 - DOCS_ALLOW_BASIC_AUTH: Allow basic auth for docs (default: False)
-- FEDERATION_DISCOVERY: Enable auto-discovery (default: False)
-- FEDERATION_PEERS: List of peer gateway URLs (default: [])
 - RESOURCE_CACHE_SIZE: Max cached resources (default: 1000)
 - RESOURCE_CACHE_TTL: Cache TTL in seconds (default: 3600)
 - TOOL_TIMEOUT: Tool invocation timeout (default: 60)
 - PROMPT_CACHE_SIZE: Max cached prompts (default: 100)
 - HEALTH_CHECK_INTERVAL: Gateway health check interval (default: 300)
+- REQUIRE_TOKEN_EXPIRATION: Require JWT tokens to have expiration (default: False)
+- REQUIRE_JTI: Require JTI claim in tokens for revocation (default: False)
+- REQUIRE_USER_IN_DB: Require all users to exist in database (default: False)
 
 Examples:
     >>> from mcpgateway.config import Settings
@@ -50,7 +50,6 @@ Examples:
 # Standard
 from functools import lru_cache
 from importlib.resources import files
-import json  # Used only for indent=2 pretty-printing in print_schema()
 import logging
 import os
 from pathlib import Path
@@ -88,6 +87,8 @@ def _normalize_env_list_vars() -> None:
         "SSO_AUTO_ADMIN_DOMAINS",
         "SSO_GITHUB_ADMIN_ORGS",
         "SSO_GOOGLE_ADMIN_DOMAINS",
+        "SSO_ENTRA_ADMIN_GROUPS",
+        "LOG_DETAILED_SKIP_ENDPOINTS",
     ]
     for key in keys:
         raw = os.environ.get(key)
@@ -147,6 +148,22 @@ class Settings(BaseSettings):
         True
         >>> isinstance(s5.allowed_origins, set)
         True
+        >>> s6 = Settings(log_detailed_skip_endpoints=["/metrics", "/health"])
+        >>> s6.log_detailed_skip_endpoints
+        ['/metrics', '/health']
+        >>> s7 = Settings(log_detailed_sample_rate=0.5)
+        >>> s7.log_detailed_sample_rate
+        0.5
+        >>> s8 = Settings(log_resolve_user_identity=True)
+        >>> s8.log_resolve_user_identity
+        True
+        >>> s9 = Settings()
+        >>> s9.log_detailed_skip_endpoints
+        []
+        >>> s9.log_detailed_sample_rate
+        1.0
+        >>> s9.log_resolve_user_identity
+        False
     """
 
     # Basic Settings
@@ -169,6 +186,11 @@ class Settings(BaseSettings):
     templates_dir: Path = Field(default_factory=lambda: Path(str(files("mcpgateway") / "templates")))
     static_dir: Path = Field(default_factory=lambda: Path(str(files("mcpgateway") / "static")))
 
+    # Template auto-reload: False for production (default), True for development
+    # Disabling prevents re-parsing templates on each request, improving performance under load
+    # Use TEMPLATES_AUTO_RELOAD=true for development (make dev sets this automatically)
+    templates_auto_reload: bool = Field(default=False, description="Auto-reload Jinja2 templates on change (enable for development)")
+
     app_root_path: str = ""
 
     # Protocol
@@ -184,10 +206,18 @@ class Settings(BaseSettings):
     jwt_audience: str = "mcpgateway-api"
     jwt_issuer: str = "mcpgateway"
     jwt_audience_verification: bool = True
+    jwt_issuer_verification: bool = True
     auth_required: bool = True
     token_expiry: int = 10080  # minutes
 
     require_token_expiration: bool = Field(default=False, description="Require all JWT tokens to have expiration claims")  # Default to flexible mode for backward compatibility
+    require_jti: bool = Field(default=False, description="Require JTI (JWT ID) claim in all tokens for revocation support")  # Default to flexible mode for backward compatibility
+    require_user_in_db: bool = Field(
+        default=False,
+        description="Require all authenticated users to exist in the database. When true, disables the platform admin bootstrap mechanism. WARNING: Enabling this on a fresh deployment will lock you out.",
+    )
+    embed_environment_in_tokens: bool = Field(default=False, description="Embed environment claim in gateway-issued JWTs for environment isolation")
+    validate_token_environment: bool = Field(default=False, description="Reject tokens with mismatched environment claim (tokens without env claim are allowed)")
 
     # SSO Configuration
     sso_enabled: bool = Field(default=False, description="Enable Single Sign-On authentication")
@@ -242,6 +272,11 @@ class Settings(BaseSettings):
     sso_entra_client_id: Optional[str] = Field(default=None, description="Microsoft Entra ID client ID")
     sso_entra_client_secret: Optional[SecretStr] = Field(default=None, description="Microsoft Entra ID client secret")
     sso_entra_tenant_id: Optional[str] = Field(default=None, description="Microsoft Entra ID tenant ID")
+    sso_entra_groups_claim: str = Field(default="groups", description="JWT claim for EntraID groups (groups/roles)")
+    sso_entra_admin_groups: Annotated[list[str], NoDecode()] = Field(default_factory=list, description="EntraID groups granting platform_admin role (CSV/JSON)")
+    sso_entra_role_mappings: Dict[str, str] = Field(default_factory=dict, description="Map EntraID groups to Context Forge roles (JSON: {group_id: role_name})")
+    sso_entra_default_role: Optional[str] = Field(default=None, description="Default role for EntraID users without group mapping (None = no role assigned)")
+    sso_entra_sync_roles_on_login: bool = Field(default=True, description="Synchronize role assignments on each login")
 
     sso_generic_enabled: bool = Field(default=False, description="Enable generic OIDC provider (Keycloak, Auth0, etc.)")
     sso_generic_provider_id: Optional[str] = Field(default=None, description="Provider ID (e.g., 'keycloak', 'auth0', 'authentik')")
@@ -267,6 +302,10 @@ class Settings(BaseSettings):
 
     # MCP Client Authentication
     mcp_client_auth_enabled: bool = Field(default=True, description="Enable JWT authentication for MCP client operations")
+    mcp_require_auth: bool = Field(
+        default=False,
+        description="Require authentication for /mcp endpoints. If false, unauthenticated requests can access public items only. " "If true, all /mcp requests must include a valid Bearer token.",
+    )
     trust_proxy_auth: bool = Field(
         default=False,
         description="Trust proxy authentication headers (required when mcp_client_auth_enabled=false)",
@@ -275,6 +314,16 @@ class Settings(BaseSettings):
 
     #  Encryption key phrase for auth storage
     auth_encryption_secret: SecretStr = Field(default=SecretStr("my-test-salt"))
+
+    # Query Parameter Authentication (INSECURE - disabled by default)
+    insecure_allow_queryparam_auth: bool = Field(
+        default=False,
+        description=("Enable query parameter authentication for gateway peers. " "WARNING: API keys may appear in proxy logs. See CWE-598."),
+    )
+    insecure_queryparam_auth_allowed_hosts: List[str] = Field(
+        default_factory=list,
+        description=("Allowlist of hosts permitted to use query parameter auth. " "Empty list allows any host when feature is enabled. " "Format: ['mcp.tavily.com', 'api.example.com']"),
+    )
 
     # OAuth Configuration
     oauth_request_timeout: int = Field(default=30, description="OAuth request timeout in seconds")
@@ -333,6 +382,14 @@ class Settings(BaseSettings):
     password_require_numbers: bool = Field(default=False, description="Require numbers in passwords")
     password_require_special: bool = Field(default=True, description="Require special characters in passwords")
 
+    # Password change enforcement and policy toggles
+    password_change_enforcement_enabled: bool = Field(default=True, description="Master switch for password change enforcement checks")
+    admin_require_password_change_on_bootstrap: bool = Field(default=True, description="Force admin to change password after bootstrap")
+    detect_default_password_on_login: bool = Field(default=True, description="Detect default password during login and mark user for change")
+    require_password_change_for_default_password: bool = Field(default=True, description="Require password change when user is created with the default password")
+    password_policy_enabled: bool = Field(default=True, description="Enable password complexity validation for new/changed passwords")
+    password_prevent_reuse: bool = Field(default=True, description="Prevent reusing the current password when changing")
+    password_max_age_days: int = Field(default=90, description="Password maximum age in days before expiry forces a change")
     # Account Security Configuration
     max_failed_login_attempts: int = Field(default=5, description="Maximum failed login attempts before account lockout")
     account_lockout_duration_minutes: int = Field(default=30, description="Account lockout duration in minutes")
@@ -355,6 +412,9 @@ class Settings(BaseSettings):
 
     # UI Tool Test Configuration
     mcpgateway_ui_tool_test_timeout: int = Field(default=60000, description="Tool test timeout in milliseconds for the admin UI")
+
+    # Tool Execution Cancellation
+    mcpgateway_tool_cancellation_enabled: bool = Field(default=True, description="Enable gateway-authoritative tool execution cancellation with REST API endpoints")
 
     # A2A (Agent-to-Agent) Feature Flags
     mcpgateway_a2a_enabled: bool = True
@@ -682,10 +742,6 @@ class Settings(BaseSettings):
         if self.debug and not self.dev_mode:
             logger.warning("🐛 SECURITY WARNING: Debug mode is enabled in non-dev mode. This may leak sensitive information! Set DEBUG=false for production.")
 
-        # Warn about federation without auth
-        if self.federation_enabled and not self.auth_required:
-            logger.warning("🌐 SECURITY WARNING: Federation is enabled without authentication. This may expose your gateway to unauthorized access.")
-
         return self
 
     def get_security_warnings(self) -> List[str]:
@@ -892,6 +948,27 @@ class Settings(BaseSettings):
         description="Maximum request body size to log in detailed mode (bytes). Separate from log_max_size_mb which is for file rotation.",
     )
 
+    # Optional: endpoints to skip for detailed request logging (prefix match)
+    log_detailed_skip_endpoints: List[str] = Field(
+        default_factory=list,
+        description="List of path prefixes to skip when log_detailed_requests is enabled",
+    )
+
+    # Whether to attempt resolving user identity via DB fallback when logging.
+    # Keep default False to avoid implicit DB queries during normal request handling.
+    log_resolve_user_identity: bool = Field(
+        default=False,
+        description="If true, RequestLoggingMiddleware will attempt DB fallback to resolve user identity when needed",
+    )
+
+    # Sampling rate for detailed request logging (0.0-1.0). Applied when log_detailed_requests is enabled.
+    log_detailed_sample_rate: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of requests to sample for detailed logging (0.0-1.0)",
+    )
+
     # Log Buffer (for in-memory storage in admin UI)
     log_buffer_size_mb: float = 1.0  # Size of in-memory log buffer in MB
 
@@ -914,8 +991,26 @@ class Settings(BaseSettings):
     # Sample rate (0.0 to 1.0) - 1.0 means trace everything
     observability_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0, description="Trace sampling rate (0.0-1.0)")
 
+    # Include paths for tracing (regex patterns)
+    observability_include_paths: List[str] = Field(
+        default_factory=lambda: [
+            r"^/rpc/?$",
+            r"^/sse$",
+            r"^/message$",
+            r"^/mcp(?:/|$)",
+            r"^/servers/[^/]+/mcp/?$",
+            r"^/servers/[^/]+/sse$",
+            r"^/servers/[^/]+/message$",
+            r"^/a2a(?:/|$)",
+        ],
+        description="Regex patterns to include for tracing (when empty, all paths are eligible before excludes)",
+    )
+
     # Exclude paths from tracing (regex patterns)
-    observability_exclude_paths: List[str] = Field(default_factory=lambda: ["/health", "/healthz", "/ready", "/metrics", "/static/.*"], description="Paths to exclude from tracing (regex)")
+    observability_exclude_paths: List[str] = Field(
+        default_factory=lambda: ["/health", "/healthz", "/ready", "/metrics", "/static/.*"],
+        description="Regex patterns to exclude from tracing (applies after include patterns)",
+    )
 
     # Enable performance metrics
     observability_metrics_enabled: bool = Field(default=True, description="Enable metrics collection")
@@ -983,6 +1078,15 @@ class Settings(BaseSettings):
     metrics_aggregation_backfill_hours: int = Field(default=6, ge=0, le=168, description="Hours of structured logs to backfill into performance metrics on startup")
     metrics_aggregation_window_minutes: int = Field(default=5, description="Time window for metrics aggregation (minutes)")
     metrics_aggregation_auto_start: bool = Field(default=False, description="Automatically run the log aggregation loop on application startup")
+    yield_batch_size: int = Field(
+        default=1000,
+        ge=100,
+        le=100000,
+        description="Number of rows fetched per batch when streaming hourly metric data from the database. "
+        "Used to limit memory usage during aggregation and percentile calculations. "
+        "Smaller values reduce memory footprint but increase DB round-trips; larger values improve throughput "
+        "at the cost of higher memory usage.",
+    )
 
     # Execution Metrics Recording
     # Controls whether tool/resource/prompt/server/A2A execution metrics are written to the database.
@@ -999,7 +1103,7 @@ class Settings(BaseSettings):
 
     # Metrics Cache Configuration (for caching aggregate metrics queries)
     metrics_cache_enabled: bool = Field(default=True, description="Enable in-memory caching for aggregate metrics queries")
-    metrics_cache_ttl_seconds: int = Field(default=10, ge=1, le=300, description="TTL for cached aggregate metrics in seconds")
+    metrics_cache_ttl_seconds: int = Field(default=60, ge=1, le=300, description="TTL for cached aggregate metrics in seconds")
 
     # Metrics Cleanup Configuration (automatic deletion of old metrics)
     metrics_cleanup_enabled: bool = Field(default=True, description="Enable automatic cleanup of old metrics data")
@@ -1037,6 +1141,13 @@ class Settings(BaseSettings):
     registry_cache_gateways_ttl: int = Field(default=20, ge=5, le=300, description="TTL in seconds for gateways list cache")
     registry_cache_catalog_ttl: int = Field(default=300, ge=60, le=600, description="TTL in seconds for catalog servers list cache (external catalog, changes infrequently)")
 
+    # Tool Lookup Cache Configuration (reduces hot-path DB lookups in invoke_tool)
+    tool_lookup_cache_enabled: bool = Field(default=True, description="Enable tool lookup cache (tool name -> tool config)")
+    tool_lookup_cache_ttl_seconds: int = Field(default=60, ge=5, le=600, description="TTL in seconds for tool lookup cache entries")
+    tool_lookup_cache_negative_ttl_seconds: int = Field(default=10, ge=1, le=60, description="TTL in seconds for negative tool lookup cache entries")
+    tool_lookup_cache_l1_maxsize: int = Field(default=10000, ge=100, le=1000000, description="Max entries for in-memory tool lookup cache (L1)")
+    tool_lookup_cache_l2_enabled: bool = Field(default=True, description="Enable Redis-backed tool lookup cache (L2) when cache_type=redis")
+
     # Admin Stats Cache Configuration (reduces dashboard query overhead)
     admin_stats_cache_enabled: bool = Field(default=True, description="Enable caching for admin dashboard statistics")
     admin_stats_cache_system_ttl: int = Field(default=60, ge=10, le=300, description="TTL in seconds for system stats cache")
@@ -1044,6 +1155,10 @@ class Settings(BaseSettings):
     admin_stats_cache_tags_ttl: int = Field(default=120, ge=30, le=600, description="TTL in seconds for tags listing cache")
     admin_stats_cache_plugins_ttl: int = Field(default=120, ge=30, le=600, description="TTL in seconds for plugin stats cache")
     admin_stats_cache_performance_ttl: int = Field(default=60, ge=15, le=300, description="TTL in seconds for performance aggregates cache")
+
+    # Team Member Count Cache Configuration (reduces N+1 queries in admin UI)
+    team_member_count_cache_enabled: bool = Field(default=True, description="Enable Redis caching for team member counts")
+    team_member_count_cache_ttl: int = Field(default=300, ge=30, le=3600, description="TTL in seconds for team member count cache (default: 5 minutes)")
 
     # Log Search Configuration
     log_search_max_results: int = Field(default=1000, description="Maximum results per log search query")
@@ -1092,64 +1207,11 @@ class Settings(BaseSettings):
     sse_keepalive_enabled: bool = True  # Enable SSE keepalive events
     sse_keepalive_interval: int = 30  # seconds between keepalive events
 
-    # Federation
-    federation_enabled: bool = True
-    federation_discovery: bool = False
-
-    # For federation_peers strip out quotes to ensure we're passing valid JSON via env
-    federation_peers: List[HttpUrl] = Field(default_factory=list)
-
-    @field_validator("federation_peers", mode="before")
-    @classmethod
-    def _parse_federation_peers(cls, v: Any) -> List[str]:
-        """Parse federation peer URLs from environment variable or config value.
-
-        Handles multiple input formats for the federation_peers field:
-        - JSON array string: '["https://gw1.com", "https://gw2.com"]'
-        - Comma-separated string: "https://gw1.com, https://gw2.com"
-        - Already parsed list
-
-        Automatically strips whitespace and removes outer quotes if present.
-        Order is preserved when parsing.
-
-        Args:
-            v: The input value to parse. Can be a string (JSON or CSV), list, or other iterable.
-
-        Returns:
-            List[str]: A list of federation peer URLs.
-
-        Examples:
-            >>> Settings._parse_federation_peers('["https://gw1", "https://gw2"]')
-            ['https://gw1', 'https://gw2']
-            >>> Settings._parse_federation_peers("https://gw3, https://gw4")
-            ['https://gw3', 'https://gw4']
-            >>> Settings._parse_federation_peers('""')
-            []
-            >>> Settings._parse_federation_peers('"https://single-peer.com"')
-            ['https://single-peer.com']
-            >>> Settings._parse_federation_peers(['http://p1.com', 'http://p2.com'])
-            ['http://p1.com', 'http://p2.com']
-            >>> Settings._parse_federation_peers([])
-            []
-        """
-        if v is None:
-            return []  # always return a list
-
-        if isinstance(v, str):
-            v = v.strip()
-            if len(v) > 1 and v[0] in "\"'" and v[-1] == v[0]:
-                v = v[1:-1]
-            try:
-                peers = orjson.loads(v)
-            except orjson.JSONDecodeError:
-                peers = [s.strip() for s in v.split(",") if s.strip()]
-            return peers  # type: ignore[no-any-return]
-
-        # Convert other iterables to list
-        return list(v)
-
-    federation_timeout: int = 120  # seconds
-    federation_sync_interval: int = 300  # seconds
+    # Gateway/Server Connection Timeout
+    # Timeout in seconds for HTTP requests to registered gateways and MCP servers.
+    # Used by: GatewayService, ToolService, ServerService for health checks and tool invocations.
+    # Note: Previously part of federation settings, retained for gateway connectivity.
+    federation_timeout: int = 120
 
     # SSO
     # For sso_issuers strip out quotes to ensure we're passing valid JSON via env
@@ -1215,14 +1277,47 @@ class Settings(BaseSettings):
     tool_rate_limit: int = 100  # requests per minute
     tool_concurrent_limit: int = 10
 
+    # MCP Session Pool - reduces per-request latency from ~20ms to ~1-2ms
+    # Disabled by default for safety. Enable explicitly in production after testing.
+    mcp_session_pool_enabled: bool = False
+    mcp_session_pool_max_per_key: int = 10  # Max sessions per (URL, identity, transport)
+    mcp_session_pool_ttl: float = 300.0  # Session TTL in seconds
+    mcp_session_pool_health_check_interval: float = 60.0  # Idle time before health check (aligned with health_check_interval)
+    mcp_session_pool_acquire_timeout: float = 30.0  # Timeout waiting for session slot
+    mcp_session_pool_create_timeout: float = 30.0  # Timeout creating new session
+    mcp_session_pool_circuit_breaker_threshold: int = 5  # Failures before circuit opens
+    mcp_session_pool_circuit_breaker_reset: float = 60.0  # Seconds before circuit resets
+    mcp_session_pool_idle_eviction: float = 600.0  # Evict idle pool keys after this time
+    # Transport timeout for pooled sessions (default 30s to match MCP SDK default).
+    # This timeout applies to all HTTP operations (connect, read, write) on pooled sessions.
+    # Use a higher value for deployments with long-running tool calls.
+    mcp_session_pool_transport_timeout: float = 30.0
+    # Force explicit RPC (list_tools) on gateway health checks even when session is fresh.
+    # Off by default: pool's internal staleness check (idle > health_check_interval) handles this.
+    # Enable for stricter health verification at the cost of ~5ms latency per check.
+    mcp_session_pool_explicit_health_rpc: bool = False
+    # Configurable health check chain - ordered list of methods to try.
+    # Options: ping, list_tools, list_prompts, list_resources, skip
+    # Default: ping,skip - try lightweight ping, skip if unsupported (for legacy servers)
+    mcp_session_pool_health_check_methods: List[str] = ["ping", "skip"]
+    # Timeout in seconds for each health check attempt
+    mcp_session_pool_health_check_timeout: float = 5.0
+    mcp_session_pool_identity_headers: List[str] = [
+        "authorization",
+        "x-tenant-id",
+        "x-user-id",
+        "x-api-key",
+        "cookie",
+    ]
+
     # Prompts
     prompt_cache_size: int = 100
     max_prompt_size: int = 100 * 1024  # 100KB
     prompt_render_timeout: int = 10  # seconds
 
     # Health Checks
-    # Interval in seconds between health checks
-    health_check_interval: int = 300
+    # Interval in seconds between health checks (aligned with mcp_session_pool_health_check_interval)
+    health_check_interval: int = 60
     # Timeout in seconds for each health check request
     health_check_timeout: int = 5
     # Per-check timeout (seconds) to bound total time of one gateway health check
@@ -1232,6 +1327,14 @@ class Settings(BaseSettings):
     unhealthy_threshold: int = 3
     # Max concurrent health checks per worker
     max_concurrent_health_checks: int = 10
+
+    # Auto-refresh tools/resources/prompts from gateways during health checks
+    # When enabled, tools/resources/prompts are fetched and synced with DB during health checks
+    auto_refresh_servers: bool = Field(default=False, description="Enable automatic tool/resource/prompt refresh during gateway health checks")
+
+    # Per-gateway refresh configuration (used when auto_refresh_servers is True)
+    # Gateways can override this with their own refresh_interval_seconds
+    gateway_auto_refresh_interval: int = Field(default=300, ge=60, description="Default refresh interval in seconds for gateway tools/resources/prompts sync (minimum 60 seconds)")
 
     # Validation Gateway URL
     gateway_validation_timeout: int = 5  # seconds
@@ -1248,8 +1351,18 @@ class Settings(BaseSettings):
     db_max_overflow: int = 10
     db_pool_timeout: int = 30
     db_pool_recycle: int = 3600
-    db_max_retries: int = 3
-    db_retry_interval_ms: int = 2000
+    db_max_retries: int = 30  # Max attempts with exponential backoff (≈5 min total)
+    db_retry_interval_ms: int = 2000  # Base interval; doubles each attempt, ±25% jitter
+    db_max_backoff_seconds: int = 30  # Cap for exponential backoff (jitter applied after cap)
+
+    # Database Performance Optimization
+    use_postgresdb_percentiles: bool = Field(
+        default=True,
+        description="Use database-native percentile functions (percentile_cont) for performance metrics. "
+        "When enabled, PostgreSQL uses native SQL percentile calculations (5-10x faster). "
+        "When disabled or using SQLite, falls back to Python-based percentile calculations. "
+        "Recommended: true for PostgreSQL, auto-detected for SQLite.",
+    )
 
     # psycopg3-specific: Number of times a query must be executed before it's
     # prepared server-side. Set to 0 to disable, 1 to prepare immediately.
@@ -1280,8 +1393,9 @@ class Settings(BaseSettings):
     cache_prefix: str = "mcpgw:"
     session_ttl: int = 3600
     message_ttl: int = 600
-    redis_max_retries: int = 3
-    redis_retry_interval_ms: int = 2000
+    redis_max_retries: int = 30  # Max attempts with exponential backoff (≈5 min total)
+    redis_retry_interval_ms: int = 2000  # Base interval; doubles each attempt, ±25% jitter
+    redis_max_backoff_seconds: int = 30  # Cap for exponential backoff (jitter applied after cap)
 
     # GlobalConfig In-Memory Cache (Issue #1715)
     # Caches GlobalConfig (passthrough headers) to eliminate redundant DB queries
@@ -1459,6 +1573,7 @@ Disallow: /
         "sso_auto_admin_domains",
         "sso_github_admin_orgs",
         "sso_google_admin_domains",
+        "insecure_queryparam_auth_allowed_hosts",
         mode="before",
     )
     @classmethod
@@ -1744,6 +1859,15 @@ Disallow: /
     # Passthrough headers configuration
     default_passthrough_headers: List[str] = Field(default_factory=list)
 
+    # Passthrough headers source priority
+    # - "env": Environment variable always wins (ideal for Kubernetes/containerized deployments)
+    # - "db": Database take precedence if configured, env as fallback (default)
+    # - "merge": Union of both sources - env provides base, other configuration in DB can add more headers
+    passthrough_headers_source: Literal["env", "db", "merge"] = Field(
+        default="db",
+        description="Source priority for passthrough headers: env (environment always wins), db (database wins, default), merge (combine both)",
+    )
+
     # ===================================
     # Pagination Configuration
     # ===================================
@@ -1986,6 +2110,6 @@ settings = LazySettingsWrapper()
 if __name__ == "__main__":
     if "--schema" in sys.argv:
         schema = generate_settings_schema()
-        print(json.dumps(schema, indent=2))
+        print(orjson.dumps(schema, option=orjson.OPT_INDENT_2).decode())
         sys.exit(0)
     settings.log_summary()

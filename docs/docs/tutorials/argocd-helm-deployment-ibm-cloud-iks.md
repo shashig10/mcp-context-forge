@@ -107,7 +107,7 @@ podman build -t mcp-context-forge:dev -f Containerfile .
 !!! note "Production deployments"
     Production deployments can pull the signed image directly:
     ```
-    ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
+    ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-2
     ```
 
 ---
@@ -416,9 +416,6 @@ mcpContextForge:
 
     - name: CACHE_TYPE
       value: "redis"
-
-    - name: FEDERATION_ENABLED
-      value: "true"
 
   # Resource limits
   resources:

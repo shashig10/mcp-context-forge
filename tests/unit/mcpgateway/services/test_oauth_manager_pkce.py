@@ -252,31 +252,22 @@ class TestExchangeCodeForTokensWithPKCE:
 
         mock_response = {"access_token": "access-token-123", "token_type": "Bearer", "expires_in": 3600}
 
-        with patch("aiohttp.ClientSession") as mock_session_class:
-            # Create mock response
-            mock_response_obj = AsyncMock()
-            mock_response_obj.status = 200
-            mock_response_obj.json = AsyncMock(return_value=mock_response)
-            mock_response_obj.raise_for_status = MagicMock()
-            mock_response_obj.headers = {"content-type": "application/json"}
+        # Create mock response
+        mock_response_obj = MagicMock()
+        mock_response_obj.status_code = 200
+        mock_response_obj.json = MagicMock(return_value=mock_response)
+        mock_response_obj.raise_for_status = MagicMock()
+        mock_response_obj.headers = {"content-type": "application/json"}
 
-            # Create mock post that returns the response
-            mock_post = MagicMock(return_value=mock_response_obj)
-            mock_post.return_value.__aenter__ = AsyncMock(return_value=mock_response_obj)
-            mock_post.return_value.__aexit__ = AsyncMock(return_value=None)
+        # Create mock client
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response_obj)
 
-            # Create mock session
-            mock_session = MagicMock()
-            mock_session.post = mock_post
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-
-            mock_session_class.return_value = mock_session
-
+        with patch.object(manager, "_get_client", return_value=mock_client):
             result = await manager._exchange_code_for_tokens(credentials, code, code_verifier=code_verifier)
 
         # Verify code_verifier was included in request
-        call_kwargs = mock_post.call_args[1]
+        call_kwargs = mock_client.post.call_args[1]
         assert call_kwargs["data"]["code_verifier"] == code_verifier
 
     @pytest.mark.asyncio
@@ -289,27 +280,18 @@ class TestExchangeCodeForTokensWithPKCE:
 
         mock_response = {"access_token": "access-token-123", "token_type": "Bearer", "expires_in": 3600}
 
-        with patch("aiohttp.ClientSession") as mock_session_class:
-            # Create mock response
-            mock_response_obj = AsyncMock()
-            mock_response_obj.status = 200
-            mock_response_obj.json = AsyncMock(return_value=mock_response)
-            mock_response_obj.raise_for_status = MagicMock()
-            mock_response_obj.headers = {"content-type": "application/json"}
+        # Create mock response
+        mock_response_obj = MagicMock()
+        mock_response_obj.status_code = 200
+        mock_response_obj.json = MagicMock(return_value=mock_response)
+        mock_response_obj.raise_for_status = MagicMock()
+        mock_response_obj.headers = {"content-type": "application/json"}
 
-            # Create mock post that returns the response
-            mock_post = MagicMock(return_value=mock_response_obj)
-            mock_post.return_value.__aenter__ = AsyncMock(return_value=mock_response_obj)
-            mock_post.return_value.__aexit__ = AsyncMock(return_value=None)
+        # Create mock client
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response_obj)
 
-            # Create mock session
-            mock_session = MagicMock()
-            mock_session.post = mock_post
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-
-            mock_session_class.return_value = mock_session
-
+        with patch.object(manager, "_get_client", return_value=mock_client):
             # Should not raise error
             result = await manager._exchange_code_for_tokens(credentials, code)
 
@@ -434,6 +416,82 @@ class TestPKCESecurityProperties:
 
         # Challenge should be shorter (SHA256 hash is 32 bytes = 43 chars base64url)
         assert len(pkce["code_challenge"]) == 43  # SHA256 base64url without padding
+
+
+class TestRFC8707MultipleResources:
+    """Test RFC 8707 multiple resource parameter support."""
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_with_list_resource_sends_multiple_params(self):
+        """Test that list resources are sent as multiple form parameters."""
+        manager = OAuthManager()
+
+        credentials = {
+            "client_id": "test_client",
+            "client_secret": "test_secret",
+            "redirect_uri": "https://gateway.example.com/callback",
+            "token_url": "https://oauth.example.com/token",
+            "resource": ["https://api1.example.com", "https://api2.example.com"],
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.json = MagicMock(return_value={"access_token": "test_token", "token_type": "Bearer"})
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch.object(manager, "_get_client", return_value=mock_client):
+            await manager._exchange_code_for_tokens(credentials, "auth_code", "code_verifier")
+
+            # Verify the request was made
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+
+            # When resource is a list, data should be list of tuples
+            form_data = call_args[1]["data"]
+            assert isinstance(form_data, list), "Form data should be list of tuples for multiple resources"
+
+            # Count resource entries
+            resource_entries = [entry for entry in form_data if entry[0] == "resource"]
+            assert len(resource_entries) == 2, "Should have two resource parameters"
+            assert ("resource", "https://api1.example.com") in form_data
+            assert ("resource", "https://api2.example.com") in form_data
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_with_list_resource_sends_multiple_params(self):
+        """Test that list resources in refresh are sent as multiple form parameters."""
+        manager = OAuthManager()
+
+        credentials = {
+            "client_id": "test_client",
+            "client_secret": "test_secret",
+            "token_url": "https://oauth.example.com/token",
+            "resource": ["https://api1.example.com", "https://api2.example.com"],
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json = MagicMock(return_value={"access_token": "new_token", "expires_in": 3600})
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch.object(manager, "_get_client", return_value=mock_client):
+            await manager.refresh_token("refresh_token", credentials)
+
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+
+            # When resource is a list, data should be list of tuples
+            form_data = call_args[1]["data"]
+            assert isinstance(form_data, list), "Form data should be list of tuples for multiple resources"
+
+            # Count resource entries
+            resource_entries = [entry for entry in form_data if entry[0] == "resource"]
+            assert len(resource_entries) == 2, "Should have two resource parameters"
 
 
 if __name__ == "__main__":

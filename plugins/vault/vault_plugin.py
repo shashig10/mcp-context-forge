@@ -13,15 +13,16 @@ Hook: tool_pre_invoke
 
 # Standard
 from enum import Enum
-import json
 from urllib.parse import urlparse
 
 # Third-Party
+import orjson
 from pydantic import BaseModel
 
 # First-Party
 from mcpgateway.db import get_db
 from mcpgateway.plugins.framework import (
+    get_attr,
     HttpHeaderPayload,
     Plugin,
     PluginConfig,
@@ -122,14 +123,15 @@ class Vault(Plugin):
         logger.debug(f"Processing tool pre-invoke for tool {payload}  with context {context}")
         logger.debug(f"Gateway metadata {context.global_context.metadata['gateway']}")
 
-        gateway_metadata = context.global_context.metadata["gateway"]
+        gateway_metadata = context.global_context.metadata.get("gateway")
 
         system_key: str | None = None
         auth_header: str | None = None
         if self._sconfig.system_handling == SystemHandling.TAG:
             # Extract tags from dict format {"id": "...", "label": "..."}
             normalized_tags: list[str] = []
-            for tag in gateway_metadata.tags:
+            gateway_tags = get_attr(gateway_metadata, "tags", [])
+            for tag in gateway_tags if gateway_tags else []:
                 if isinstance(tag, dict):
                     # Use 'label' field (the actual tag value)
                     tag_value = str(tag.get("label", ""))
@@ -180,8 +182,8 @@ class Vault(Plugin):
             return ToolPreInvokeResult()
 
         try:
-            vault_tokens: dict[str, str] = json.loads(headers[self._sconfig.vault_header_name])
-        except (json.JSONDecodeError, TypeError) as e:
+            vault_tokens: dict[str, str] = orjson.loads(headers[self._sconfig.vault_header_name])
+        except (orjson.JSONDecodeError, TypeError) as e:
             logger.error(f"Failed to parse vault tokens from header: {e}")
             return ToolPreInvokeResult()
 

@@ -8,10 +8,12 @@ Basic tests for Email Authentication Service functionality.
 """
 
 # Standard
+import base64
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Third-Party
+import orjson
 import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -649,6 +651,26 @@ class TestEmailAuthServiceUserManagement:
         mock_db.commit.assert_called()
 
     @pytest.mark.asyncio
+    async def test_change_password_clears_password_change_required_flag(self, service, mock_db, mock_user, mock_password_service):
+        """Test that password change clears password_change_required flag (regression test for #1842)."""
+        service.password_service = mock_password_service
+        mock_db.execute.return_value.scalar_one_or_none.return_value = mock_user
+
+        # User initially has password_change_required = True
+        mock_user.password_change_required = True
+
+        # Make verify return True for old password, False for new (different)
+        mock_password_service.verify_password.side_effect = [True, False]
+        mock_password_service.hash_password.return_value = "new_hashed_password"
+
+        result = await service.change_password(email="test@example.com", old_password="old_password", new_password="NewSecurePass123!", ip_address="192.168.1.1")
+
+        assert result is True
+        # Verify the flag was cleared - this is the key assertion for #1842
+        assert mock_user.password_change_required is False
+        mock_db.commit.assert_called()
+
+    @pytest.mark.asyncio
     async def test_change_password_wrong_old_password(self, service, mock_db, mock_user, mock_password_service):
         """Test password change with incorrect old password."""
         service.password_service = mock_password_service
@@ -826,10 +848,10 @@ class TestEmailAuthServiceUserListing:
         mock_result.scalars.return_value.all.return_value = mock_users[:3]  # Return first 3
         mock_db.execute.return_value = mock_result
 
-        result = await service.list_users(limit=3, offset=0)
+        result = await service.list_users(cursor=None, limit=3)
 
-        assert len(result) == 3
-        assert result[0].email == "user0@example.com"
+        assert len(result.data) == 3
+        assert result.data[0].email == "user0@example.com"
         mock_db.execute.assert_called_once()
 
     @pytest.mark.asyncio
@@ -839,19 +861,93 @@ class TestEmailAuthServiceUserListing:
 
         result = await service.list_users()
 
-        assert result == []
+        assert result.data == []
 
     @pytest.mark.asyncio
-    async def test_get_all_users(self, service, mock_db, mock_users):
-        """Test getting all users without explicit pagination."""
+    async def test_list_users_generates_cursor_using_email(self, service, mock_db, mock_users):
+        """Test that list_users generates cursor using (created_at, email) keyset."""
+        # Create mock users with created_at timestamps
+        users_with_timestamps = []
+        for i, user in enumerate(mock_users[:3]):
+            user.created_at = datetime(2024, 1, 15, 10, 0, i, tzinfo=timezone.utc)
+            users_with_timestamps.append(user)
+
+        # Return 4 items to trigger has_more (limit=3 + 1)
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = users_with_timestamps + [mock_users[3]]
+        mock_db.execute.return_value = mock_result
+
+        result = await service.list_users(cursor=None, limit=3)
+
+        # Should return 3 items and a next_cursor
+        assert len(result.data) == 3
+        assert result.next_cursor is not None
+
+        # Decode and verify cursor uses (created_at, email)
+        cursor_json = base64.urlsafe_b64decode(result.next_cursor.encode()).decode()
+        cursor_data = orjson.loads(cursor_json)
+        assert "created_at" in cursor_data
+        assert "email" in cursor_data
+        assert cursor_data["email"] == mock_users[2].email  # Last item's email
+
+    @pytest.mark.asyncio
+    async def test_list_users_with_cursor_applies_keyset_filter(self, service, mock_db, mock_users):
+        """Test that list_users with cursor applies correct keyset filter."""
+        # Create a cursor for the second page
+        cursor_data = {
+            "created_at": "2024-01-15T10:00:02+00:00",
+            "email": "user2@example.com",
+        }
+        cursor = base64.urlsafe_b64encode(orjson.dumps(cursor_data)).decode()
+
+        # Mock the result
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = mock_users[3:]  # Remaining users
+        mock_db.execute.return_value = mock_result
+
+        result = await service.list_users(cursor=cursor, limit=10)
+
+        # Verify that execute was called (the filter is applied internally)
+        mock_db.execute.assert_called_once()
+        # Result should contain remaining users
+        assert len(result.data) == 2
+
+    @pytest.mark.asyncio
+    async def test_list_users_cursor_handles_invalid_cursor(self, service, mock_db, mock_users):
+        """Test that list_users handles invalid cursor gracefully."""
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = mock_users
         mock_db.execute.return_value = mock_result
 
+        # Invalid base64 cursor should be ignored
+        result = await service.list_users(cursor="invalid-cursor", limit=10)
+
+        # Should still return results (cursor ignored)
+        assert len(result.data) == 5
+
+    @pytest.mark.asyncio
+    async def test_get_all_users(self, service, mock_db, mock_users):
+        """Test getting all users without explicit pagination."""
+        mock_count_result = MagicMock()
+        mock_count_result.scalar.return_value = len(mock_users)
+        mock_list_result = MagicMock()
+        mock_list_result.scalars.return_value.all.return_value = mock_users
+        mock_db.execute.side_effect = [mock_count_result, mock_list_result]
+
         result = await service.get_all_users()
 
         assert len(result) == 5
-        mock_db.execute.assert_called_once()
+        assert mock_db.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_all_users_raises_when_exceeds_limit(self, service, mock_db):
+        """Test get_all_users raises when total exceeds limit."""
+        mock_count_result = MagicMock()
+        mock_count_result.scalar.return_value = 10001
+        mock_db.execute.return_value = mock_count_result
+
+        with pytest.raises(ValueError):
+            await service.get_all_users()
 
     @pytest.mark.asyncio
     async def test_count_users_success(self, service, mock_db, mock_users):

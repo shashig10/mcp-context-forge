@@ -49,7 +49,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import JSONRPCMessage
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
-from starlette.status import HTTP_401_UNAUTHORIZED
+from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 from starlette.types import Receive, Scope, Send
 
 # First-Party
@@ -478,10 +478,46 @@ async def call_tool(name: str, arguments: dict) -> List[Union[types.TextContent,
         typing.List[typing.Union[mcp.types.TextContent, mcp.types.ImageContent, mcp.types.EmbeddedResource]]
     """
     request_headers = request_headers_var.get()
-    app_user_email = get_user_email_from_context()
+    server_id = server_id_var.get()
+    user_context = user_context_var.get()
+
+    meta_data = None
+    # Extract _meta from request context if available
+    try:
+        ctx = mcp_app.request_context
+        if ctx and ctx.meta is not None:
+            meta_data = ctx.meta.model_dump()
+    except LookupError:
+        # request_context might not be active in some edge cases (e.g. tests)
+        logger.debug("No active request context found")
+
+    # Extract authorization parameters from user context (same pattern as list_tools)
+    user_email = user_context.get("email") if user_context else None
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    app_user_email = get_user_email_from_context()  # Keep for OAuth token selection
     try:
         async with get_db() as db:
-            result = await tool_service.invoke_tool(db=db, name=name, arguments=arguments, request_headers=request_headers, app_user_email=app_user_email)
+            result = await tool_service.invoke_tool(
+                db=db,
+                name=name,
+                arguments=arguments,
+                request_headers=request_headers,
+                app_user_email=app_user_email,
+                user_email=user_email,
+                token_teams=token_teams,
+                server_id=server_id,
+                meta_data=meta_data,
+            )
             if not result or not result.content:
                 logger.warning(f"No content returned by tool: {name}")
                 return []
@@ -536,11 +572,26 @@ async def list_tools() -> List[types.Tool]:
     """
     server_id = server_id_var.get()
     request_headers = request_headers_var.get()
+    user_context = user_context_var.get()
+
+    # Extract filtering parameters from user context
+    user_email = user_context.get("email") if user_context else None
+    # Use None as default to distinguish "no teams specified" from "empty teams array"
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
 
     if server_id:
         try:
             async with get_db() as db:
-                tools = await tool_service.list_server_tools(db, server_id, _request_headers=request_headers)
+                tools = await tool_service.list_server_tools(db, server_id, user_email=user_email, token_teams=token_teams, _request_headers=request_headers)
                 return [types.Tool(name=tool.name, description=tool.description, inputSchema=tool.input_schema, outputSchema=tool.output_schema, annotations=tool.annotations) for tool in tools]
         except Exception as e:
             logger.exception(f"Error listing tools:{e}")
@@ -548,7 +599,7 @@ async def list_tools() -> List[types.Tool]:
     else:
         try:
             async with get_db() as db:
-                tools, _ = await tool_service.list_tools(db, False, None, None, request_headers)
+                tools, _ = await tool_service.list_tools(db, include_inactive=False, limit=0, user_email=user_email, token_teams=token_teams, _request_headers=request_headers)
                 return [types.Tool(name=tool.name, description=tool.description, inputSchema=tool.input_schema, outputSchema=tool.output_schema, annotations=tool.annotations) for tool in tools]
         except Exception as e:
             logger.exception(f"Error listing tools:{e}")
@@ -572,13 +623,27 @@ async def list_prompts() -> List[types.Prompt]:
         >>> sig.return_annotation
         typing.List[mcp.types.Prompt]
     """
-
     server_id = server_id_var.get()
+    user_context = user_context_var.get()
+
+    # Extract filtering parameters from user context
+    user_email = user_context.get("email") if user_context else None
+    # Use None as default to distinguish "no teams specified" from "empty teams array"
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
 
     if server_id:
         try:
             async with get_db() as db:
-                prompts = await prompt_service.list_server_prompts(db, server_id)
+                prompts = await prompt_service.list_server_prompts(db, server_id, user_email=user_email, token_teams=token_teams)
                 return [types.Prompt(name=prompt.name, description=prompt.description, arguments=prompt.arguments) for prompt in prompts]
         except Exception as e:
             logger.exception(f"Error listing Prompts:{e}")
@@ -586,7 +651,7 @@ async def list_prompts() -> List[types.Prompt]:
     else:
         try:
             async with get_db() as db:
-                prompts, _ = await prompt_service.list_prompts(db, False, None, None)
+                prompts, _ = await prompt_service.list_prompts(db, include_inactive=False, limit=0, user_email=user_email, token_teams=token_teams)
                 return [types.Prompt(name=prompt.name, description=prompt.description, arguments=prompt.arguments) for prompt in prompts]
         except Exception as e:
             logger.exception(f"Error listing prompts:{e}")
@@ -616,10 +681,43 @@ async def get_prompt(prompt_id: str, arguments: dict[str, str] | None = None) ->
         >>> sig.return_annotation.__name__
         'GetPromptResult'
     """
+    server_id = server_id_var.get()
+    user_context = user_context_var.get()
+
+    # Extract authorization parameters from user context (same pattern as list_prompts)
+    user_email = user_context.get("email") if user_context else None
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    meta_data = None
+    # Extract _meta from request context if available
+    try:
+        ctx = mcp_app.request_context
+        if ctx and ctx.meta is not None:
+            meta_data = ctx.meta.model_dump()
+    except LookupError:
+        # request_context might not be active in some edge cases (e.g. tests)
+        logger.debug("No active request context found")
+
     try:
         async with get_db() as db:
             try:
-                result = await prompt_service.get_prompt(db=db, prompt_id=prompt_id, arguments=arguments)
+                result = await prompt_service.get_prompt(
+                    db=db,
+                    prompt_id=prompt_id,
+                    arguments=arguments,
+                    user=user_email,
+                    server_id=server_id,
+                    token_teams=token_teams,
+                    _meta_data=meta_data,
+                )
             except Exception as e:
                 logger.exception(f"Error getting prompt '{prompt_id}': {e}")
                 return []
@@ -650,13 +748,27 @@ async def list_resources() -> List[types.Resource]:
         >>> sig.return_annotation
         typing.List[mcp.types.Resource]
     """
-
     server_id = server_id_var.get()
+    user_context = user_context_var.get()
+
+    # Extract filtering parameters from user context
+    user_email = user_context.get("email") if user_context else None
+    # Use None as default to distinguish "no teams specified" from "empty teams array"
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
 
     if server_id:
         try:
             async with get_db() as db:
-                resources = await resource_service.list_server_resources(db, server_id)
+                resources = await resource_service.list_server_resources(db, server_id, user_email=user_email, token_teams=token_teams)
                 return [types.Resource(uri=resource.uri, name=resource.name, description=resource.description, mimeType=resource.mime_type) for resource in resources]
         except Exception as e:
             logger.exception(f"Error listing Resources:{e}")
@@ -664,7 +776,7 @@ async def list_resources() -> List[types.Resource]:
     else:
         try:
             async with get_db() as db:
-                resources, _ = await resource_service.list_resources(db, False)
+                resources, _ = await resource_service.list_resources(db, include_inactive=False, limit=0, user_email=user_email, token_teams=token_teams)
                 return [types.Resource(uri=resource.uri, name=resource.name, description=resource.description, mimeType=resource.mime_type) for resource in resources]
         except Exception as e:
             logger.exception(f"Error listing resources:{e}")
@@ -693,10 +805,42 @@ async def read_resource(resource_uri: str) -> Union[str, bytes]:
         >>> sig.return_annotation
         typing.Union[str, bytes]
     """
+    server_id = server_id_var.get()
+    user_context = user_context_var.get()
+
+    # Extract authorization parameters from user context (same pattern as list_resources)
+    user_email = user_context.get("email") if user_context else None
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    meta_data = None
+    # Extract _meta from request context if available
+    try:
+        ctx = mcp_app.request_context
+        if ctx and ctx.meta is not None:
+            meta_data = ctx.meta.model_dump()
+    except LookupError:
+        # request_context might not be active in some edge cases (e.g. tests)
+        logger.debug("No active request context found")
+
     try:
         async with get_db() as db:
             try:
-                result = await resource_service.read_resource(db=db, resource_uri=str(resource_uri))
+                result = await resource_service.read_resource(
+                    db=db,
+                    resource_uri=str(resource_uri),
+                    user=user_email,
+                    server_id=server_id,
+                    token_teams=token_teams,
+                    meta_data=meta_data,
+                )
             except Exception as e:
                 logger.exception(f"Error reading resource '{resource_uri}': {e}")
                 return ""
@@ -733,10 +877,28 @@ async def list_resource_templates() -> List[Dict[str, Any]]:
         >>> sig.return_annotation.__origin__.__name__
         'list'
     """
+    # Extract filtering parameters from user context (same pattern as list_resources)
+    user_context = user_context_var.get()
+    user_email = user_context.get("email") if user_context else None
+    token_teams = user_context.get("teams") if user_context else None
+    is_admin = user_context.get("is_admin", False) if user_context else False
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        # token_teams stays None (unrestricted)
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
     try:
         async with get_db() as db:
             try:
-                resource_templates = await resource_service.list_resource_templates(db)
+                resource_templates = await resource_service.list_resource_templates(
+                    db,
+                    user_email=user_email,
+                    token_teams=token_teams,
+                )
                 return [template.model_dump(by_alias=True) for template in resource_templates]
             except Exception as e:
                 logger.exception(f"Error listing resource templates: {e}")
@@ -998,9 +1160,13 @@ async def streamable_http_auth(scope: Any, receive: Any, send: Any) -> bool:
 
     Behavior:
     - If the path does not end with "/mcp", authentication is skipped.
-    - If there is no Authorization header, the request is allowed.
+    - If mcp_require_auth=True (strict mode):
+      - Requests without valid auth are rejected with 401.
+    - If mcp_require_auth=False (default, permissive mode):
+      - Requests without auth are allowed but get public-only access (token_teams=[]).
+      - Valid tokens get full scoped access based on their teams.
     - If a Bearer token is present, it is verified using `verify_credentials`.
-    - If verification fails, a 401 Unauthorized JSON response is sent.
+    - If verification fails and mcp_require_auth=True, a 401 Unauthorized JSON response is sent.
 
     Args:
         scope: The ASGI scope dictionary, which includes request metadata.
@@ -1022,13 +1188,20 @@ async def streamable_http_auth(scope: Any, receive: Any, send: Any) -> bool:
         >>> list(sig.parameters.keys())
         ['scope', 'receive', 'send']
     """
-
     path = scope.get("path", "")
     if not path.endswith("/mcp") and not path.endswith("/mcp/"):
         # No auth needed for other paths in this middleware usage
         return True
 
     headers = Headers(scope=scope)
+
+    # CORS preflight (OPTIONS + Origin + Access-Control-Request-Method) cannot carry auth headers
+    method = scope.get("method", "")
+    if method == "OPTIONS":
+        origin = headers.get("origin")
+        if origin and headers.get("access-control-request-method"):
+            return True
+
     authorization = headers.get("authorization")
     proxy_user = headers.get(settings.proxy_user_header) if settings.trust_proxy_auth else None
 
@@ -1036,8 +1209,15 @@ async def streamable_http_auth(scope: Any, receive: Any, send: Any) -> bool:
     if not settings.mcp_client_auth_enabled and settings.trust_proxy_auth:
         # Client auth disabled → allow proxy header
         if proxy_user:
-            # Set user context for proxy-authenticated sessions
-            user_context_var.set({"email": proxy_user})
+            # Set enriched user context for proxy-authenticated sessions
+            user_context_var.set(
+                {
+                    "email": proxy_user,
+                    "teams": [],  # Proxy auth has no team context
+                    "is_authenticated": True,
+                    "is_admin": False,
+                }
+            )
             return True  # Trusted proxy supplied user
 
     # --- Standard JWT authentication flow (client auth enabled) ---
@@ -1049,26 +1229,145 @@ async def streamable_http_auth(scope: Any, receive: Any, send: Any) -> bool:
 
     try:
         if token is None:
-            raise Exception()
+            raise Exception("No token provided")
         user_payload = await verify_credentials(token)
-        # Store user context for later use in tool invocations
+        # Store enriched user context with normalized teams
         if isinstance(user_payload, dict):
-            user_context_var.set(user_payload)
+            # Check if "teams" key exists and is not None to distinguish:
+            # - Key exists with non-None value (even empty []) -> normalized list (scoped token)
+            # - Key absent OR key is None -> None (unrestricted for admin, public-only for non-admin)
+            teams_value = user_payload.get("teams") if "teams" in user_payload else None
+            if teams_value is not None:
+                normalized_teams = []
+                for team in teams_value or []:
+                    if isinstance(team, dict):
+                        team_id = team.get("id")
+                        if team_id:
+                            normalized_teams.append(team_id)
+                    elif isinstance(team, str):
+                        normalized_teams.append(team)
+                final_teams = normalized_teams
+            else:
+                # No "teams" key or teams is null - treat as unrestricted (None)
+                final_teams = None
+
+            # ═══════════════════════════════════════════════════════════════════════════
+            # SECURITY: Validate team membership for team-scoped tokens
+            # Users removed from a team should lose MCP access immediately, not at token expiry
+            # ═══════════════════════════════════════════════════════════════════════════
+            user_email = user_payload.get("sub") or user_payload.get("email")
+            is_admin = user_payload.get("is_admin", False) or user_payload.get("user", {}).get("is_admin", False)
+
+            # Only validate membership for team-scoped tokens (non-empty teams list)
+            # Skip for: public-only tokens ([]), admin unrestricted tokens (None)
+            if final_teams and len(final_teams) > 0 and user_email:
+                # Import lazily to avoid circular imports
+                # First-Party
+                from mcpgateway.cache.auth_cache import get_auth_cache  # pylint: disable=import-outside-toplevel
+                from mcpgateway.db import EmailTeamMember  # pylint: disable=import-outside-toplevel
+
+                auth_cache = get_auth_cache()
+
+                # Check cache first (60s TTL)
+                cached_result = auth_cache.get_team_membership_valid_sync(user_email, final_teams)
+                if cached_result is False:
+                    logger.warning(f"MCP auth rejected: User {user_email} no longer member of teams (cached)")
+                    response = ORJSONResponse(
+                        {"detail": "Token invalid: User is no longer a member of the associated team"},
+                        status_code=HTTP_403_FORBIDDEN,
+                    )
+                    await response(scope, receive, send)
+                    return False
+
+                if cached_result is None:
+                    # Cache miss - query database
+                    # Third-Party
+                    from sqlalchemy import select  # pylint: disable=import-outside-toplevel
+
+                    db = SessionLocal()
+                    try:
+                        memberships = (
+                            db.execute(
+                                select(EmailTeamMember.team_id).where(
+                                    EmailTeamMember.team_id.in_(final_teams),
+                                    EmailTeamMember.user_email == user_email,
+                                    EmailTeamMember.is_active.is_(True),
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+
+                        valid_team_ids = set(memberships)
+                        missing_teams = set(final_teams) - valid_team_ids
+
+                        if missing_teams:
+                            logger.warning(f"MCP auth rejected: User {user_email} no longer member of teams: {missing_teams}")
+                            auth_cache.set_team_membership_valid_sync(user_email, final_teams, False)
+                            response = ORJSONResponse(
+                                {"detail": "Token invalid: User is no longer a member of the associated team"},
+                                status_code=HTTP_403_FORBIDDEN,
+                            )
+                            await response(scope, receive, send)
+                            return False
+
+                        # Cache positive result
+                        auth_cache.set_team_membership_valid_sync(user_email, final_teams, True)
+                    finally:
+                        db.close()
+
+            user_context_var.set(
+                {
+                    "email": user_email,
+                    "teams": final_teams,
+                    "is_authenticated": True,
+                    "is_admin": is_admin,
+                }
+            )
         elif proxy_user:
             # If using proxy auth, store the proxy user
-            user_context_var.set({"email": proxy_user})
+            user_context_var.set(
+                {
+                    "email": proxy_user,
+                    "teams": [],
+                    "is_authenticated": True,
+                    "is_admin": False,
+                }
+            )
     except Exception:
         # If JWT auth fails but we have a trusted proxy user, use that
         if settings.trust_proxy_auth and proxy_user:
-            user_context_var.set({"email": proxy_user})
+            user_context_var.set(
+                {
+                    "email": proxy_user,
+                    "teams": [],
+                    "is_authenticated": True,
+                    "is_admin": False,
+                }
+            )
             return True  # Fall back to proxy authentication
 
-        response = ORJSONResponse(
-            {"detail": "Authentication failed"},
-            status_code=HTTP_401_UNAUTHORIZED,
-            headers={"WWW-Authenticate": "Bearer"},
+        # Check mcp_require_auth setting to determine behavior
+        if settings.mcp_require_auth:
+            # Strict mode: require authentication, return 401 for unauthenticated requests
+            response = ORJSONResponse(
+                {"detail": "Authentication required for MCP endpoints"},
+                status_code=HTTP_401_UNAUTHORIZED,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return False
+
+        # Permissive mode (default): allow unauthenticated access with public-only scope
+        # Set context indicating unauthenticated user with public-only access (teams=[])
+        user_context_var.set(
+            {
+                "email": None,
+                "teams": [],  # Empty list = public-only access
+                "is_authenticated": False,
+                "is_admin": False,
+            }
         )
-        await response(scope, receive, send)
-        return False
+        return True  # Allow request to proceed with public-only access
 
     return True

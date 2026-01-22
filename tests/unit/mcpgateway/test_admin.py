@@ -67,12 +67,12 @@ from mcpgateway.admin import (  # admin_get_metrics,
     admin_stream_logs,
     admin_test_a2a_agent,
     admin_test_gateway,
-    admin_toggle_a2a_agent,
-    admin_toggle_gateway,
-    admin_toggle_prompt,
-    admin_toggle_resource,
-    admin_toggle_server,
-    admin_toggle_tool,
+    admin_set_a2a_agent_state,
+    admin_set_gateway_state,
+    admin_set_prompt_state,
+    admin_set_resource_state,
+    admin_set_server_state,
+    admin_set_tool_state,
     admin_ui,
     get_aggregated_metrics,
     get_global_passthrough_headers,
@@ -245,11 +245,9 @@ class TestAdminServerRoutes:
         mock_server_active.model_dump.return_value = {"id": 1, "name": "Active Server", "is_active": True, "associated_tools": ["tool1", "tool2"], "metrics": {"total_executions": 50}}
 
         # Mock server_service.list_servers to return paginated response
-        mock_server_service.list_servers = AsyncMock(return_value={
-            "data": [mock_server_active],
-            "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False),
-            "links": None
-        })
+        mock_server_service.list_servers = AsyncMock(
+            return_value={"data": [mock_server_active], "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False), "links": None}
+        )
 
         # Test with include_inactive=False
         result = await admin_list_servers(page=1, per_page=50, include_inactive=False, db=mock_db, user="test-user")
@@ -332,16 +330,215 @@ class TestAdminServerRoutes:
         assert isinstance(result, JSONResponse)
         assert result.status_code in (200, 409, 422, 500)
 
-    @patch.object(ServerService, "toggle_server_status")
-    async def test_admin_toggle_server_with_exception(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling server status with exception handling."""
+    @patch.object(ServerService, "update_server")
+    async def test_admin_edit_server_enable_oauth(self, mock_update_server, mock_request, mock_db):
+        """Test enabling OAuth configuration when editing a server."""
+        server_id = "00000000-0000-0000-0000-000000000001"
+        # Setup form data with OAuth enabled
+        form_data = FakeForm(
+            {
+                "id": server_id,
+                "name": "OAuth_Server",
+                "description": "Server with OAuth",
+                "oauth_enabled": "on",
+                "oauth_authorization_server": "https://idp.example.com",
+                "oauth_scopes": "openid profile email",
+                "oauth_token_endpoint": "https://idp.example.com/oauth/token",
+                "visibility": "public",
+                "associatedTools": [],
+                "associatedResources": [],
+                "associatedPrompts": [],
+            }
+        )
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        # Mock successful update
+        mock_server_read = MagicMock()
+        mock_server_read.model_dump.return_value = {
+            "id": server_id,
+            "name": "OAuth_Server",
+            "oauth_enabled": True,
+            "oauth_config": {
+                "authorization_servers": ["https://idp.example.com"],
+                "scopes_supported": ["openid", "profile", "email"],
+                "token_endpoint": "https://idp.example.com/oauth/token",
+            },
+        }
+        mock_update_server.return_value = mock_server_read
+
+        result = await admin_edit_server(server_id, mock_request, mock_db, "test-user")
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+
+        # Verify update_server was called with OAuth config
+        mock_update_server.assert_called_once()
+        call_args = mock_update_server.call_args
+        server_update = call_args[0][2]  # Third positional arg is the ServerUpdate
+        assert server_update.oauth_enabled is True
+        assert server_update.oauth_config is not None
+        assert "authorization_servers" in server_update.oauth_config
+        assert server_update.oauth_config["authorization_servers"] == ["https://idp.example.com"]
+        assert server_update.oauth_config["scopes_supported"] == ["openid", "profile", "email"]
+
+    @patch.object(ServerService, "update_server")
+    async def test_admin_edit_server_disable_oauth(self, mock_update_server, mock_request, mock_db):
+        """Test disabling OAuth configuration when editing a server."""
+        server_id = "00000000-0000-0000-0000-000000000002"
+        # Setup form data with OAuth disabled (checkbox not checked = not in form)
+        form_data = FakeForm(
+            {
+                "id": server_id,
+                "name": "OAuth_Disabled_Server",
+                "description": "Server with OAuth disabled",
+                # oauth_enabled is NOT present (checkbox unchecked)
+                "visibility": "public",
+                "associatedTools": [],
+                "associatedResources": [],
+                "associatedPrompts": [],
+            }
+        )
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        # Mock successful update
+        mock_server_read = MagicMock()
+        mock_server_read.model_dump.return_value = {
+            "id": server_id,
+            "name": "OAuth_Disabled_Server",
+            "oauth_enabled": False,
+            "oauth_config": None,
+        }
+        mock_update_server.return_value = mock_server_read
+
+        result = await admin_edit_server(server_id, mock_request, mock_db, "test-user")
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+
+        # Verify update_server was called with OAuth disabled
+        mock_update_server.assert_called_once()
+        call_args = mock_update_server.call_args
+        server_update = call_args[0][2]  # Third positional arg is the ServerUpdate
+        assert server_update.oauth_enabled is False
+        assert server_update.oauth_config is None
+
+    @patch.object(ServerService, "update_server")
+    async def test_admin_edit_server_oauth_without_authorization_server(self, mock_update_server, mock_request, mock_db):
+        """Test that OAuth is disabled when enabled but no authorization server provided."""
+        server_id = "00000000-0000-0000-0000-000000000003"
+        # Setup form data with OAuth enabled but missing authorization server
+        form_data = FakeForm(
+            {
+                "id": server_id,
+                "name": "OAuth_Missing_Server",
+                "description": "Server with incomplete OAuth",
+                "oauth_enabled": "on",
+                "oauth_authorization_server": "",  # Empty!
+                "oauth_scopes": "openid",
+                "visibility": "public",
+                "associatedTools": [],
+                "associatedResources": [],
+                "associatedPrompts": [],
+            }
+        )
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        # Mock successful update
+        mock_server_read = MagicMock()
+        mock_server_read.model_dump.return_value = {
+            "id": server_id,
+            "name": "OAuth_Missing_Server",
+            "oauth_enabled": False,
+            "oauth_config": None,
+        }
+        mock_update_server.return_value = mock_server_read
+
+        result = await admin_edit_server(server_id, mock_request, mock_db, "test-user")
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+
+        # Verify OAuth was disabled due to missing authorization server
+        mock_update_server.assert_called_once()
+        call_args = mock_update_server.call_args
+        server_update = call_args[0][2]  # Third positional arg is the ServerUpdate
+        assert server_update.oauth_enabled is False
+        assert server_update.oauth_config is None
+
+    @patch.object(ServerService, "set_server_state")
+    async def test_admin_set_server_state_activate(self, mock_set_state, mock_request, mock_db):
+        """Test activating a server."""
+        form_data = FakeForm({"activate": "true", "is_inactive_checked": "false"})
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        result = await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
+
+        mock_set_state.assert_called_once_with(mock_db, "server-1", True, user_email="test-user")
+        assert isinstance(result, RedirectResponse)
+        assert result.status_code == 303
+        assert result.headers["location"] == "/admin#catalog"
+
+    @patch.object(ServerService, "set_server_state")
+    async def test_admin_set_server_state_deactivate(self, mock_set_state, mock_request, mock_db):
+        """Test deactivating a server."""
+        form_data = FakeForm({"activate": "false", "is_inactive_checked": "false"})
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        result = await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
+
+        mock_set_state.assert_called_once_with(mock_db, "server-1", False, user_email="test-user")
+        assert isinstance(result, RedirectResponse)
+        assert result.status_code == 303
+        assert result.headers["location"] == "/admin#catalog"
+
+    @patch.object(ServerService, "set_server_state")
+    async def test_admin_set_server_state_with_inactive_checked(self, mock_set_state, mock_request, mock_db):
+        """Test setting server state with inactive checkbox checked."""
+        form_data = FakeForm({"activate": "false", "is_inactive_checked": "true"})
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+
+        result = await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
+
+        mock_set_state.assert_called_once_with(mock_db, "server-1", False, user_email="test-user")
+        assert isinstance(result, RedirectResponse)
+        assert result.status_code == 303
+        assert result.headers["location"] == "/admin/?include_inactive=true#catalog"
+
+    @patch.object(ServerService, "set_server_state")
+    async def test_admin_set_server_state_with_exception(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting server state with exception handling."""
+        form_data = FakeForm({"activate": "true", "is_inactive_checked": "false"})
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
         mock_toggle_status.side_effect = Exception("Toggle operation failed")
 
-        # Should still return redirect
-        result = await admin_toggle_server("server-1", mock_request, mock_db, "test-user")
+        result = await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
 
         assert isinstance(result, RedirectResponse)
         assert result.status_code == 303
+        assert "error=" in result.headers["location"]
+        assert "#catalog" in result.headers["location"]
+
+    @patch.object(ServerService, "set_server_state")
+    async def test_admin_set_server_state_permission_error(self, mock_set_state, mock_request, mock_db):
+        """Test setting server state with permission error."""
+        form_data = FakeForm({"activate": "true", "is_inactive_checked": "false"})
+        mock_request.form = AsyncMock(return_value=form_data)
+        mock_request.scope = {"root_path": ""}
+        mock_set_state.side_effect = PermissionError("Only the owner can activate the Server")
+
+        result = await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
+
+        assert isinstance(result, RedirectResponse)
+        assert result.status_code == 303
+        assert "error=" in result.headers["location"]
+        assert "Only%20the%20owner" in result.headers["location"]
 
     @patch.object(ServerService, "delete_server")
     async def test_admin_delete_server_with_inactive_checkbox(self, mock_delete_server, mock_request, mock_db):
@@ -374,11 +571,9 @@ class TestAdminToolRoutes:
 
         # Test empty list
         # Mock tool_service.list_tools to return empty paginated response
-        mock_tool_service.list_tools = AsyncMock(return_value={
-            "data": [],
-            "pagination": PaginationMeta(page=1, per_page=50, total_items=0, total_pages=0, has_next=False, has_prev=False),
-            "links": None
-        })
+        mock_tool_service.list_tools = AsyncMock(
+            return_value={"data": [], "pagination": PaginationMeta(page=1, per_page=50, total_items=0, total_pages=0, has_next=False, has_prev=False), "links": None}
+        )
 
         # Call the function with explicit pagination params
         result = await admin_list_tools(page=1, per_page=50, include_inactive=False, db=mock_db, user="test-user")
@@ -538,30 +733,30 @@ class TestAdminToolRoutes:
         assert tool_update.headers == {}
         assert tool_update.input_schema == {}
 
-    @patch.object(ToolService, "toggle_tool_status")
-    async def test_admin_toggle_tool_various_activate_values(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling tool with various activate values."""
+    @patch.object(ToolService, "set_tool_state")
+    async def test_admin_set_tool_state_various_activate_values(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting tool state with various activate values."""
         tool_id = "tool-1"
 
         # Test with "false"
         form_data = FakeForm({"activate": "false"})
         mock_request.form = AsyncMock(return_value=form_data)
 
-        await admin_toggle_tool(tool_id, mock_request, mock_db, "test-user")
+        await admin_set_tool_state(tool_id, mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, tool_id, False, reachable=False, user_email="test-user")
 
         # Test with "FALSE"
         form_data = FakeForm({"activate": "FALSE"})
         mock_request.form = AsyncMock(return_value=form_data)
 
-        await admin_toggle_tool(tool_id, mock_request, mock_db, "test-user")
+        await admin_set_tool_state(tool_id, mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, tool_id, False, reachable=False, user_email="test-user")
 
         # Test with missing activate field (defaults to true)
         form_data = FakeForm({})
         mock_request.form = AsyncMock(return_value=form_data)
 
-        await admin_toggle_tool(tool_id, mock_request, mock_db, "test-user")
+        await admin_set_tool_state(tool_id, mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, tool_id, True, reachable=True, user_email="test-user")
 
 
@@ -809,24 +1004,15 @@ class TestAdminResourceRoutes:
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
             metrics=ResourceMetrics(
-                total_executions=100,
-                successful_executions=100,
-                failed_executions=0,
-                failure_rate=0.0,
-                min_response_time=0.1,
-                max_response_time=0.5,
-                avg_response_time=0.3,
-                last_execution_time=None
+                total_executions=100, successful_executions=100, failed_executions=0, failure_rate=0.0, min_response_time=0.1, max_response_time=0.5, avg_response_time=0.3, last_execution_time=None
             ),
-            tags=[]
+            tags=[],
         )
 
         # Mock resource_service.list_resources to return paginated response
-        mock_resource_service.list_resources = AsyncMock(return_value={
-            "data": [resource_read],
-            "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False),
-            "links": None
-        })
+        mock_resource_service.list_resources = AsyncMock(
+            return_value={"data": [resource_read], "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False), "links": None}
+        )
 
         result = await admin_list_resources(page=1, per_page=50, include_inactive=False, db=mock_db, user="test-user")
 
@@ -850,19 +1036,11 @@ class TestAdminResourceRoutes:
         assert result["resource"]["id"] == 1
         mock_read_resource.assert_not_called()
 
-
     @patch.object(ResourceService, "register_resource")
     async def test_admin_add_resource_with_valid_mime_type(self, mock_register_resource, mock_request, mock_db):
         """Test adding resource with valid MIME type."""
         # Use a valid MIME type
-        form_data = FakeForm(
-            {
-                        "uri": "greetme://morning/{name}",
-                        "name": "test_doc",
-                        "content": "Test content",
-                        "mimeType": "text/plain"
-            }
-        )
+        form_data = FakeForm({"uri": "greetme://morning/{name}", "name": "test_doc", "content": "Test content", "mimeType": "text/plain"})
 
         mock_request.form = AsyncMock(return_value=form_data)
 
@@ -908,15 +1086,15 @@ class TestAdminResourceRoutes:
         mock_update_resource.assert_called_once()
         assert mock_update_resource.call_args[0][1] == uri
 
-    @patch.object(ResourceService, "toggle_resource_status")
-    async def test_admin_toggle_resource_numeric_id(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling resource with numeric ID."""
+    @patch.object(ResourceService, "set_resource_state")
+    async def test_admin_set_resource_state_numeric_id(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting resource state with numeric ID."""
         # Test with integer ID
-        await admin_toggle_resource(123, mock_request, mock_db, "test-user")
+        await admin_set_resource_state(123, mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, 123, True, user_email="test-user")
 
         # Test with string number
-        await admin_toggle_resource("456", mock_request, mock_db, "test-user")
+        await admin_set_resource_state("456", mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, "456", True, user_email="test-user")
 
 
@@ -925,13 +1103,9 @@ class TestAdminPromptRoutes:
 
     @patch("mcpgateway.admin.prompt_service")
     @patch("mcpgateway.admin.TeamManagementService")
-    async def test_admin_list_prompts_with_complex_arguments(
-        self, mock_team_service_class, mock_prompt_service, mock_db
-    ):
+    async def test_admin_list_prompts_with_complex_arguments(self, mock_team_service_class, mock_prompt_service, mock_db):
         """Test listing prompts with complex argument structures."""
         from mcpgateway.schemas import PaginationMeta
-        from mcpgateway.db import Prompt as DbPrompt
-        from datetime import datetime, timezone
 
         # Mock team service
         mock_team_service = AsyncMock()
@@ -952,11 +1126,9 @@ class TestAdminPromptRoutes:
         }
 
         # Mock prompt_service.list_prompts to return paginated response
-        mock_prompt_service.list_prompts = AsyncMock(return_value={
-            "data": [mock_prompt],
-            "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False),
-            "links": None
-        })
+        mock_prompt_service.list_prompts = AsyncMock(
+            return_value={"data": [mock_prompt], "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False), "links": None}
+        )
 
         result = await admin_list_prompts(page=1, per_page=50, include_inactive=False, db=mock_db, user="test-user")
 
@@ -1089,15 +1261,15 @@ class TestAdminPromptRoutes:
         mock_update_prompt.assert_called_once()
         assert mock_update_prompt.call_args[0][1] == "old-prompt-name"
 
-    @patch.object(PromptService, "toggle_prompt_status")
-    async def test_admin_toggle_prompt_edge_cases(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling prompt with edge cases."""
+    @patch.object(PromptService, "set_prompt_state")
+    async def test_admin_set_prompt_state_edge_cases(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting prompt state with edge cases."""
         # Test with string ID that looks like number
-        await admin_toggle_prompt("123", mock_request, mock_db, "test-user")
+        await admin_set_prompt_state("123", mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, "123", True, user_email="test-user")
 
         # Test with negative number
-        await admin_toggle_prompt(-1, mock_request, mock_db, "test-user")
+        await admin_set_prompt_state(-1, mock_request, mock_db, "test-user")
         mock_toggle_status.assert_called_with(mock_db, -1, True, user_email="test-user")
 
 
@@ -1132,15 +1304,13 @@ class TestAdminGatewayRoutes:
             "authValue": "Some value",
             "slug": "secure-gateway",
             "capabilities": {},
-            "reachable": True
+            "reachable": True,
         }
 
         # Mock gateway_service.list_gateways to return paginated response
-        mock_gateway_service.list_gateways = AsyncMock(return_value={
-            "data": [mock_gateway],
-            "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False),
-            "links": None
-        })
+        mock_gateway_service.list_gateways = AsyncMock(
+            return_value={"data": [mock_gateway], "pagination": PaginationMeta(page=1, per_page=50, total_items=1, total_pages=1, has_next=False, has_prev=False), "links": None}
+        )
 
         result = await admin_list_gateways(page=1, per_page=50, include_inactive=False, db=mock_db, user="test-user")
 
@@ -1265,9 +1435,9 @@ class TestAdminGatewayRoutes:
         assert result.status_code in (400, 422)
         assert body["success"] is False
 
-    @patch.object(GatewayService, "toggle_gateway_status")
-    async def test_admin_toggle_gateway_concurrent_calls(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling gateway with simulated concurrent calls."""
+    @patch.object(GatewayService, "set_gateway_state")
+    async def test_admin_set_gateway_state_concurrent_calls(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting gateway state with simulated concurrent calls."""
         # Simulate race condition
         call_count = 0
 
@@ -1281,11 +1451,11 @@ class TestAdminGatewayRoutes:
         mock_toggle_status.side_effect = side_effect
 
         # First call should fail
-        result1 = await admin_toggle_gateway("gateway-1", mock_request, mock_db, "test-user")
+        result1 = await admin_set_gateway_state("gateway-1", mock_request, mock_db, "test-user")
         assert isinstance(result1, RedirectResponse)
 
         # Second call should succeed
-        result2 = await admin_toggle_gateway("gateway-1", mock_request, mock_db, "test-user")
+        result2 = await admin_set_gateway_state("gateway-1", mock_request, mock_db, "test-user")
         assert isinstance(result2, RedirectResponse)
 
 
@@ -1303,7 +1473,7 @@ class TestAdminRootRoutes:
         )
         mock_request.form = AsyncMock(return_value=form_data)
 
-        result = await admin_add_root(mock_request, "test-user")
+        await admin_add_root(mock_request, "test-user")
 
         mock_add_root.assert_called_once_with("/test/root-with-dashes_and_underscores", "Special-Root_Name")
 
@@ -1318,7 +1488,7 @@ class TestAdminRootRoutes:
         )
         mock_request.form = AsyncMock(return_value=form_data)
 
-        result = await admin_add_root(mock_request, "test-user")
+        await admin_add_root(mock_request, "test-user")
 
         mock_add_root.assert_called_once_with("/nameless/root", None)
 
@@ -1381,8 +1551,7 @@ class TestAdminMetricsRoutes:
         mock_server_top.return_value = []
         mock_prompt_top.return_value = []
 
-        # result = await admin_get_metrics(mock_db, "test-user")
-        result = await get_aggregated_metrics(mock_db)
+        result = await get_aggregated_metrics(mock_db, _user={"email": "test-user@example.com", "db": mock_db})
 
         assert result["tools"].total_executions == 0
         assert result["resources"].total_executions == 100
@@ -1407,7 +1576,7 @@ class TestAdminMetricsRoutes:
 
         # Should raise the exception
         with pytest.raises(Exception) as excinfo:
-            await admin_reset_metrics(mock_db, "test-user")
+            await admin_reset_metrics(mock_db, user={"email": "test-user@example.com", "db": mock_db})
 
         assert "Resource metrics locked" in str(excinfo.value)
 
@@ -1622,7 +1791,13 @@ class TestAdminUIRoute:
             mock_settings.app_root_path = "/custom/root"
             mock_settings.gateway_tool_name_separator = "__"
 
-            response = await admin_ui(mock_request, None, True, mock_db, "admin")
+            await admin_ui(
+                request=mock_request,
+                team_id=None,
+                include_inactive=True,
+                db=mock_db,
+                user="admin",
+            )
 
             # Check template was called with correct context
             template_call = mock_request.app.state.templates.TemplateResponse.call_args
@@ -1654,7 +1829,13 @@ class TestAdminUIRoute:
         mock_gateways.return_value = []
         mock_roots.return_value = []
 
-        response = await admin_ui(mock_request, None, False, mock_db, "admin")
+        response = await admin_ui(
+            request=mock_request,
+            team_id=None,
+            include_inactive=False,
+            db=mock_db,
+            user="admin",
+        )
 
         # Verify response is an HTMLResponse
         assert isinstance(response, HTMLResponse)
@@ -1955,16 +2136,16 @@ class TestA2AAgentManagement:
         assert data["success"] is False
         assert "agent name already exists" in data["message"].lower()
 
-    @patch.object(A2AAgentService, "toggle_agent_status")
-    async def test_admin_toggle_a2a_agent_success(self, mock_toggle_status, mock_request, mock_db):
-        """Test toggling A2A agent status."""
+    @patch.object(A2AAgentService, "set_agent_state")
+    async def test_admin_set_a2a_agent_state_success(self, mock_toggle_status, mock_request, mock_db):
+        """Test setting A2A agent state."""
         # First-Party
 
         form_data = FakeForm({"activate": "true"})
         mock_request.form = AsyncMock(return_value=form_data)
         mock_request.scope = {"root_path": ""}
 
-        result = await admin_toggle_a2a_agent("agent-1", mock_request, mock_db, "test-user")
+        result = await admin_set_a2a_agent_state("agent-1", mock_request, mock_db, "test-user")
 
         assert isinstance(result, RedirectResponse)
         assert result.status_code == 303
@@ -2059,7 +2240,7 @@ class TestExportImportEndpoints:
         # First-Party
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_export_logs(export_format="xml", level=None, start_time=None, end_time=None, user="test-user")
+            await admin_export_logs(export_format="xml", level=None, start_time=None, end_time=None, user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 400
         assert "Invalid format: xml" in str(excinfo.value.detail)
@@ -2182,7 +2363,7 @@ class TestLoggingEndpoints:
         mock_settings.log_file = None
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_get_log_file(filename=None, user="test-user")
+            await admin_get_log_file(filename=None, user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 404
         assert "File logging is not enabled" in str(excinfo.value.detail)
@@ -2488,7 +2669,7 @@ class TestImportConfigurationEndpoints:
         request_body = {"import_data": import_data, "conflict_strategy": "update", "dry_run": False, "selected_entities": {"servers": True, "tools": True}}
         mock_request.json = AsyncMock(return_value=request_body)
 
-        result = await admin_import_configuration(mock_request, mock_db, "test-user")
+        result = await admin_import_configuration(mock_request, mock_db, user={"email": "test-user@example.com", "db": mock_db})
 
         assert isinstance(result, JSONResponse)
         body = json.loads(result.body)
@@ -2505,7 +2686,7 @@ class TestImportConfigurationEndpoints:
         mock_request.json = AsyncMock(return_value=request_body)
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_import_configuration(mock_request, mock_db, "test-user")
+            await admin_import_configuration(mock_request, mock_db, user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 500
         assert "Import failed" in str(excinfo.value.detail)
@@ -2518,7 +2699,7 @@ class TestImportConfigurationEndpoints:
         mock_request.json = AsyncMock(return_value=request_body)
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_import_configuration(mock_request, mock_db, "test-user")
+            await admin_import_configuration(mock_request, mock_db, user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 500
         assert "Import failed" in str(excinfo.value.detail)
@@ -2534,7 +2715,7 @@ class TestImportConfigurationEndpoints:
         mock_request.json = AsyncMock(return_value=request_body)
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_import_configuration(mock_request, mock_db, "test-user")
+            await admin_import_configuration(mock_request, mock_db, user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 400
         assert "Import validation failed" in str(excinfo.value.detail)
@@ -2551,10 +2732,10 @@ class TestImportConfigurationEndpoints:
         request_body = {"import_data": {"version": "1.0"}, "conflict_strategy": "update"}
         mock_request.json = AsyncMock(return_value=request_body)
 
-        # User as dict instead of string
-        user_dict = {"username": "dict-user", "token": "jwt-token"}
+        # User as dict instead of string - need email and db keys for RBAC
+        user_dict = {"email": "dict-user@example.com", "db": mock_db, "username": "dict-user", "token": "jwt-token"}
 
-        result = await admin_import_configuration(mock_request, mock_db, user_dict)
+        result = await admin_import_configuration(mock_request, mock_db, user=user_dict)
 
         assert isinstance(result, JSONResponse)
         # Verify the username was extracted correctly
@@ -2571,7 +2752,7 @@ class TestImportConfigurationEndpoints:
         mock_status.to_dict.return_value = {"import_id": "import-123", "status": "in_progress", "progress": {"total": 10, "completed": 5, "errors": 0}}
         mock_get_status.return_value = mock_status
 
-        result = await admin_get_import_status("import-123", "test-user")
+        result = await admin_get_import_status("import-123", user={"email": "test-user@example.com", "db": mock_db})
 
         assert isinstance(result, JSONResponse)
         body = json.loads(result.body)
@@ -2587,7 +2768,7 @@ class TestImportConfigurationEndpoints:
         mock_get_status.return_value = None
 
         with pytest.raises(HTTPException) as excinfo:
-            await admin_get_import_status("nonexistent", "test-user")
+            await admin_get_import_status("nonexistent", user={"email": "test-user@example.com", "db": mock_db})
 
         assert excinfo.value.status_code == 404
         assert "Import nonexistent not found" in str(excinfo.value.detail)
@@ -2603,7 +2784,7 @@ class TestImportConfigurationEndpoints:
         mock_status2.to_dict.return_value = {"import_id": "import-2", "status": "failed"}
         mock_list_statuses.return_value = [mock_status1, mock_status2]
 
-        result = await admin_list_import_statuses("test-user")
+        result = await admin_list_import_statuses(user={"email": "test-user@example.com", "db": mock_db})
 
         assert isinstance(result, JSONResponse)
         body = json.loads(result.body)
@@ -2633,7 +2814,13 @@ class TestAdminUIMainEndpoint:
         mock_gateways.return_value = []
         mock_roots.return_value = []
 
-        response = await admin_ui(mock_request, False, mock_db, "admin")
+        await admin_ui(
+            request=mock_request,
+            team_id=None,
+            include_inactive=False,
+            db=mock_db,
+            user="admin",
+        )
 
         # Check template was called with correct context (no a2a_agents)
         template_call = mock_request.app.state.templates.TemplateResponse.call_args
@@ -2687,8 +2874,8 @@ class TestEdgeCasesAndErrorHandling:
         mock_request.form = AsyncMock(return_value=form_data)
 
         # Test with toggle operations which use boolean parsing
-        with patch.object(ServerService, "toggle_server_status", new_callable=AsyncMock) as mock_toggle:
-            await admin_toggle_server("server-1", mock_request, mock_db, "test-user")
+        with patch.object(ServerService, "set_server_state", new_callable=AsyncMock) as mock_toggle:
+            await admin_set_server_state("server-1", mock_request, mock_db, "test-user")
 
             # Check how the value was parsed
             if form_field == "activate":
@@ -2820,21 +3007,21 @@ class TestEdgeCasesAndErrorHandling:
                 MagicMock(name="Tool1", execution_count=10),
                 MagicMock(name="Tool2", execution_count=5),
             ]
-            result = await admin_metrics_partial_html(mock_request, "tools", 1, 10, mock_db, "test-user")
+            result = await admin_metrics_partial_html(mock_request, "tools", 1, 10, mock_db, user={"email": "test-user@example.com", "db": mock_db})
             assert isinstance(result, HTMLResponse)
             assert result.status_code == 200
 
     async def test_admin_metrics_partial_html_invalid_entity(self, mock_request, mock_db):
         """Test admin metrics partial HTML endpoint with invalid entity type."""
         with pytest.raises(HTTPException) as exc_info:
-            await admin_metrics_partial_html(mock_request, "invalid", 1, 10, mock_db, "test-user")
+            await admin_metrics_partial_html(mock_request, "invalid", 1, 10, mock_db, user={"email": "test-user@example.com", "db": mock_db})
         assert exc_info.value.status_code == 400
 
     async def test_admin_metrics_partial_html_resources(self, mock_request, mock_db):
         """Test admin metrics partial HTML endpoint for resources."""
         with patch("mcpgateway.services.resource_service.ResourceService.get_top_resources", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = []
-            result = await admin_metrics_partial_html(mock_request, "resources", 1, 10, mock_db, "test-user")
+            result = await admin_metrics_partial_html(mock_request, "resources", 1, 10, mock_db, user={"email": "test-user@example.com", "db": mock_db})
             assert isinstance(result, HTMLResponse)
             assert result.status_code == 200
 
@@ -2842,6 +3029,6 @@ class TestEdgeCasesAndErrorHandling:
         """Test admin metrics partial HTML endpoint with pagination."""
         with patch("mcpgateway.services.prompt_service.PromptService.get_top_prompts", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = [MagicMock(name=f"Prompt{i}") for i in range(25)]
-            result = await admin_metrics_partial_html(mock_request, "prompts", 2, 10, mock_db, "test-user")
+            result = await admin_metrics_partial_html(mock_request, "prompts", 2, 10, mock_db, user={"email": "test-user@example.com", "db": mock_db})
             assert isinstance(result, HTMLResponse)
             assert result.status_code == 200

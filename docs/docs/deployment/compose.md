@@ -3,6 +3,7 @@
 Running **MCP Gateway** with **Compose** spins up a full stack (Gateway, Postgres, Redis, optional MPC servers) behind a single YAML file.
 The Makefile detects Podman or Docker automatically, and you can override it with `COMPOSE_CMD=`.
 Health-checks (`service_healthy`) gate the Gateway until the database is ready, preventing race conditions.
+If dependencies become temporarily unavailable, the Gateway uses **exponential backoff with jitter** for connection retries—see [Startup Resilience](../architecture/performance-architecture.md#startup-resilience) for details.
 
 ---
 
@@ -18,7 +19,7 @@ export COMPOSE_CMD="docker compose"
 ## 🐳/🦭 Build the images
 
 ```bash
-docker pull ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
+docker pull ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-2
 ```
 
 ## 🐳/🦭 Build the images (when doing local development)
@@ -192,6 +193,7 @@ PgBouncer supports three pool modes:
     - **Prepared statements** may not work as expected across transactions
     - **Session-level settings** (like `SET` commands) are not preserved
     - **LISTEN/NOTIFY** requires session mode
+    - **Advisory locks** (used during migrations/bootstrap) are session-level; ensure `server_reset_query` clears them (use `DISCARD ALL` or add `SELECT pg_advisory_unlock_all()`), or run migrations against direct PostgreSQL.
 
     MCP Gateway is designed to work with transaction mode.
 
