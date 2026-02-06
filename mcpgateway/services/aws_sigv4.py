@@ -18,8 +18,13 @@ class SigV4MCPAuth(httpx.Auth):
     def auth_flow(self, request: httpx.Request):
         creds = self.session.get_credentials().get_frozen_credentials()
         payload = orjson.loads(request.content.decode()) if request.content else {}
-
-        if payload["method"] == "initialize" or payload["method"] == "message/send":
+        if "method" in payload and (payload["method"] == "initialize" or payload["method"] == "message/send") :
+            filtered = {
+                "host": request.url.host,
+                "content-type": request.headers.get("content-type", ""),
+                "accept": request.headers.get("accept", "")
+            }
+        elif "jsonrpc" not in payload:
             filtered = {
                 "host": request.url.host,
                 "content-type": request.headers.get("content-type", ""),

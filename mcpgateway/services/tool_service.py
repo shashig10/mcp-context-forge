@@ -2780,9 +2780,17 @@ class ToolService:
                     # Use the tool's request_type rather than defaulting to POST (using local variable)
                     method = tool_request_type.upper() if tool_request_type else "POST"
                     if method == "GET":
-                        response = await self._http_client.get(final_url, params=payload, headers=headers)
+                        if "bedrock-agentcore" in final_url:
+                            auth = SigV4MCPAuth("eu-central-1")
+                            response = await self._http_client.get(final_url, params=payload, headers=headers, auth=auth)
+                        else:
+                            response = await self._http_client.get(final_url, params=payload, headers=headers)
                     else:
-                        response = await self._http_client.request(method, final_url, json=payload, headers=headers)
+                        if "bedrock-agentcore" in final_url:
+                            auth = SigV4MCPAuth("eu-central-1")
+                            response = await self._http_client.request(method, final_url, json=payload, headers=headers, auth=auth)
+                        else:
+                            response = await self._http_client.request(method, final_url, json=payload, headers=headers)
                     response.raise_for_status()
 
                     # Handle 204 No Content responses that have no body
