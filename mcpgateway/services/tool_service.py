@@ -2714,6 +2714,8 @@ class ToolService:
                         try:
                             access_token = await self.oauth_manager.get_access_token(tool_oauth_config)
                             headers["Authorization"] = f"Bearer {access_token}"
+                            if "bedrock-agentcore" in tool_url:
+                                headers["X-Amzn-Bedrock-AgentCore-Runtime-Custom-TSAT"] = f"Bearer {access_token}"
                         except Exception as e:
                             logger.error(f"Failed to obtain OAuth access token for tool {tool_name_computed}: {e}")
                             raise ToolInvocationError(f"OAuth authentication failed: {str(e)}")
@@ -2845,7 +2847,7 @@ class ToolService:
                                     access_token = await token_storage.get_user_token(gateway_id_str, app_user_email)
 
                                 if access_token:
-                                    headers = {"Authorization": f"Bearer {access_token}"}
+                                    headers = {"Authorization": f"Bearer {access_token}", "X-Amzn-Bedrock-AgentCore-Runtime-Custom-TSAT": f"Bearer {access_token}"} if "bedrock-agentcore" in gateway_url else {"Authorization": f"Bearer {access_token}"}
                                 else:
                                     # User hasn't authorized this gateway yet
                                     raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
@@ -2856,7 +2858,7 @@ class ToolService:
                             # For Client Credentials flow, get token directly (no DB needed)
                             try:
                                 access_token = await self.oauth_manager.get_access_token(gateway_oauth_config)
-                                headers = {"Authorization": f"Bearer {access_token}"}
+                                headers = {"Authorization": f"Bearer {access_token}", "X-Amzn-Bedrock-AgentCore-Runtime-Custom-TSAT": f"Bearer {access_token}"} if "bedrock-agentcore" in gateway_url else {"Authorization": f"Bearer {access_token}"}
                             except Exception as e:
                                 logger.error(f"Failed to obtain OAuth access token for gateway {gateway_name}: {e}")
                                 raise ToolInvocationError(f"OAuth authentication failed for gateway: {str(e)}")
@@ -4174,8 +4176,12 @@ class ToolService:
         # Add authentication if configured
         if agent.auth_type == "api_key" and agent.auth_value:
             headers["Authorization"] = f"Bearer {agent.auth_value}"
+            if "bedrock-agentcore" in endpoint_url:
+                headers["X-Amzn-Bedrock-AgentCore-Runtime-Custom-TSAT"] = f"Bearer {agent.auth_value}"
         elif agent.auth_type == "bearer" and agent.auth_value:
             headers["Authorization"] = f"Bearer {agent.auth_value}"
+            if "bedrock-agentcore" in endpoint_url:
+                headers["X-Amzn-Bedrock-AgentCore-Runtime-Custom-TSAT"] = f"Bearer {agent.auth_value}"
         elif agent.auth_type == "query_param" and agent.auth_query_params:
             # Handle query parameter authentication (imports at top: decode_auth, apply_query_param_auth, sanitize_url_for_logging)
             auth_query_params_decrypted: dict[str, str] = {}
