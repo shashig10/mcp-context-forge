@@ -1063,6 +1063,10 @@ class OAuthManager:
                 token_data = form_data  # type: ignore[assignment]
             else:
                 token_data["resource"] = resource
+        
+        if "https://login.microsoftonline.com/" in token_url:
+            # Microsoft OAuth doesn't support the 'resource' parameter in token requests
+            token_data.pop("resource", None)
 
         # Exchange code for token with retries
         for attempt in range(self.max_retries):
