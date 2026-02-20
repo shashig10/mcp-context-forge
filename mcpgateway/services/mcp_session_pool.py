@@ -661,6 +661,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
         timeout: Optional[float] = None,
         user_identity: Optional[str] = None,
         gateway_id: Optional[str] = None,
+        auth: Optional[httpx.Auth] = None,
     ) -> PooledSession:
         """
         Acquire a session for the given URL, identity, and transport type.
@@ -676,6 +677,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
                                   (for custom SSL/timeout configuration).
             timeout: Optional timeout in seconds for transport connection.
             gateway_id: Optional gateway ID for notification handler context.
+            auth: Optional auth strategy for upstream transport client.
 
         Returns:
             PooledSession ready for use.
@@ -813,7 +815,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
                         raise RuntimeError(f"Session owned by another worker: {owner}")
 
             pooled = await asyncio.wait_for(
-                self._create_session(url, headers, transport_type, httpx_client_factory, effective_timeout, gateway_id),
+                self._create_session(url, headers, transport_type, httpx_client_factory, effective_timeout, gateway_id, auth),
                 timeout=self._session_create_timeout,
             )
             # Store identity components for key reconstruction
@@ -1068,6 +1070,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
         httpx_client_factory: Optional[HttpxClientFactory],
         timeout: Optional[float] = None,
         gateway_id: Optional[str] = None,
+        auth: Optional[httpx.Auth] = None,
     ) -> PooledSession:
         """
         Create a new initialized MCP session.
@@ -1079,6 +1082,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
             httpx_client_factory: Optional factory for httpx clients.
             timeout: Optional timeout in seconds for transport connection.
             gateway_id: Optional gateway ID for notification handler context.
+            auth: Optional auth strategy for upstream transport client.
 
         Returns:
             Initialized PooledSession.
@@ -1116,9 +1120,9 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
                 read_stream, write_stream = streams[0], streams[1]
             else:  # STREAMABLE_HTTP
                 if httpx_client_factory:
-                    transport_ctx = streamablehttp_client(url=url, headers=merged_headers, httpx_client_factory=httpx_client_factory, timeout=timeout)
+                    transport_ctx = streamablehttp_client(url=url, headers=merged_headers, auth=auth, httpx_client_factory=httpx_client_factory, timeout=timeout)
                 else:
-                    transport_ctx = streamablehttp_client(url=url, headers=merged_headers, timeout=timeout)
+                    transport_ctx = streamablehttp_client(url=url, headers=merged_headers, auth=auth, timeout=timeout)
                 # pylint: disable=unnecessary-dunder-call,no-member
                 read_stream, write_stream, _ = await transport_ctx.__aenter__()  # Must call directly for manual lifecycle management
 
@@ -1837,6 +1841,7 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
         timeout: Optional[float] = None,
         user_identity: Optional[str] = None,
         gateway_id: Optional[str] = None,
+        auth: Optional[httpx.Auth] = None,
     ) -> "AsyncIterator[PooledSession]":
         """
         Context manager for acquiring and releasing a session.
@@ -1853,11 +1858,12 @@ class MCPSessionPool:  # pylint: disable=too-many-instance-attributes
             timeout: Optional timeout in seconds for transport connection.
             user_identity: Optional user identity for strict isolation.
             gateway_id: Optional gateway ID for notification handler context.
+            auth: Optional auth strategy for upstream transport client.
 
         Yields:
             PooledSession ready for use.
         """
-        pooled = await self.acquire(url, headers, transport_type, httpx_client_factory, timeout, user_identity, gateway_id)
+        pooled = await self.acquire(url, headers, transport_type, httpx_client_factory, timeout, user_identity, gateway_id, auth)
         try:
             yield pooled
         finally:

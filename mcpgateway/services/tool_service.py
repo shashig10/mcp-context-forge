@@ -3798,7 +3798,13 @@ class ToolService:
                     logger.info(f"Calling A2A agent '{a2a_agent_name}' at {endpoint_url}")
                     a2a_start_time = time.time()
                     try:
-                        http_response = await asyncio.wait_for(self._http_client.post(endpoint_url, json=request_data, headers=headers), timeout=effective_timeout)
+                        if "bedrock-agentcore" in endpoint_url:
+                            auth = SigV4MCPAuth("eu-central-1")
+                            http_response = await asyncio.wait_for(
+                                self._http_client.post(endpoint_url, json=request_data, headers=headers, auth=auth),
+                                timeout=effective_timeout)
+                        else:
+                            http_response = await asyncio.wait_for(self._http_client.post(endpoint_url, json=request_data, headers=headers), timeout=effective_timeout)
                     except (asyncio.TimeoutError, httpx.TimeoutException):
                         a2a_elapsed_ms = (time.time() - a2a_start_time) * 1000
                         structured_logger.log(
