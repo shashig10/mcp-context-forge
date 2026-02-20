@@ -283,7 +283,7 @@
   <body class="bg-gray-100 dark:bg-gray-900">
     {% set hidden_sections = ui_hidden_sections | default([]) %}
     {% set hidden_header_items = ui_hidden_header_items | default([]) %}
-    <div class="flex h-screen overflow-hidden" x-data="{ sidebarOpen: true, sidebarCollapsed: false }">
+    <div class="flex h-screen overflow-hidden w-full max-w-[2000px] mx-auto" x-data="{ sidebarOpen: true, sidebarCollapsed: false }">
 
       <!-- Mobile sidebar backdrop -->
       <div
@@ -2233,12 +2233,12 @@
       {% if 'servers' not in hidden_sections %}
       <!-- Catalog Panel (Virtual Servers) -->
       <div id="catalog-panel" class="tab-panel hidden">
-        {% if not catalog_enabled %}
-        <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 dark:bg-yellow-800 dark:border-yellow-400 dark:text-yellow-200">
-          <p class="font-bold">Catalog is currently disabled</p>
-          <p class="text-sm">Set <code>MCPGATEWAY_CATALOG_ENABLED=true</code> to enable catalog-backed server operations.</p>
-        </div>
-        {% endif %}
+<!--        {% if not catalog_enabled %}-->
+<!--        <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 dark:bg-yellow-800 dark:border-yellow-400 dark:text-yellow-200">-->
+<!--          <p class="font-bold">Catalog is currently disabled</p>-->
+<!--          <p class="text-sm">Set <code>MCPGATEWAY_CATALOG_ENABLED=true</code> to enable catalog-backed server operations.</p>-->
+<!--        </div>-->
+<!--        {% endif %}-->
         <div class="flex justify-between items-center mb-4">
           <div class="flex items-center space-x-10">
             <h2 class="text-2xl font-bold dark:text-gray-200">Virtual MCP Servers</h2>
