@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=import-outside-toplevel,no-name-in-module
 """Location: ./mcpgateway/services/import_service.py
 Copyright 2025
 SPDX-License-Identifier: Apache-2.0
@@ -31,12 +32,11 @@ from sqlalchemy.orm import Session
 from mcpgateway.config import settings
 from mcpgateway.db import A2AAgent, EmailUser, Gateway, Prompt, Resource, Server, Tool
 from mcpgateway.schemas import AuthenticationValues, GatewayCreate, GatewayUpdate, PromptCreate, PromptUpdate, ResourceCreate, ResourceUpdate, ServerCreate, ServerUpdate, ToolCreate, ToolUpdate
-from mcpgateway.services.gateway_service import GatewayNameConflictError, GatewayService
-from mcpgateway.services.prompt_service import PromptNameConflictError, PromptService
-from mcpgateway.services.resource_service import ResourceService, ResourceURIConflictError
-from mcpgateway.services.root_service import RootService
-from mcpgateway.services.server_service import ServerNameConflictError, ServerService
-from mcpgateway.services.tool_service import ToolNameConflictError, ToolService
+from mcpgateway.services.gateway_service import GatewayNameConflictError
+from mcpgateway.services.prompt_service import PromptNameConflictError
+from mcpgateway.services.resource_service import ResourceURIConflictError
+from mcpgateway.services.server_service import ServerNameConflictError
+from mcpgateway.services.tool_service import ToolNameConflictError
 from mcpgateway.utils.services_auth import decode_auth, encode_auth
 
 logger = logging.getLogger(__name__)
@@ -182,12 +182,26 @@ class ImportService:
             >>> hasattr(service, 'gateway_service')
             True
         """
-        self.gateway_service = GatewayService()
-        self.tool_service = ToolService()
-        self.resource_service = ResourceService()
-        self.prompt_service = PromptService()
-        self.server_service = ServerService()
-        self.root_service = RootService()
+        # Prefer globally-initialized singletons from mcpgateway.main to ensure
+        # services share initialized EventService/Redis clients. Import lazily
+        # to avoid circular import at module load time. Fall back to local
+        # instances if singletons are not available (tests, isolated usage).
+        # Use globally-exported singletons from service modules so they
+        # share initialized EventService/Redis clients created at app startup.
+        # First-Party
+        from mcpgateway.services.gateway_service import gateway_service
+        from mcpgateway.services.prompt_service import prompt_service
+        from mcpgateway.services.resource_service import resource_service
+        from mcpgateway.services.root_service import root_service
+        from mcpgateway.services.server_service import server_service
+        from mcpgateway.services.tool_service import tool_service
+
+        self.gateway_service = gateway_service
+        self.tool_service = tool_service
+        self.resource_service = resource_service
+        self.prompt_service = prompt_service
+        self.server_service = server_service
+        self.root_service = root_service
         self.active_imports: Dict[str, ImportStatus] = {}
 
     async def initialize(self) -> None:
@@ -726,7 +740,7 @@ class ImportService:
                 elif conflict_strategy == ConflictStrategy.UPDATE:
                     try:
                         # Find existing gateway by name
-                        gateways = await self.gateway_service.list_gateways(db, include_inactive=True)
+                        gateways, _ = await self.gateway_service.list_gateways(db, include_inactive=True)
                         existing_gateway = next((g for g in gateways if g.name == gateway_name), None)
                         if existing_gateway:
                             update_data = self._convert_to_gateway_update(gateway_data)
@@ -943,14 +957,34 @@ class ImportService:
             if not tools_to_register:
                 return
 
+            # Use a batch ID so we can scope the post-import fixup below.
+            batch_id = str(uuid.uuid4())
+
             # Use bulk registration
             result = await self.tool_service.register_tools_bulk(
                 db=db,
                 tools=tools_to_register,
                 created_by=imported_by,
                 created_via="import",
+                import_batch_id=batch_id,
                 conflict_strategy=conflict_strategy.value,
             )
+
+            # Restore original_description from export data for newly created tools.
+            # register_tools_bulk sets original_description=description, but the
+            # export payload may carry the real upstream original_description.
+            if result.get("created", 0) > 0:
+                orig_desc_map = {d["name"]: d["original_description"] for d in tools_data if d.get("original_description") and d.get("original_description") != d.get("description")}
+                if orig_desc_map:
+                    # Third-Party
+                    from sqlalchemy import select
+
+                    for tool_name, orig_desc in orig_desc_map.items():
+                        stmt = select(Tool).where(Tool.original_name == tool_name, Tool.import_batch_id == batch_id)
+                        db_tool = db.execute(stmt).scalar_one_or_none()
+                        if db_tool:
+                            db_tool.original_description = orig_desc
+                    db.commit()
 
             # Update status based on results
             status.created_entities += result["created"]
@@ -1593,7 +1627,7 @@ class ImportService:
                 existing, _ = await self.tool_service.list_tools(db)
                 item_info["conflicts_with"] = any(t.original_name == item_name for t in existing)
             elif entity_type == "gateways":
-                existing = await self.gateway_service.list_gateways(db)
+                existing, _ = await self.gateway_service.list_gateways(db)
                 item_info["conflicts_with"] = any(g.name == item_name for g in existing)
             elif entity_type == "servers":
                 existing = await self.server_service.list_servers(db)
@@ -1707,7 +1741,7 @@ class ImportService:
 
             # Check gateway conflicts
             if "gateways" in entities:
-                existing_gateways = await self.gateway_service.list_gateways(db)
+                existing_gateways, _ = await self.gateway_service.list_gateways(db)
                 existing_names = {g.name for g in existing_gateways}
 
                 gateway_conflicts = []

@@ -20,38 +20,56 @@ class TestAPIIntegration:
         pytest tests/playwright/test_api_integration.py
     """
 
-    @pytest.mark.skip(reason="Temporarily disabled for demonstration purposes")
     def test_should_handle_mcp_protocol_requests(self, page: Page, admin_page):
-        """Test MCP protocol API integration via UI."""
-        api_calls = []
+        """Test MCP tool test modal via UI.
 
-        def handle_request(route):
-            api_calls.append(route.request.url)
-            route.continue_()
+        Verifies the tool test flow: click Test on a tool row, modal opens
+        with dynamically generated form fields, click Run Tool, result area
+        displays output.
+        """
+        # admin_page fixture ensures login; use raw page for operations
+        page.click('[data-testid="tools-tab"]')
+        page.wait_for_selector("#tools-panel:not(.hidden)")
 
-        page.route("/api/mcp/**", handle_request)
-        page.click("#tab-tools")
-        page.wait_for_selector("#tools-panel")
-        first_tool = page.locator("#tools-table tbody tr").first
-        first_tool.locator('button:has-text("Execute")').click()
-        expect(page.locator("#tool-execution-modal")).to_be_visible()
-        page.fill('[name="tool-params"]', '{"test": "value"}')
+        # Wait for tools table to load
+        try:
+            page.wait_for_selector("#tools-table-body tr", timeout=10000)
+        except Exception:
+            pytest.skip("No tools available to test MCP protocol requests")
+
+        first_tool = page.locator("#tools-table-body tr").first
+        test_btn = first_tool.locator('button:has-text("Test")')
+        if test_btn.count() == 0:
+            pytest.skip("No Test button available on first tool")
+        test_btn.click()
+
+        # Wait for tool test modal and dynamic form field generation
+        expect(page.locator("#tool-test-modal")).to_be_visible(timeout=10000)
+        # Wait for dynamic form fields to be generated from schema
+        page.wait_for_selector("#tool-test-form-fields", state="visible", timeout=10000)
+
+        # Fill any dynamically generated form fields (schema-based)
+        form_fields = page.locator("#tool-test-form-fields input")
+        for i in range(form_fields.count()):
+            field = form_fields.nth(i)
+            if field.input_value() == "":
+                field.fill("test")
+
+        # Click Run Tool and verify result area becomes populated
         page.click('button:has-text("Run Tool")')
-        page.wait_for_selector(".tool-result", timeout=10000)
-        expect(page.locator(".tool-result")).to_be_visible()
-        assert len(api_calls) > 0
+        page.wait_for_selector("#tool-test-result", timeout=30000)
+        expect(page.locator("#tool-test-result")).to_be_visible()
 
-    @pytest.mark.skip(reason="Temporarily disabled for demonstration purposes")
-    def test_mcp_initialize_endpoint(self, page: Page, request: APIRequestContext, admin_page):
+    def test_mcp_initialize_endpoint(self, page: Page, api_request_context: APIRequestContext, admin_page):
         """Test MCP initialize endpoint directly via APIRequestContext."""
         cookies = page.context.cookies()
         jwt_cookie = next((c for c in cookies if c["name"] == "jwt_token"), None)
         assert jwt_cookie is not None
-        response = request.post(
-            "/api/mcp/initialize",
-            headers={"Cookie": f"jwt_token={jwt_cookie['value']}"},
-            data={"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}}, "id": 1},
+        response = api_request_context.post(
+            "/protocol/initialize",
+            headers={"Authorization": f"Bearer {jwt_cookie['value']}"},
+            data={"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test-client", "version": "1.0.0"}},
         )
         assert response.ok
         data = response.json()
-        assert "result" in data
+        assert "protocolVersion" in data

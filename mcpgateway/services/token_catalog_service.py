@@ -15,9 +15,11 @@ Examples:
 """
 
 # Standard
+import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
-from typing import List, Optional
+import math
+from typing import Dict, List, Optional
 import uuid
 
 # Third-Party
@@ -33,6 +35,9 @@ from mcpgateway.utils.create_jwt_token import create_jwt_token
 # Initialize logging
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
+
+# Strong references to background tasks to prevent GC before completion
+_background_tasks: set[asyncio.Task] = set()
 
 
 class TokenScope:
@@ -233,39 +238,51 @@ class TokenCatalogService:
         Returns:
             str: Signed JWT token string ready for API authentication
 
+        Raises:
+            ValueError: If expires_at is in the past (cannot create already-expired tokens)
+
         Note:
             This is an internal method. Use create_token() to generate
             tokens with proper database tracking and validation.
         """
-        now = datetime.now(timezone.utc)
+        # Calculate expiration in minutes from expires_at
+        expires_in_minutes = 0
+        if expires_at:
+            now = datetime.now(timezone.utc)
+            delta = expires_at - now
+            delta_seconds = delta.total_seconds()
 
-        # Build JWT payload with required claims
-        payload = {
-            "sub": user_email,  # Subject (user email)
-            "iss": settings.jwt_issuer,  # Issuer
-            "aud": settings.jwt_audience,  # Audience
-            "iat": int(now.timestamp()),  # Issued at
-            "jti": jti,  # JWT ID for uniqueness
-            "user": {"email": user_email, "full_name": "API Token User", "is_admin": user.is_admin if user else False, "auth_provider": "api_token"},  # Use actual admin status if user provided
-            "teams": [team_id] if team_id else [],
-            "namespaces": [f"user:{user_email}", "public"] + ([f"team:{team_id}"] if team_id else []),
+            # Guard: reject already-expired expiration times
+            if delta_seconds <= 0:
+                raise ValueError("Token expiration time is in the past. Cannot create already-expired tokens.")
+
+            # Use ceiling to ensure we always have at least 1 minute expiration
+            # This prevents <60s from rounding to 0 and creating non-expiring tokens
+            expires_in_minutes = max(1, math.ceil(delta_seconds / 60))
+
+        # Build user data dict
+        user_data = {
+            "email": user_email,
+            "full_name": "API Token User",
+            "is_admin": user.is_admin if user else False,
+            "auth_provider": "api_token",
         }
 
-        # Add expiration if specified
-        if expires_at:
-            payload["exp"] = int(expires_at.timestamp())
+        # Build teams list
+        teams = [team_id] if team_id else []
 
-        # Add scoping information if available
+        # Build scopes dict
         # Empty permissions = defer to RBAC at runtime (not wildcard access)
+        scopes_dict = None
         if scope:
-            payload["scopes"] = {
+            scopes_dict = {
                 "server_id": scope.server_id,
                 "permissions": scope.permissions if scope.permissions is not None else [],
                 "ip_restrictions": scope.ip_restrictions or [],
                 "time_restrictions": scope.time_restrictions or {},
             }
         else:
-            payload["scopes"] = {
+            scopes_dict = {
                 "server_id": None,
                 "permissions": [],  # Empty = inherit from RBAC at runtime
                 "ip_restrictions": [],
@@ -273,8 +290,14 @@ class TokenCatalogService:
             }
 
         # Generate JWT token using the centralized token creation utility
-        # The create_jwt_token will handle expiration and other standard claims
-        return await create_jwt_token(payload, expires_in_minutes=0)
+        # Pass structured data to the enhanced create_jwt_token function
+        return await create_jwt_token(
+            data={"sub": user_email, "jti": jti, "token_use": "api"},  # nosec B105 - token type marker, not a password
+            expires_in_minutes=expires_in_minutes,
+            user_data=user_data,
+            teams=teams,
+            scopes=scopes_dict,
+        )
 
     def _hash_token(self, token: str) -> str:
         """Create secure hash of token for storage.
@@ -350,6 +373,7 @@ class TokenCatalogService:
         tags: Optional[List[str]] = None,
         team_id: Optional[str] = None,
         caller_permissions: Optional[List[str]] = None,
+        is_active: bool = True,
     ) -> tuple[EmailApiToken, str]:
         """
         Create a new API token with team-level scoping and additional configurations.
@@ -376,6 +400,7 @@ class TokenCatalogService:
             team_id (Optional[str]): The team ID to which the token should be scoped. This is required for team-level scoping.
             caller_permissions (Optional[List[str]]): The permissions of the caller creating the token. Used for
                 scope containment validation to ensure the new token cannot have broader permissions than the caller.
+            is_active (bool): Whether the token should be created as active (default is True).
 
         Returns:
             tuple[EmailApiToken, str]: A tuple where the first element is the `EmailApiToken` database record and
@@ -441,6 +466,10 @@ class TokenCatalogService:
         if expires_in_days:
             expires_at = utc_now() + timedelta(days=expires_in_days)
 
+        # Enforce expiration requirement if configured
+        if settings.require_token_expiration and not expires_at:
+            raise ValueError("Token expiration is required by server policy (REQUIRE_TOKEN_EXPIRATION=true). Please specify an expiration date for the token.")
+
         jti = str(uuid.uuid4())  # Unique JWT ID
         # Generate JWT token with all necessary claims
         raw_token = await self._generate_token(user_email=user_email, jti=jti, team_id=team_id, expires_at=expires_at, scope=scope, user=user)  # Pass user object to include admin status
@@ -466,7 +495,7 @@ class TokenCatalogService:
             time_restrictions=scope.time_restrictions if scope else {},
             usage_limits=scope.usage_limits if scope else {},
             # Token status
-            is_active=True,
+            is_active=is_active,
             created_at=utc_now(),
             last_used=None,
         )
@@ -478,6 +507,92 @@ class TokenCatalogService:
         token_type = f"team-scoped (team: {team_id})" if team_id else "public-only"
         logger.info(f"Created {token_type} API token '{name}' for user {user_email}. Token ID: {api_token.id}, Expires: {expires_at or 'Never'}")
         return api_token, raw_token
+
+    async def count_user_tokens(self, user_email: str, include_inactive: bool = False) -> int:
+        """Count API tokens for a user.
+
+        Args:
+            user_email: User's email address
+            include_inactive: Include inactive/expired tokens
+
+        Returns:
+            int: Total number of matching tokens
+        """
+        # pylint: disable=not-callable
+        query = select(func.count(EmailApiToken.id)).where(EmailApiToken.user_email == user_email)
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        result = self.db.execute(query)
+        return result.scalar() or 0
+
+    async def get_user_team_ids(self, user_email: str) -> List[str]:
+        """Get all team IDs the user is a member of.
+
+        Uses TeamManagementService.get_user_teams which is cached and consistent
+        with how other services (servers, tools, resources) resolve team visibility.
+
+        Args:
+            user_email: User's email address
+
+        Returns:
+            List[str]: Team IDs the user belongs to
+        """
+        # First-Party
+        from mcpgateway.services.team_management_service import TeamManagementService  # pylint: disable=import-outside-toplevel
+
+        team_service = TeamManagementService(self.db)
+        user_teams = await team_service.get_user_teams(user_email)
+        return [team.id for team in user_teams]
+
+    async def count_user_and_team_tokens(self, user_email: str, include_inactive: bool = False) -> int:
+        """Count API tokens for a user plus team tokens from teams the user belongs to.
+
+        This combines personal tokens (created by the user) with team-scoped tokens
+        from all teams where the user is an active member.
+
+        Args:
+            user_email: User's email address
+            include_inactive: Include inactive/expired tokens
+
+        Returns:
+            int: Total number of matching tokens
+        """
+        team_ids = await self.get_user_team_ids(user_email)
+
+        # Build query: tokens created by user OR tokens in user's teams
+        conditions = [EmailApiToken.user_email == user_email]
+        if team_ids:
+            conditions.append(EmailApiToken.team_id.in_(team_ids))
+
+        # pylint: disable=not-callable
+        query = select(func.count(EmailApiToken.id)).where(or_(*conditions))
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        result = self.db.execute(query)
+        return result.scalar() or 0
+
+    async def count_team_tokens(self, team_id: str, include_inactive: bool = False) -> int:
+        """Count API tokens for a team.
+
+        Args:
+            team_id: Team ID to count tokens for
+            include_inactive: Include inactive/expired tokens
+
+        Returns:
+            int: Total number of matching tokens
+        """
+        # pylint: disable=not-callable
+        query = select(func.count(EmailApiToken.id)).where(EmailApiToken.team_id == team_id)
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        result = self.db.execute(query)
+        return result.scalar() or 0
 
     async def list_user_tokens(self, user_email: str, include_inactive: bool = False, limit: int = 100, offset: int = 0) -> List[EmailApiToken]:
         """List API tokens for a user.
@@ -510,11 +625,11 @@ class TokenCatalogService:
         return result.scalars().all()
 
     async def list_team_tokens(self, team_id: str, user_email: str, include_inactive: bool = False, limit: int = 100, offset: int = 0) -> List[EmailApiToken]:
-        """List API tokens for a team (only accessible by team owners).
+        """List API tokens for a team (accessible by any active team member).
 
         Args:
             team_id: Team ID to list tokens for
-            user_email: User's email (must be team owner)
+            user_email: User's email (must be an active member of the team)
             include_inactive: Include inactive/expired tokens
             limit: Maximum tokens to return
             offset: Number of tokens to skip
@@ -523,18 +638,12 @@ class TokenCatalogService:
             List[EmailApiToken]: Team's API tokens
 
         Raises:
-            ValueError: If user is not a team owner
+            ValueError: If user is not an active member of the team
         """
-        # Validate user is team owner
-        # First-Party
-        from mcpgateway.db import EmailTeamMember  # pylint: disable=import-outside-toplevel
+        team_ids = await self.get_user_team_ids(user_email)
 
-        membership = self.db.execute(
-            select(EmailTeamMember).where(and_(EmailTeamMember.team_id == team_id, EmailTeamMember.user_email == user_email, EmailTeamMember.role == "owner", EmailTeamMember.is_active.is_(True)))
-        ).scalar_one_or_none()
-
-        if not membership:
-            raise ValueError(f"Only team owners can view team tokens for {team_id}")
+        if team_id not in team_ids:
+            raise ValueError(f"User {user_email} is not an active member of team {team_id}")
 
         # Validate parameters
         if limit <= 0 or limit > 1000:
@@ -547,6 +656,47 @@ class TokenCatalogService:
             query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
 
         query = query.order_by(EmailApiToken.created_at.desc()).limit(limit).offset(offset)
+        result = self.db.execute(query)
+        return result.scalars().all()
+
+    async def list_user_and_team_tokens(self, user_email: str, include_inactive: bool = False, limit: int = 100, offset: int = 0) -> List[EmailApiToken]:
+        """List API tokens for a user plus team tokens from teams the user belongs to.
+
+        This combines personal tokens (created by the user) with team-scoped tokens
+        from all teams where the user is an active member.
+
+        Args:
+            user_email: User's email address
+            include_inactive: Include inactive/expired tokens
+            limit: Maximum tokens to return
+            offset: Number of tokens to skip
+
+        Returns:
+            List[EmailApiToken]: Combined list of user's personal tokens and team tokens
+
+        Examples:
+            >>> service = TokenCatalogService(None)  # Would use real DB session
+            >>> # Returns List[EmailApiToken] including personal and team tokens
+        """
+        # Validate parameters
+        if limit <= 0 or limit > 1000:
+            limit = 50
+        offset = max(offset, 0)
+
+        team_ids = await self.get_user_team_ids(user_email)
+
+        # Build query: tokens created by user OR tokens in user's teams
+        conditions = [EmailApiToken.user_email == user_email]
+        if team_ids:
+            conditions.append(EmailApiToken.team_id.in_(team_ids))
+
+        query = select(EmailApiToken).where(or_(*conditions))
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        query = query.order_by(EmailApiToken.created_at.desc()).limit(limit).offset(offset)
+
         result = self.db.execute(query)
         return result.scalars().all()
 
@@ -581,6 +731,7 @@ class TokenCatalogService:
         scope: Optional[TokenScope] = None,
         tags: Optional[List[str]] = None,
         caller_permissions: Optional[List[str]] = None,
+        is_active: Optional[bool] = None,
     ) -> Optional[EmailApiToken]:
         """Update an existing token with scope containment validation.
 
@@ -592,6 +743,7 @@ class TokenCatalogService:
             scope: New scoping configuration
             tags: New tags
             caller_permissions: Caller's effective permissions for scope containment
+            is_active: New token active status
 
         Returns:
             Optional[EmailApiToken]: Updated token if found
@@ -628,6 +780,9 @@ class TokenCatalogService:
         if tags is not None:
             token.tags = tags
 
+        if is_active is not None:
+            token.is_active = is_active
+
         if scope:
             token.server_id = scope.server_id
             token.resource_scopes = scope.permissions
@@ -643,11 +798,11 @@ class TokenCatalogService:
         return token
 
     async def revoke_token(self, token_id: str, user_email: str, revoked_by: str, reason: Optional[str] = None) -> bool:
-        """Revoke a token owned by the specified user.
+        """Revoke a token owned by the specified user or in a team the user belongs to.
 
         Args:
             token_id: Token ID to revoke
-            user_email: Owner's email - token must belong to this user (ownership check)
+            user_email: Caller's email - must own the token or be a member of the token's team
             revoked_by: Email of user performing revocation (for audit)
             reason: Optional reason for revocation
 
@@ -658,10 +813,22 @@ class TokenCatalogService:
             >>> service = TokenCatalogService(None)  # Would use real DB session
             >>> # Returns bool: True if token was revoked successfully
         """
-        # SECURITY FIX: Filter by owner to prevent cross-user revocation
+        # First try ownership match
         token = await self.get_token(token_id, user_email)
+
+        # If not owned by caller, check if token is in a team the caller is an owner of
         if not token:
-            return False
+            token = await self.get_token(token_id)
+            if not token or not token.team_id:
+                return False
+            # Only team owners (admins) can revoke other members' team tokens
+            # First-Party
+            from mcpgateway.services.team_management_service import TeamManagementService  # pylint: disable=import-outside-toplevel
+
+            team_service = TeamManagementService(self.db)
+            role = await team_service.get_user_role_in_team(user_email, token.team_id)
+            if role != "owner":
+                return False
 
         # Mark token as inactive
         token.is_active = False
@@ -674,13 +841,12 @@ class TokenCatalogService:
 
         # Invalidate auth cache for revoked token
         try:
-            # Standard
-            import asyncio  # pylint: disable=import-outside-toplevel
-
             # First-Party
             from mcpgateway.cache.auth_cache import auth_cache  # pylint: disable=import-outside-toplevel
 
-            asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+            task = asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         except Exception as cache_error:
             logger.debug(f"Failed to invalidate auth cache for revoked token: {cache_error}")
 
@@ -717,13 +883,12 @@ class TokenCatalogService:
         self.db.commit()
 
         try:
-            # Standard
-            import asyncio  # pylint: disable=import-outside-toplevel
-
             # First-Party
             from mcpgateway.cache.auth_cache import auth_cache  # pylint: disable=import-outside-toplevel
 
-            asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+            task = asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         except Exception as cache_error:
             logger.debug(f"Failed to invalidate auth cache: {cache_error}")
 
@@ -793,13 +958,6 @@ class TokenCatalogService:
 
         self.db.add(usage_log)
         self.db.commit()
-
-        # Update token last_used timestamp
-        token = self.db.execute(select(EmailApiToken).where(EmailApiToken.jti == jti)).scalar_one_or_none()
-
-        if token:
-            token.last_used = utc_now()
-            self.db.commit()
 
     async def get_token_usage_stats(self, user_email: str, token_id: Optional[str] = None, days: int = 30) -> dict:
         """Get token usage statistics.
@@ -967,6 +1125,62 @@ class TokenCatalogService:
         """
         result = self.db.execute(select(TokenRevocation).where(TokenRevocation.jti == jti))
         return result.scalar_one_or_none()
+
+    async def get_token_revocations_batch(self, jtis: List[str]) -> Dict[str, TokenRevocation]:
+        """Get token revocation information for multiple JTIs in a single query.
+
+        Args:
+            jtis: List of JWT token IDs
+
+        Returns:
+            Dict mapping JTI to TokenRevocation for revoked tokens only.
+        """
+        if not jtis:
+            return {}
+        result = self.db.execute(select(TokenRevocation).where(TokenRevocation.jti.in_(jtis)))
+        return {rev.jti: rev for rev in result.scalars().all()}
+
+    async def list_all_tokens(self, include_inactive: bool = False, limit: int = 100, offset: int = 0) -> List[EmailApiToken]:
+        """List all API tokens (admin only).
+
+        Args:
+            include_inactive: Include inactive/expired tokens
+            limit: Maximum tokens to return
+            offset: Number of tokens to skip
+
+        Returns:
+            List[EmailApiToken]: All API tokens
+        """
+        if limit <= 0 or limit > 1000:
+            limit = 50
+        offset = max(offset, 0)
+
+        query = select(EmailApiToken)
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        query = query.order_by(EmailApiToken.created_at.desc()).limit(limit).offset(offset)
+
+        result = self.db.execute(query)
+        return result.scalars().all()
+
+    async def count_all_tokens(self, include_inactive: bool = False) -> int:
+        """Count all API tokens (admin only).
+
+        Args:
+            include_inactive: Include inactive/expired tokens in count
+
+        Returns:
+            int: Total count of all tokens
+        """
+        query = select(func.count(EmailApiToken.id))  # pylint: disable=not-callable
+
+        if not include_inactive:
+            query = query.where(and_(EmailApiToken.is_active.is_(True), or_(EmailApiToken.expires_at.is_(None), EmailApiToken.expires_at > utc_now())))
+
+        result = self.db.execute(query)
+        return result.scalar() or 0
 
     async def cleanup_expired_tokens(self) -> int:
         """Clean up expired tokens using bulk UPDATE.

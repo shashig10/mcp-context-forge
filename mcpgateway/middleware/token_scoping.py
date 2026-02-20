@@ -21,6 +21,7 @@ from fastapi import HTTPException, Request, status
 from fastapi.security import HTTPBearer
 
 # First-Party
+from mcpgateway.auth import normalize_token_teams
 from mcpgateway.db import Permissions
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.utils.orjson_response import ORJSONResponse
@@ -50,6 +51,7 @@ _RESOURCE_PATTERNS: List[Tuple[Pattern[str], str]] = [
     (re.compile(r"/tools/?([a-f0-9\-]+)"), "tool"),
     (re.compile(r"/resources/?([a-f0-9\-]+)"), "resource"),
     (re.compile(r"/prompts/?([a-f0-9\-]+)"), "prompt"),
+    (re.compile(r"/gateways/?([a-f0-9\-]+)"), "gateway"),
 ]
 
 # Permission map with precompiled patterns
@@ -57,27 +59,42 @@ _RESOURCE_PATTERNS: List[Tuple[Pattern[str], str]] = [
 _PERMISSION_PATTERNS: List[Tuple[str, Pattern[str], str]] = [
     # Tools permissions
     ("GET", re.compile(r"^/tools(?:$|/)"), Permissions.TOOLS_READ),
-    ("POST", re.compile(r"^/tools(?:$|/)"), Permissions.TOOLS_CREATE),
+    ("POST", re.compile(r"^/tools/?$"), Permissions.TOOLS_CREATE),  # Only exact /tools or /tools/
+    ("POST", re.compile(r"^/tools/[^/]+/"), Permissions.TOOLS_UPDATE),  # POST to sub-resources (state, toggle)
     ("PUT", re.compile(r"^/tools/[^/]+(?:$|/)"), Permissions.TOOLS_UPDATE),
     ("DELETE", re.compile(r"^/tools/[^/]+(?:$|/)"), Permissions.TOOLS_DELETE),
     ("GET", re.compile(r"^/servers/[^/]+/tools(?:$|/)"), Permissions.TOOLS_READ),
     ("POST", re.compile(r"^/servers/[^/]+/tools/[^/]+/call(?:$|/)"), Permissions.TOOLS_EXECUTE),
     # Resources permissions
     ("GET", re.compile(r"^/resources(?:$|/)"), Permissions.RESOURCES_READ),
-    ("POST", re.compile(r"^/resources(?:$|/)"), Permissions.RESOURCES_CREATE),
+    ("POST", re.compile(r"^/resources/?$"), Permissions.RESOURCES_CREATE),  # Only exact /resources or /resources/
+    ("POST", re.compile(r"^/resources/subscribe(?:$|/)"), Permissions.RESOURCES_READ),  # SSE subscription
+    ("POST", re.compile(r"^/resources/[^/]+/"), Permissions.RESOURCES_UPDATE),  # POST to sub-resources (state, toggle)
     ("PUT", re.compile(r"^/resources/[^/]+(?:$|/)"), Permissions.RESOURCES_UPDATE),
     ("DELETE", re.compile(r"^/resources/[^/]+(?:$|/)"), Permissions.RESOURCES_DELETE),
     ("GET", re.compile(r"^/servers/[^/]+/resources(?:$|/)"), Permissions.RESOURCES_READ),
     # Prompts permissions
     ("GET", re.compile(r"^/prompts(?:$|/)"), Permissions.PROMPTS_READ),
-    ("POST", re.compile(r"^/prompts(?:$|/)"), Permissions.PROMPTS_CREATE),
+    ("POST", re.compile(r"^/prompts/?$"), Permissions.PROMPTS_CREATE),  # Only exact /prompts or /prompts/
+    ("POST", re.compile(r"^/prompts/[^/]+/"), Permissions.PROMPTS_UPDATE),  # POST to sub-resources (state, toggle)
+    ("POST", re.compile(r"^/prompts/[^/]+$"), Permissions.PROMPTS_READ),  # MCP spec prompt retrieval (POST /prompts/{id})
     ("PUT", re.compile(r"^/prompts/[^/]+(?:$|/)"), Permissions.PROMPTS_UPDATE),
     ("DELETE", re.compile(r"^/prompts/[^/]+(?:$|/)"), Permissions.PROMPTS_DELETE),
     # Server management permissions
+    ("GET", re.compile(r"^/servers/[^/]+/sse(?:$|/)"), Permissions.SERVERS_USE),  # Server SSE access endpoint
     ("GET", re.compile(r"^/servers(?:$|/)"), Permissions.SERVERS_READ),
-    ("POST", re.compile(r"^/servers(?:$|/)"), Permissions.SERVERS_CREATE),
+    ("POST", re.compile(r"^/servers/?$"), Permissions.SERVERS_CREATE),  # Only exact /servers or /servers/
+    ("POST", re.compile(r"^/servers/[^/]+/(?:state|toggle)(?:$|/)"), Permissions.SERVERS_UPDATE),  # Server management sub-resources
+    ("POST", re.compile(r"^/servers/[^/]+/message(?:$|/)"), Permissions.SERVERS_USE),  # Server message access endpoint
+    ("POST", re.compile(r"^/servers/[^/]+/mcp(?:$|/)"), Permissions.SERVERS_USE),  # Server MCP access endpoint
     ("PUT", re.compile(r"^/servers/[^/]+(?:$|/)"), Permissions.SERVERS_UPDATE),
     ("DELETE", re.compile(r"^/servers/[^/]+(?:$|/)"), Permissions.SERVERS_DELETE),
+    # Gateway permissions
+    ("GET", re.compile(r"^/gateways(?:$|/)"), Permissions.GATEWAYS_READ),
+    ("POST", re.compile(r"^/gateways/?$"), Permissions.GATEWAYS_CREATE),  # Only exact /gateways or /gateways/
+    ("POST", re.compile(r"^/gateways/[^/]+/"), Permissions.GATEWAYS_UPDATE),  # POST to sub-resources (state, toggle, refresh)
+    ("PUT", re.compile(r"^/gateways/[^/]+(?:$|/)"), Permissions.GATEWAYS_UPDATE),
+    ("DELETE", re.compile(r"^/gateways/[^/]+(?:$|/)"), Permissions.GATEWAYS_DELETE),
     # Admin permissions
     ("GET", re.compile(r"^/admin(?:$|/)"), Permissions.ADMIN_USER_MANAGEMENT),
     ("POST", re.compile(r"^/admin/[^/]+(?:$|/)"), Permissions.ADMIN_USER_MANAGEMENT),
@@ -318,7 +335,7 @@ class TokenScopingMiddleware:
                 return path_server_id == server_id
 
         # If no server ID found in path, allow general endpoints
-        general_endpoints = ["/health", "/metrics", "/openapi.json", "/docs", "/redoc"]
+        general_endpoints = ["/health", "/metrics", "/openapi.json", "/docs", "/redoc", "/rpc"]
 
         # Check exact root path separately
         if request_path == "/":
@@ -537,7 +554,7 @@ class TokenScopingMiddleware:
         from sqlalchemy import select  # pylint: disable=import-outside-toplevel
 
         # First-Party
-        from mcpgateway.db import get_db, Prompt, Resource, Server, Tool  # pylint: disable=import-outside-toplevel
+        from mcpgateway.db import Gateway, get_db, Prompt, Resource, Server, Tool  # pylint: disable=import-outside-toplevel
 
         # Track if we own the session (and thus must clean it up)
         owns_session = db is None
@@ -576,13 +593,14 @@ class TokenScopingMiddleware:
                     logger.warning(f"Access denied: Server {resource_id} is team-scoped to '{server.team_id}', token is scoped to teams {token_team_ids}")
                     return False
 
-                # PRIVATE SERVERS: Check if server belongs to token's teams
+                # PRIVATE SERVERS: Owner-only access (per RBAC doc)
                 if server_visibility == "private":
-                    if server.team_id in token_team_ids:
-                        logger.debug(f"Access granted: Private server {resource_id} in token's team {server.team_id}")
+                    server_owner = getattr(server, "owner_email", None)
+                    if server_owner and server_owner == _user_email:
+                        logger.debug(f"Access granted: Private server {resource_id} owned by {_user_email}")
                         return True
 
-                    logger.warning(f"Access denied: Server {resource_id} is private to team '{server.team_id}'")
+                    logger.warning(f"Access denied: Server {resource_id} is private, owner is '{server_owner}', requester is '{_user_email}'")
                     return False
 
                 # Unknown visibility - deny by default
@@ -621,14 +639,14 @@ class TokenScopingMiddleware:
                     logger.warning(f"Access denied: Tool {resource_id} is team-scoped to '{tool_team_id}', token is scoped to teams {token_team_ids}")
                     return False
 
-                # PRIVATE TOOLS: Check if tool is in token's team context
+                # PRIVATE TOOLS: Owner-only access (per RBAC doc)
                 if tool_visibility in ["private", "user"]:
-                    tool_team_id = getattr(tool, "team_id", None)
-                    if tool_team_id and tool_team_id in token_team_ids:
-                        logger.debug(f"Access granted: Private tool {resource_id} in token's team {tool_team_id}")
+                    tool_owner = getattr(tool, "owner_email", None)
+                    if tool_owner and tool_owner == _user_email:
+                        logger.debug(f"Access granted: Private tool {resource_id} owned by {_user_email}")
                         return True
 
-                    logger.warning(f"Access denied: Tool {resource_id} is {tool_visibility} and not in token's teams")
+                    logger.warning(f"Access denied: Tool {resource_id} is {tool_visibility}, owner is '{tool_owner}', requester is '{_user_email}'")
                     return False
 
                 # Unknown visibility - deny by default
@@ -667,14 +685,14 @@ class TokenScopingMiddleware:
                     logger.warning(f"Access denied: Resource {resource_id} is team-scoped to '{resource_team_id}', token is scoped to teams {token_team_ids}")
                     return False
 
-                # PRIVATE RESOURCES: Check if resource is in token's team context
+                # PRIVATE RESOURCES: Owner-only access (per RBAC doc)
                 if resource_visibility in ["private", "user"]:
-                    resource_team_id = getattr(resource, "team_id", None)
-                    if resource_team_id and resource_team_id in token_team_ids:
-                        logger.debug(f"Access granted: Private resource {resource_id} in token's team {resource_team_id}")
+                    resource_owner = getattr(resource, "owner_email", None)
+                    if resource_owner and resource_owner == _user_email:
+                        logger.debug(f"Access granted: Private resource {resource_id} owned by {_user_email}")
                         return True
 
-                    logger.warning(f"Access denied: Resource {resource_id} is {resource_visibility} and not in token's teams")
+                    logger.warning(f"Access denied: Resource {resource_id} is {resource_visibility}, owner is '{resource_owner}', requester is '{_user_email}'")
                     return False
 
                 # Unknown visibility - deny by default
@@ -713,18 +731,64 @@ class TokenScopingMiddleware:
                     logger.warning(f"Access denied: Prompt {resource_id} is team-scoped to '{prompt_team_id}', token is scoped to teams {token_team_ids}")
                     return False
 
-                # PRIVATE PROMPTS: Check if prompt is in token's team context
+                # PRIVATE PROMPTS: Owner-only access (per RBAC doc)
                 if prompt_visibility in ["private", "user"]:
-                    prompt_team_id = getattr(prompt, "team_id", None)
-                    if prompt_team_id and prompt_team_id in token_team_ids:
-                        logger.debug(f"Access granted: Private prompt {resource_id} in token's team {prompt_team_id}")
+                    prompt_owner = getattr(prompt, "owner_email", None)
+                    if prompt_owner and prompt_owner == _user_email:
+                        logger.debug(f"Access granted: Private prompt {resource_id} owned by {_user_email}")
                         return True
 
-                    logger.warning(f"Access denied: Prompt {resource_id} is {prompt_visibility} and not in token's teams")
+                    logger.warning(f"Access denied: Prompt {resource_id} is {prompt_visibility}, owner is '{prompt_owner}', requester is '{_user_email}'")
                     return False
 
                 # Unknown visibility - deny by default
                 logger.warning(f"Access denied: Prompt {resource_id} has unknown visibility: {prompt_visibility}")
+                return False
+
+            # CHECK GATEWAYS
+            if resource_type == "gateway":
+                gateway = db.execute(select(Gateway).where(Gateway.id == resource_id)).scalar_one_or_none()
+
+                if not gateway:
+                    logger.warning(f"Gateway {resource_id} not found in database")
+                    return True
+
+                # Get gateway visibility (default to 'team' if field doesn't exist)
+                gateway_visibility = getattr(gateway, "visibility", "team")
+
+                # PUBLIC GATEWAYS: Accessible by everyone (including public-only tokens)
+                if gateway_visibility == "public":
+                    logger.debug(f"Access granted: Gateway {resource_id} is PUBLIC")
+                    return True
+
+                # PUBLIC-ONLY TOKEN: Can ONLY access public gateways (strict public-only policy)
+                # No owner access - if user needs own resources, use a personal team-scoped token
+                if is_public_token:
+                    logger.warning(f"Access denied: Public-only token cannot access {gateway_visibility} gateway {resource_id}")
+                    return False
+
+                # TEAM GATEWAYS: Check if gateway's team matches token's teams
+                if gateway_visibility == "team":
+                    gateway_team_id = getattr(gateway, "team_id", None)
+                    if gateway_team_id and gateway_team_id in token_team_ids:
+                        logger.debug(f"Access granted: Team gateway {resource_id} belongs to token's team {gateway_team_id}")
+                        return True
+
+                    logger.warning(f"Access denied: Gateway {resource_id} is team-scoped to '{gateway_team_id}', token is scoped to teams {token_team_ids}")
+                    return False
+
+                # PRIVATE GATEWAYS: Owner-only access (per RBAC doc)
+                if gateway_visibility in ["private", "user"]:
+                    gateway_owner = getattr(gateway, "owner_email", None)
+                    if gateway_owner and gateway_owner == _user_email:
+                        logger.debug(f"Access granted: Private gateway {resource_id} owned by {_user_email}")
+                        return True
+
+                    logger.warning(f"Access denied: Gateway {resource_id} is {gateway_visibility}, owner is '{gateway_owner}', requester is '{_user_email}'")
+                    return False
+
+                # Unknown visibility - deny by default
+                logger.warning(f"Access denied: Gateway {resource_id} has unknown visibility: {gateway_visibility}")
                 return False
 
             # UNKNOWN RESOURCE TYPE
@@ -800,24 +864,28 @@ class TokenScopingMiddleware:
             # TEAM VALIDATION: Use single DB session for both team checks
             # This reduces connection pool overhead from 2 sessions to 1 for resource endpoints
             user_email = payload.get("sub") or payload.get("email")  # Extract user email for ownership check
-            is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
 
-            # Determine token_teams based on whether "teams" key exists and is not None
-            # - Key absent OR null + admin = None (unrestricted bypass)
-            # - Key absent OR null + non-admin = [] (public-only, secure default)
-            # - Key present with non-None value = normalize the value
-            teams_value = payload.get("teams") if "teams" in payload else None
-            if teams_value is not None:
-                token_teams = self._normalize_teams(teams_value)
-            elif is_admin:
-                # Admin without teams key (or teams: null) = unrestricted (skip team checks)
-                token_teams = None
+            # Resolve teams based on token_use claim
+            token_use = payload.get("token_use")
+            if token_use == "session":  # nosec B105 - Not a password; token_use is a JWT claim type
+                # Session token: resolve teams from DB/cache directly
+                # Cannot rely on request.state.token_teams — AuthContextMiddleware
+                # is gated by security_logging_enabled (defaults to False)
+                # First-Party
+                from mcpgateway.auth import _resolve_teams_from_db  # pylint: disable=import-outside-toplevel
+
+                is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
+                user_info = {"is_admin": is_admin}
+                token_teams = await _resolve_teams_from_db(user_email, user_info)
             else:
-                # Non-admin without teams key (or teams: null) = public-only (secure default)
-                token_teams = []
+                # API token or legacy: use embedded teams with normalize_token_teams
+                token_teams = normalize_token_teams(payload)
 
-            # Admin with no team restrictions bypasses team validation entirely
-            if is_admin and token_teams is None:
+            # Check if admin bypass is active (token_teams is None means admin with explicit null teams)
+            is_admin_bypass = token_teams is None
+
+            # Admin with explicit null teams bypasses team validation entirely
+            if is_admin_bypass:
                 logger.debug(f"Admin bypass: skipping team validation for {user_email}")
                 # Skip to other checks (server_id, IP, etc.)
             elif token_teams:

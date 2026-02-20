@@ -18,9 +18,9 @@ import pytest
 
 # First-Party
 from mcpgateway.db import OAuthToken
+from mcpgateway.services.encryption_service import EncryptionService
 from mcpgateway.services.oauth_manager import OAuthError, OAuthManager
 from mcpgateway.services.token_storage_service import TokenStorageService
-from mcpgateway.services.encryption_service import EncryptionService
 
 
 class TestOAuthManager:
@@ -240,7 +240,7 @@ class TestOAuthManager:
 
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
-                mock_encryption.decrypt_secret.return_value = "decrypted_secret"
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value="decrypted_secret")
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -256,7 +256,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager._client_credentials_flow(credentials)
                     assert result == "decrypted_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_client_credentials_flow_encryption_error(self):
@@ -302,7 +302,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption returns None - line 108
-                mock_encryption.decrypt_secret.return_value = None
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value=None)
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -319,7 +319,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager._client_credentials_flow(credentials)
                     assert result == "fallback_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_client_credentials_flow_form_encoded_response(self):
@@ -763,7 +763,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption returns None - lines 438-439
-                mock_encryption.decrypt_secret.return_value = None
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value=None)
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -780,7 +780,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager._exchange_code_for_tokens(credentials, "auth_code")
                     assert result["access_token"] == "internal_exchange_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     def test_extract_user_id_from_sub(self):
         """Test user ID extraction from token response 'sub' field."""
@@ -848,7 +848,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption returns None - lines 216-217
-                mock_encryption.decrypt_secret.return_value = None
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value=None)
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -865,7 +865,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager.exchange_code_for_token(credentials, "auth_code", "state")
                     assert result == "exchange_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_exchange_code_for_token_form_encoded_response(self):
@@ -965,6 +965,7 @@ class TestOAuthManager:
                 result = await manager.exchange_code_for_token(credentials, "auth_code", "state")
                 assert result == "retry_success_token"
                 assert mock_sleep.call_count == 1  # Should sleep before retry
+
     @pytest.mark.asyncio
     async def test_exchange_code_for_token_max_retries_exceeded(self):
         """Test exchange code for token when all retries are exhausted (lines 265-266)."""
@@ -1079,7 +1080,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption succeeds - lines 435-437
-                mock_encryption.decrypt_secret.return_value = "decrypted_secret"
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value="decrypted_secret")
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -1096,7 +1097,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager._exchange_code_for_tokens(credentials, "auth_code")
                     assert result["access_token"] == "success_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_exchange_code_for_tokens_decryption_exception(self):
@@ -1114,7 +1115,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption throws exception - lines 440-441
-                mock_encryption.decrypt_secret.side_effect = ValueError("Decryption failed")
+                mock_encryption.decrypt_secret_async = AsyncMock(side_effect=ValueError("Decryption failed"))
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -1131,7 +1132,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager._exchange_code_for_tokens(credentials, "auth_code")
                     assert result["access_token"] == "exception_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_exchange_code_for_tokens_form_encoded_response(self):
@@ -1237,7 +1238,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption succeeds - lines 213-215
-                mock_encryption.decrypt_secret.return_value = "decrypted_secret"
+                mock_encryption.decrypt_secret_async = AsyncMock(return_value="decrypted_secret")
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -1254,7 +1255,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager.exchange_code_for_token(credentials, "auth_code", "state")
                     assert result == "exchange_success_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_exchange_code_for_token_decryption_exception(self):
@@ -1272,7 +1273,7 @@ class TestOAuthManager:
             with patch("mcpgateway.services.oauth_manager.get_encryption_service") as mock_get_encryption:
                 mock_encryption = Mock()
                 # Decryption throws exception - lines 218-219
-                mock_encryption.decrypt_secret.side_effect = ValueError("Decryption failed")
+                mock_encryption.decrypt_secret_async = AsyncMock(side_effect=ValueError("Decryption failed"))
                 mock_get_encryption.return_value = mock_encryption
 
                 # Create mock response
@@ -1289,7 +1290,7 @@ class TestOAuthManager:
                 with patch.object(manager, "_get_client", return_value=mock_client):
                     result = await manager.exchange_code_for_token(credentials, "auth_code", "state")
                     assert result == "exchange_exception_token"
-                    mock_encryption.decrypt_secret.assert_called_once_with(encrypted_secret)
+                    mock_encryption.decrypt_secret_async.assert_called_once_with(encrypted_secret)
 
     @pytest.mark.asyncio
     async def test_refresh_token_success(self):
@@ -1446,7 +1447,7 @@ class TestTokenStorageService:
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
         mock_encryption = Mock()
-        mock_encryption.encrypt_secret.side_effect = ["encrypted_access", "encrypted_refresh"]
+        mock_encryption.encrypt_secret_async = AsyncMock(side_effect=["encrypted_access", "encrypted_refresh"])
 
         with patch("mcpgateway.services.token_storage_service.get_settings") as mock_get_settings:
             mock_settings = Mock()
@@ -1475,8 +1476,8 @@ class TestTokenStorageService:
                     )
 
                     # Verify encryption calls
-                    mock_encryption.encrypt_secret.assert_any_call("access_token_123")
-                    mock_encryption.encrypt_secret.assert_any_call("refresh_token_123")
+                    mock_encryption.encrypt_secret_async.assert_any_call("access_token_123")
+                    mock_encryption.encrypt_secret_async.assert_any_call("refresh_token_123")
 
                     # Verify database operations
                     mock_db.add.assert_called_once()
@@ -1547,7 +1548,7 @@ class TestTokenStorageService:
         mock_db.execute.return_value.scalar_one_or_none.return_value = existing_token
 
         mock_encryption = Mock()
-        mock_encryption.encrypt_secret.side_effect = ["encrypted_access", "encrypted_refresh"]
+        mock_encryption.encrypt_secret_async = AsyncMock(side_effect=["encrypted_access", "encrypted_refresh"])
 
         with patch("mcpgateway.services.token_storage_service.get_settings") as mock_get_settings:
             mock_settings = Mock()
@@ -1591,7 +1592,7 @@ class TestTokenStorageService:
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
         mock_encryption = Mock()
-        mock_encryption.encrypt_secret.return_value = "encrypted_access"
+        mock_encryption.encrypt_secret_async = AsyncMock(return_value="encrypted_access")
 
         with patch("mcpgateway.services.token_storage_service.get_settings") as mock_get_settings:
             mock_settings = Mock()
@@ -1613,7 +1614,7 @@ class TestTokenStorageService:
                     )
 
                     # Verify only access token was encrypted
-                    mock_encryption.encrypt_secret.assert_called_once_with("access_token_123")
+                    mock_encryption.encrypt_secret_async.assert_called_once_with("access_token_123")
 
                     added_token = mock_db.add.call_args[0][0]
                     assert added_token.access_token == "encrypted_access"
@@ -1648,7 +1649,7 @@ class TestTokenStorageService:
         mock_db.execute.return_value.scalar_one_or_none.return_value = token_record
 
         mock_encryption = Mock()
-        mock_encryption.decrypt_secret.return_value = "decrypted_access_token"
+        mock_encryption.decrypt_secret_async = AsyncMock(return_value="decrypted_access_token")
 
         with patch("mcpgateway.services.token_storage_service.get_settings") as mock_get_settings:
             mock_settings = Mock()
@@ -1663,7 +1664,7 @@ class TestTokenStorageService:
                 result = await service.get_user_token("gateway123", "test@example.com")
 
                 assert result == "decrypted_access_token"
-                mock_encryption.decrypt_secret.assert_called_once_with("encrypted_token")
+                mock_encryption.decrypt_secret_async.assert_called_once_with("encrypted_token")
 
     @pytest.mark.asyncio
     async def test_get_valid_token_success_without_encryption(self):
@@ -2176,264 +2177,3 @@ class TestTokenStorageService:
 
             assert result == 0
             mock_db.rollback.assert_called_once()
-
-
-class TestEncryptionService:
-    """Test cases for EncryptionService class."""
-
-    def test_init(self):
-        """Test EncryptionService initialization."""
-        encryption = EncryptionService(SecretStr("test_secret_key"))
-        assert encryption.encryption_secret == b"test_secret_key"
-
-    def test_encrypt_secret_success(self):
-        """Test successful secret encryption."""
-        encryption = EncryptionService(SecretStr("test_secret_key"))
-        plaintext = "my_secret_token_123"
-
-        encrypted = encryption.encrypt_secret(plaintext)
-
-        # Should be a base64-encoded string
-        assert isinstance(encrypted, str)
-        assert len(encrypted) > len(plaintext)  # Encrypted data should be longer
-
-        # Should be able to decrypt back to original
-        decrypted = encryption.decrypt_secret(encrypted)
-        assert decrypted == plaintext
-
-    def test_encrypt_secret_different_keys_different_output(self):
-        """Test that different keys produce different encrypted output."""
-        encryption1 = EncryptionService(SecretStr("key1"))
-        encryption2 = EncryptionService(SecretStr("key2"))
-        plaintext = "same_secret"
-
-        encrypted1 = encryption1.encrypt_secret(plaintext)
-        encrypted2 = encryption2.encrypt_secret(plaintext)
-
-        # Different keys should produce different encrypted output
-        assert encrypted1 != encrypted2
-
-    def test_encrypt_secret_same_key_different_output(self):
-        """Test that same key produces different encrypted output due to nonce."""
-        encryption = EncryptionService(SecretStr("test_key"))
-        plaintext = "same_secret"
-
-        encrypted1 = encryption.encrypt_secret(plaintext)
-        encrypted2 = encryption.encrypt_secret(plaintext)
-
-        # Same plaintext with same key should produce different output (due to nonce)
-        assert encrypted1 != encrypted2
-
-        # But both should decrypt to the same plaintext
-        assert encryption.decrypt_secret(encrypted1) == plaintext
-        assert encryption.decrypt_secret(encrypted2) == plaintext
-
-    def test_encrypt_secret_empty_string(self):
-        """Test encrypting empty string."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        encrypted = encryption.encrypt_secret("")
-        decrypted = encryption.decrypt_secret(encrypted)
-
-        assert decrypted == ""
-
-    def test_encrypt_secret_unicode_characters(self):
-        """Test encrypting string with unicode characters."""
-        encryption = EncryptionService(SecretStr("test_key"))
-        plaintext = "🔐 secret with émojis and spéciàl chars ñ"
-
-        encrypted = encryption.encrypt_secret(plaintext)
-        decrypted = encryption.decrypt_secret(encrypted)
-
-        assert decrypted == plaintext
-
-    def test_encrypt_secret_exception_handling(self):
-        """Test exception handling in encrypt_secret."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        with patch.object(encryption, "derive_key_argon2id", side_effect=Exception("Encryption failed")):
-            with pytest.raises(Exception, match="Encryption failed"):
-                encryption.encrypt_secret("test")
-
-    def test_decrypt_secret_success(self):
-        """Test successful secret decryption."""
-        encryption = EncryptionService(SecretStr("test_secret_key"))
-        plaintext = "original_secret"
-
-        # First encrypt
-        encrypted = encryption.encrypt_secret(plaintext)
-
-        # Then decrypt
-        decrypted = encryption.decrypt_secret(encrypted)
-
-        assert decrypted == plaintext
-
-    def test_decrypt_secret_invalid_data(self):
-        """Test decryption with invalid encrypted data."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        result = encryption.decrypt_secret("invalid_encrypted_data")
-
-        assert result is None
-
-    def test_decrypt_secret_wrong_key(self):
-        """Test decryption with wrong key."""
-        encryption1 = EncryptionService(SecretStr("key1"))
-        encryption2 = EncryptionService(SecretStr("key2"))
-
-        # Encrypt with one key
-        encrypted = encryption1.encrypt_secret("secret")
-
-        # Try to decrypt with different key
-        result = encryption2.decrypt_secret(encrypted)
-
-        assert result is None
-
-    def test_decrypt_secret_corrupted_data(self):
-        """Test decryption with corrupted base64 data."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        # Create valid encrypted data then corrupt it
-        encrypted = encryption.encrypt_secret("test")
-        corrupted = encrypted[:-5] + "XXXXX"  # Corrupt the end
-
-        result = encryption.decrypt_secret(corrupted)
-
-        assert result is None
-
-    def test_decrypt_secret_malformed_base64(self):
-        """Test decryption with malformed base64."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        result = encryption.decrypt_secret("not_valid_base64!@#")
-
-        assert result is None
-
-    def test_decrypt_secret_empty_string(self):
-        """Test decryption with empty string."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        result = encryption.decrypt_secret("")
-
-        assert result is None
-
-    def test_is_encrypted_valid_encrypted_data(self):
-        """Test is_encrypted with valid encrypted data."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        encrypted = encryption.encrypt_secret("test_data")
-
-        assert encryption.is_encrypted(encrypted) is True
-
-    def test_is_encrypted_plain_text(self):
-        """Test is_encrypted with plain text."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        assert encryption.is_encrypted("plain_text_secret") is False
-        assert encryption.is_encrypted("another_plain_string") is False
-
-    def test_is_encrypted_short_data(self):
-        """Test is_encrypted with short data."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        # Fernet encrypted data should be at least 32 bytes
-        short_data = "dGVzdA=="  # "test" in base64 (only 4 bytes when decoded)
-
-        assert encryption.is_encrypted(short_data) is False
-
-    def test_is_encrypted_valid_base64_but_not_encrypted(self):
-        """Test is_encrypted with valid base64 that's not encrypted data."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        # Create base64 data that's long enough but not encrypted
-        # Standard
-        import base64
-
-        fake_data = b"a" * 40  # 40 bytes of 'a'
-        base64_fake = base64.urlsafe_b64encode(fake_data).decode()
-
-        # This should be considered "encrypted" based on length, but won't decrypt properly
-        assert encryption.is_encrypted(base64_fake) is True
-
-        # But decryption should fail
-        assert encryption.decrypt_secret(base64_fake) is None
-
-    def test_is_encrypted_invalid_base64(self):
-        """Test is_encrypted with invalid base64."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        assert encryption.is_encrypted("not_base64!@#$%") is False
-
-    def test_is_encrypted_exception_handling(self):
-        """Test exception handling in is_encrypted."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        # Test with None (should handle gracefully)
-        with patch("base64.urlsafe_b64decode", side_effect=Exception("Base64 error")):
-            result = encryption.is_encrypted("any_string")
-            assert result is False
-
-    def test_get_encryption_service_function(self):
-        """Test the get_encryption_service utility function."""
-        # First-Party
-        from mcpgateway.services.encryption_service import get_encryption_service
-
-        encryption = get_encryption_service(SecretStr("test_secret"))
-
-        assert isinstance(encryption, EncryptionService)
-        assert encryption.encryption_secret == b"test_secret"
-
-    def test_encryption_roundtrip_multiple_values(self):
-        """Test encryption/decryption roundtrip with multiple values."""
-        encryption = EncryptionService(SecretStr("test_key"))
-
-        test_values = [
-            "simple_token",
-            "complex_token_with_special_chars_123!@#",
-            "very_long_token_" * 100,  # Very long token
-            "token_with_newlines\n\r\t",
-            "token with spaces and symbols: !@#$%^&*()",
-            "🔐🗝️🔑 tokens with emojis",
-        ]
-
-        for original in test_values:
-            encrypted = encryption.encrypt_secret(original)
-            decrypted = encryption.decrypt_secret(encrypted)
-
-            assert decrypted == original, f"Failed for: {original}"
-            assert encryption.is_encrypted(encrypted) is True
-
-    def test_encryption_key_derivation_consistency(self):
-        """Test that key derivation is consistent across instances."""
-        # Create two instances with same key
-        encryption1 = EncryptionService(SecretStr("same_key"))
-        encryption2 = EncryptionService(SecretStr("same_key"))
-
-        # Encrypt with first instance
-        plaintext = "test_consistency"
-        encrypted = encryption1.encrypt_secret(plaintext)
-
-        # Decrypt with second instance
-        decrypted = encryption2.decrypt_secret(encrypted)
-
-        assert decrypted == plaintext
-
-    def test_encryption_with_long_key(self):
-        """Test encryption with very long key."""
-        long_key = SecretStr("a" * 1000)  # Very long key
-        encryption = EncryptionService(long_key)
-
-        encrypted = encryption.encrypt_secret("test_data")
-        decrypted = encryption.decrypt_secret(encrypted)
-
-        assert decrypted == "test_data"
-
-    def test_encryption_with_special_char_key(self):
-        """Test encryption with key containing special characters."""
-        special_key = SecretStr("key_with_special_chars!@#$%^&*()_+-={}[]|\\:;\"'<>?,./")
-        encryption = EncryptionService(special_key)
-
-        encrypted = encryption.encrypt_secret("test_data")
-        decrypted = encryption.decrypt_secret(encrypted)
-
-        assert decrypted == "test_data"

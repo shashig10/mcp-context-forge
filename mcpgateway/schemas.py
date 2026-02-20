@@ -429,7 +429,9 @@ class ToolCreate(BaseModel):
         if v is None:
             return v
 
-        forbidden_patterns = ["&&", ";", "||", "$(", "`", "|", "> ", "< "]
+        # Note: backticks (`) are allowed as they are commonly used in Markdown
+        # for inline code examples in tool descriptions
+        forbidden_patterns = ["&&", ";", "||", "$(", "|", "> ", "< "]
         for pat in forbidden_patterns:
             if pat in v:
                 raise ValueError(f"Description contains unsafe characters: '{pat}'")
@@ -836,11 +838,10 @@ class ToolCreate(BaseModel):
             ValueError: If any plugin is not in the allowed set.
         """
         allowed_plugins = {"deny_filter", "rate_limit", "pii_filter", "response_shape", "regex_filter", "resource_filter"}
-        if v is None:
-            return v
-        for plugin in v:
-            if plugin not in allowed_plugins:
-                raise ValueError(f"Unknown plugin: {plugin}")
+        if v is not None:
+            for plugin in v:
+                if plugin not in allowed_plugins:
+                    raise ValueError(f"Unknown plugin: {plugin}")
         return v
 
     @model_validator(mode="after")
@@ -1145,9 +1146,7 @@ class ToolUpdate(BaseModelWithConfigDict):
             base_url = f"{parsed.scheme}://{parsed.netloc}"
             path_template = parsed.path
             # Ensure path_template starts with a single '/'
-            if path_template and not path_template.startswith("/"):
-                path_template = "/" + path_template.lstrip("/")
-            elif path_template:
+            if path_template:
                 path_template = "/" + path_template.lstrip("/")
             if not values.get("base_url"):
                 values["base_url"] = base_url
@@ -1258,11 +1257,10 @@ class ToolUpdate(BaseModelWithConfigDict):
             ValueError: If any plugin is not in the allowed set.
         """
         allowed_plugins = {"deny_filter", "rate_limit", "pii_filter", "response_shape", "regex_filter", "resource_filter"}
-        if v is None:
-            return v
-        for plugin in v:
-            if plugin not in allowed_plugins:
-                raise ValueError(f"Unknown plugin: {plugin}")
+        if v is not None:
+            for plugin in v:
+                if plugin not in allowed_plugins:
+                    raise ValueError(f"Unknown plugin: {plugin}")
         return v
 
 
@@ -1284,6 +1282,7 @@ class ToolRead(BaseModelWithConfigDict):
     original_name: str
     url: Optional[str]
     description: Optional[str]
+    original_description: Optional[str] = None
     request_type: str
     integration_type: str
     headers: Optional[Dict[str, str]]
@@ -1354,9 +1353,9 @@ class ToolInvocation(BaseModelWithConfigDict):
     - Arguments matching tool's input schema (validated for depth limits)
 
     Validation Rules:
-    - Tool names must start with a letter and contain only letters, numbers,
-      underscores, and hyphens
-    - Tool names cannot contain HTML special characters (<, >, ", ', /)
+    - Tool names must start with a letter, number, or underscore and contain only
+      letters, numbers, periods, underscores, hyphens, and slashes (per SEP-986)
+    - Tool names cannot contain HTML special characters (<, >, ", ')
     - Arguments are validated to prevent excessively deep nesting (default max: 10 levels)
 
     Attributes:
@@ -1392,12 +1391,22 @@ class ToolInvocation(BaseModelWithConfigDict):
         ...     print("Validation failed: HTML tags not allowed")
         Validation failed: HTML tags not allowed
 
-        >>> # Invalid: Tool name starting with number
+        >>> # Valid: Tool name starting with number (per MCP spec)
+        >>> tool_num = ToolInvocation(name="123_tool", arguments={})
+        >>> tool_num.name
+        '123_tool'
+
+        >>> # Valid: Tool name starting with underscore (per MCP spec)
+        >>> tool_underscore = ToolInvocation(name="_5gpt_query", arguments={})
+        >>> tool_underscore.name
+        '_5gpt_query'
+
+        >>> # Invalid: Tool name starting with hyphen
         >>> try:
-        ...     ToolInvocation(name="123_tool", arguments={})
+        ...     ToolInvocation(name="-invalid_tool", arguments={})
         ... except ValidationError as e:
-        ...     print("Validation failed: Must start with letter")
-        Validation failed: Must start with letter
+        ...     print("Validation failed: Must start with letter, number, or underscore")
+        Validation failed: Must start with letter, number, or underscore
 
         >>> # Valid: Complex but not too deep arguments
         >>> args = {"level1": {"level2": {"level3": {"data": "value"}}}}
@@ -1529,6 +1538,7 @@ class ResourceCreate(BaseModel):
     team_id: Optional[str] = Field(None, description="Team ID for resource organization")
     owner_email: Optional[str] = Field(None, description="Email of the resource owner")
     visibility: Optional[str] = Field(default="public", description="Visibility level (private, team, public)")
+    gateway_id: Optional[str] = Field(None, description="ID of the gateway for the resource")
 
     @field_validator("tags")
     @classmethod
@@ -1804,7 +1814,7 @@ class ResourceRead(BaseModelWithConfigDict):
     updated_at: datetime
     enabled: bool
     metrics: Optional[ResourceMetrics] = Field(None, description="Resource metrics (may be None in list operations)")
-    tags: List[Dict[str, str]] = Field(default_factory=list, description="Tags for categorizing the resource")
+    tags: List[str] = Field(default_factory=list, description="Tags for categorizing the resource")
 
     # Comprehensive metadata for audit tracking
     created_by: Optional[str] = Field(None, description="Username who created this entity")
@@ -2069,6 +2079,7 @@ class PromptCreate(BaseModelWithConfigDict):
     team_id: Optional[str] = Field(None, description="Team ID for resource organization")
     owner_email: Optional[str] = Field(None, description="Email of the prompt owner")
     visibility: Optional[str] = Field(default="public", description="Visibility level (private, team, public)")
+    gateway_id: Optional[str] = Field(None, description="ID of the gateway for the prompt")
 
     @field_validator("tags")
     @classmethod
@@ -2521,7 +2532,7 @@ class GatewayCreate(BaseModel):
     # One time auth - do not store the auth in gateway flag
     one_time_auth: Optional[bool] = Field(default=False, description="The authentication should be used only once and not stored in the gateway")
 
-    tags: Optional[List[str]] = Field(default_factory=list, description="Tags for categorizing the gateway")
+    tags: Optional[List[Union[str, Dict[str, str]]]] = Field(default_factory=list, description="Tags for categorizing the gateway")
 
     # Team scoping fields for resource organization
     team_id: Optional[str] = Field(None, description="Team ID this gateway belongs to")
@@ -2535,6 +2546,22 @@ class GatewayCreate(BaseModel):
 
     # Per-gateway refresh configuration
     refresh_interval_seconds: Optional[int] = Field(None, ge=60, description="Per-gateway refresh interval in seconds (minimum 60); uses global default if not set")
+
+    # Gateway mode configuration
+    gateway_mode: str = Field(default="cache", description="Gateway mode: 'cache' (database caching, default) or 'direct_proxy' (pass-through mode with no caching)", pattern="^(cache|direct_proxy)$")
+
+    @field_validator("gateway_mode", mode="before")
+    @classmethod
+    def default_gateway_mode(cls, v: Optional[str]) -> str:
+        """Default gateway_mode to 'cache' when None is provided.
+
+        Args:
+            v: Gateway mode value (may be None).
+
+        Returns:
+            The validated gateway mode string, defaulting to 'cache'.
+        """
+        return v if v is not None else "cache"
 
     @field_validator("tags")
     @classmethod
@@ -2813,7 +2840,7 @@ class GatewayUpdate(BaseModelWithConfigDict):
     name: Optional[str] = Field(None, description="Unique name for the gateway")
     url: Optional[Union[str, AnyHttpUrl]] = Field(None, description="Gateway endpoint URL")
     description: Optional[str] = Field(None, description="Gateway description")
-    transport: str = Field(default="SSE", description="Transport used by MCP server: SSE or STREAMABLEHTTP")
+    transport: Optional[str] = Field(None, description="Transport used by MCP server: SSE or STREAMABLEHTTP")
 
     passthrough_headers: Optional[List[str]] = Field(default=None, description="List of headers allowed to be passed through from client to target")
 
@@ -2846,7 +2873,7 @@ class GatewayUpdate(BaseModelWithConfigDict):
     # One time auth - do not store the auth in gateway flag
     one_time_auth: Optional[bool] = Field(default=False, description="The authentication should be used only once and not stored in the gateway")
 
-    tags: Optional[List[str]] = Field(None, description="Tags for categorizing the gateway")
+    tags: Optional[List[Union[str, Dict[str, str]]]] = Field(None, description="Tags for categorizing the gateway")
 
     # Team scoping fields for resource organization
     team_id: Optional[str] = Field(None, description="Team ID this gateway belongs to")
@@ -2855,6 +2882,9 @@ class GatewayUpdate(BaseModelWithConfigDict):
 
     # Per-gateway refresh configuration
     refresh_interval_seconds: Optional[int] = Field(None, ge=60, description="Per-gateway refresh interval in seconds (minimum 60); uses global default if not set")
+
+    # Gateway mode configuration
+    gateway_mode: Optional[str] = Field(None, description="Gateway mode: 'cache' (database caching, default) or 'direct_proxy' (pass-through mode with no caching)", pattern="^(cache|direct_proxy)$")
 
     @field_validator("tags")
     @classmethod
@@ -3075,15 +3105,54 @@ class GatewayUpdate(BaseModelWithConfigDict):
         Raises:
             ValueError: If required fields are missing when setting query_param auth.
         """
-        if self.auth_type != "query_param":
-            return self
-        # Validate fields are provided when explicitly setting query_param auth
-        # Feature flag/allowlist check happens in service layer (has access to existing gateway)
-        if not self.auth_query_param_key:
-            raise ValueError("auth_query_param_key is required when setting auth_type to 'query_param'")
-        if not self.auth_query_param_value:
-            raise ValueError("auth_query_param_value is required when setting auth_type to 'query_param'")
+        if self.auth_type == "query_param":
+            # Validate fields are provided when explicitly setting query_param auth
+            # Feature flag/allowlist check happens in service layer (has access to existing gateway)
+            if not self.auth_query_param_key:
+                raise ValueError("auth_query_param_key is required when setting auth_type to 'query_param'")
+            if not self.auth_query_param_value:
+                raise ValueError("auth_query_param_value is required when setting auth_type to 'query_param'")
+
         return self
+
+
+# ---------------------------------------------------------------------------
+# OAuth config masking helper (used by GatewayRead.masked / A2AAgentRead.masked)
+# ---------------------------------------------------------------------------
+_SENSITIVE_OAUTH_KEYS = frozenset(
+    {
+        "client_secret",
+        "password",
+        "refresh_token",
+        "access_token",
+        "id_token",
+        "token",
+        "secret",
+        "private_key",
+    }
+)
+
+
+def _mask_oauth_config(oauth_config: Any) -> Any:
+    """Recursively mask sensitive keys inside an ``oauth_config`` dict.
+
+    Args:
+        oauth_config: The oauth_config value to mask (dict, list, or scalar).
+
+    Returns:
+        The masked copy with sensitive values replaced.
+    """
+    if isinstance(oauth_config, dict):
+        out: Dict[str, Any] = {}
+        for k, v in oauth_config.items():
+            if isinstance(k, str) and k.lower() in _SENSITIVE_OAUTH_KEYS:
+                out[k] = settings.masked_auth_value if v else v
+            else:
+                out[k] = _mask_oauth_config(v)
+        return out
+    if isinstance(oauth_config, list):
+        return [_mask_oauth_config(x) for x in oauth_config]
+    return oauth_config
 
 
 class GatewayRead(BaseModelWithConfigDict):
@@ -3179,6 +3248,9 @@ class GatewayRead(BaseModelWithConfigDict):
     # Per-gateway refresh configuration
     refresh_interval_seconds: Optional[int] = Field(None, description="Per-gateway refresh interval in seconds")
     last_refresh_at: Optional[datetime] = Field(None, description="Timestamp of last successful refresh")
+
+    # Gateway mode configuration
+    gateway_mode: str = Field(default="cache", description="Gateway mode: 'cache' (database caching, default) or 'direct_proxy' (pass-through mode with no caching)")
 
     @model_validator(mode="before")
     @classmethod
@@ -3380,10 +3452,15 @@ class GatewayRead(BaseModelWithConfigDict):
                 for header in masked_data["auth_headers"]
             ]
 
-        masked_data["auth_password_unmasked"] = self.auth_password_unmasked
-        masked_data["auth_token_unmasked"] = self.auth_token_unmasked
-        masked_data["auth_header_value_unmasked"] = self.auth_header_value_unmasked
-        masked_data["auth_headers_unmasked"] = [header.copy() for header in self.auth_headers_unmasked] if self.auth_headers_unmasked else None
+        # Mask sensitive keys inside oauth_config (e.g. password, client_secret)
+        if masked_data.get("oauth_config"):
+            masked_data["oauth_config"] = _mask_oauth_config(masked_data["oauth_config"])
+
+        # SECURITY: Never expose unmasked credentials in API responses
+        masked_data["auth_password_unmasked"] = None
+        masked_data["auth_token_unmasked"] = None
+        masked_data["auth_header_value_unmasked"] = None
+        masked_data["auth_headers_unmasked"] = None
         return GatewayRead.model_validate(masked_data)
 
 
@@ -3456,6 +3533,8 @@ class FederatedPrompt(BaseModelWithConfigDict):
 # --- RPC Schemas ---
 class RPCRequest(BaseModel):
     """MCP-compliant RPC request validation"""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     jsonrpc: Literal["2.0"]
     method: str
@@ -4821,14 +4900,14 @@ class A2AAgentUpdate(BaseModelWithConfigDict):
         Raises:
             ValueError: If required fields are missing when setting query_param auth.
         """
-        if self.auth_type != "query_param":
-            return self
-        # Validate fields are provided when explicitly setting query_param auth
-        # Feature flag/allowlist check happens in service layer (has access to existing agent)
-        if not self.auth_query_param_key:
-            raise ValueError("auth_query_param_key is required when setting auth_type to 'query_param'")
-        if not self.auth_query_param_value:
-            raise ValueError("auth_query_param_value is required when setting auth_type to 'query_param'")
+        if self.auth_type == "query_param":
+            # Validate fields are provided when explicitly setting query_param auth
+            # Feature flag/allowlist check happens in service layer (has access to existing agent)
+            if not self.auth_query_param_key:
+                raise ValueError("auth_query_param_key is required when setting auth_type to 'query_param'")
+            if not self.auth_query_param_value:
+                raise ValueError("auth_query_param_value is required when setting auth_type to 'query_param'")
+
         return self
 
 
@@ -5102,6 +5181,10 @@ class A2AAgentRead(BaseModelWithConfigDict):
         masked_data["auth_token"] = settings.masked_auth_value if masked_data.get("auth_token") else None
         masked_data["auth_header_value"] = settings.masked_auth_value if masked_data.get("auth_header_value") else None
 
+        # Mask sensitive keys inside oauth_config (e.g. password, client_secret)
+        if masked_data.get("oauth_config"):
+            masked_data["oauth_config"] = _mask_oauth_config(masked_data["oauth_config"])
+
         return A2AAgentRead.model_validate(masked_data)
 
 
@@ -5175,17 +5258,49 @@ class EmailLoginRequest(BaseModel):
     password: str = Field(..., min_length=1, description="User's password")
 
 
-class EmailRegistrationRequest(BaseModel):
-    """Request schema for user registration.
+class PublicRegistrationRequest(BaseModel):
+    """Public self-registration request — minimal fields, password required.
+
+    Extra fields are rejected (extra="forbid") so clients cannot submit
+    admin-only fields like is_admin or is_active.
 
     Attributes:
         email: User's email address
-        password: User's password
+        password: User's password (required, min 8 chars)
         full_name: Optional full name for display
-        is_admin: Whether user should have admin privileges (default: False)
 
     Examples:
-        >>> request = EmailRegistrationRequest(
+        >>> request = PublicRegistrationRequest(
+        ...     email="new@example.com",
+        ...     password="secure123",
+        ...     full_name="New User"
+        ... )
+        >>> request.email
+        'new@example.com'
+        >>> request.full_name
+        'New User'
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    email: EmailStr = Field(..., description="User's email address")
+    password: str = Field(..., min_length=8, description="User's password")
+    full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
+
+
+class AdminCreateUserRequest(BaseModel):
+    """Admin user creation request — all fields, password required.
+
+    Attributes:
+        email: User's email address
+        password: User's password (required, min 8 chars)
+        full_name: Optional full name for display
+        is_admin: Whether user should have admin privileges (default: False)
+        is_active: Whether user account is active (default: True)
+        password_change_required: Whether user must change password on next login (default: False)
+
+    Examples:
+        >>> request = AdminCreateUserRequest(
         ...     email="new@example.com",
         ...     password="secure123",
         ...     full_name="New User"
@@ -5196,6 +5311,10 @@ class EmailRegistrationRequest(BaseModel):
         'New User'
         >>> request.is_admin
         False
+        >>> request.is_active
+        True
+        >>> request.password_change_required
+        False
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -5204,24 +5323,12 @@ class EmailRegistrationRequest(BaseModel):
     password: str = Field(..., min_length=8, description="User's password")
     full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
     is_admin: bool = Field(False, description="Grant admin privileges to user")
+    is_active: bool = Field(True, description="Whether user account is active")
+    password_change_required: bool = Field(False, description="Whether user must change password on next login")
 
-    @field_validator("password")
-    @classmethod
-    def validate_password(cls, v: str) -> str:
-        """Validate password meets minimum requirements.
 
-        Args:
-            v: Password string to validate
-
-        Returns:
-            str: Validated password
-
-        Raises:
-            ValueError: If password doesn't meet requirements
-        """
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        return v
+# Deprecated alias — use AdminCreateUserRequest or PublicRegistrationRequest instead
+EmailRegistrationRequest = AdminCreateUserRequest
 
 
 class ChangePasswordRequest(BaseModel):
@@ -5266,6 +5373,45 @@ class ChangePasswordRequest(BaseModel):
         return v
 
 
+class ForgotPasswordRequest(BaseModel):
+    """Request schema for forgot-password flow."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    email: EmailStr = Field(..., description="Email address for password reset")
+
+
+class ResetPasswordRequest(BaseModel):
+    """Request schema for completing password reset."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    new_password: str = Field(..., min_length=8, description="New password to set")
+    confirm_password: str = Field(..., min_length=8, description="Password confirmation")
+
+    @model_validator(mode="after")
+    def validate_password_match(self):
+        """Ensure password and confirmation are identical.
+
+        Returns:
+            ResetPasswordRequest: Validated request instance.
+
+        Raises:
+            ValueError: If the password and confirmation do not match.
+        """
+        if self.new_password != self.confirm_password:
+            raise ValueError("Passwords do not match")
+        return self
+
+
+class PasswordResetTokenValidationResponse(BaseModel):
+    """Response schema for reset-token validation."""
+
+    valid: bool = Field(..., description="Whether token is currently valid")
+    message: str = Field(..., description="Validation status message")
+    expires_at: Optional[datetime] = Field(None, description="Token expiration timestamp when valid")
+
+
 class EmailUserResponse(BaseModel):
     """Response schema for user information.
 
@@ -5278,6 +5424,7 @@ class EmailUserResponse(BaseModel):
         created_at: Account creation timestamp
         last_login: Last successful login timestamp
         email_verified: Whether email is verified
+        password_change_required: Whether user must change password on next login
 
     Examples:
         >>> user = EmailUserResponse(
@@ -5307,6 +5454,9 @@ class EmailUserResponse(BaseModel):
     last_login: Optional[datetime] = Field(None, description="Last successful login")
     email_verified: bool = Field(False, description="Whether email is verified")
     password_change_required: bool = Field(False, description="Whether user must change password on next login")
+    failed_login_attempts: int = Field(0, description="Current failed login attempts counter")
+    locked_until: Optional[datetime] = Field(None, description="Account lock expiration timestamp")
+    is_locked: bool = Field(False, description="Whether the account is currently locked")
 
     @classmethod
     def from_email_user(cls, user) -> "EmailUserResponse":
@@ -5318,6 +5468,13 @@ class EmailUserResponse(BaseModel):
         Returns:
             EmailUserResponse: Response schema instance
         """
+        locked_until_raw = getattr(user, "locked_until", None)
+        locked_until = locked_until_raw if isinstance(locked_until_raw, datetime) else None
+        failed_attempts_raw = getattr(user, "failed_login_attempts", 0)
+        try:
+            failed_attempts = int(failed_attempts_raw or 0)
+        except (TypeError, ValueError):
+            failed_attempts = 0
         return cls(
             email=user.email,
             full_name=user.full_name,
@@ -5328,6 +5485,9 @@ class EmailUserResponse(BaseModel):
             last_login=user.last_login,
             email_verified=user.is_email_verified(),
             password_change_required=user.password_change_required,
+            failed_login_attempts=failed_attempts,
+            locked_until=locked_until,
+            is_locked=bool(locked_until and locked_until > datetime.now(timezone.utc)),
         )
 
 
@@ -5437,36 +5597,6 @@ class UserListResponse(BaseModel):
     offset: int = Field(..., description="Request offset")
 
 
-class AdminUserCreateRequest(BaseModel):
-    """Request schema for admin user creation.
-
-    Attributes:
-        email: User's email address
-        password: User's password
-        full_name: Optional full name
-        is_admin: Whether user should have admin privileges
-
-    Examples:
-        >>> request = AdminUserCreateRequest(
-        ...     email="admin@example.com",
-        ...     password="admin_password",
-        ...     full_name="Admin User",
-        ...     is_admin=True
-        ... )
-        >>> request.email
-        'admin@example.com'
-        >>> request.is_admin
-        True
-    """
-
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    email: EmailStr = Field(..., description="User's email address")
-    password: str = Field(..., min_length=8, description="User's password")
-    full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
-    is_admin: bool = Field(default=False, description="Whether user has admin privileges")
-
-
 class AdminUserUpdateRequest(BaseModel):
     """Request schema for admin user updates.
 
@@ -5474,6 +5604,8 @@ class AdminUserUpdateRequest(BaseModel):
         full_name: User's full name
         is_admin: Whether user has admin privileges
         is_active: Whether account is active
+        password_change_required: Whether user must change password on next login
+        password: New password (admin can reset without old password)
 
     Examples:
         >>> request = AdminUserUpdateRequest(
@@ -5492,6 +5624,8 @@ class AdminUserUpdateRequest(BaseModel):
     full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
     is_admin: Optional[bool] = Field(None, description="Whether user has admin privileges")
     is_active: Optional[bool] = Field(None, description="Whether account is active")
+    password_change_required: Optional[bool] = Field(None, description="Whether user must change password on next login")
+    password: Optional[str] = Field(None, min_length=8, description="New password (admin reset)")
 
 
 class ErrorResponse(BaseModel):
@@ -5827,6 +5961,8 @@ class TeamMemberResponse(BaseModel):
         'member'
     """
 
+    model_config = ConfigDict(from_attributes=True)
+
     id: str = Field(..., description="Member UUID")
     team_id: str = Field(..., description="Team UUID")
     user_email: str = Field(..., description="Member email address")
@@ -5937,6 +6073,18 @@ class TeamInvitationResponse(BaseModel):
     token: str = Field(..., description="Invitation token")
     is_active: bool = Field(..., description="Whether the invitation is active")
     is_expired: bool = Field(..., description="Whether the invitation has expired")
+
+
+class TeamMemberAddRequest(BaseModel):
+    """Schema for adding a team member.
+
+    Attributes:
+        email: Email address of user to be added to the team
+        role: New role for the team member
+    """
+
+    email: EmailStr = Field(..., description="Email address of user to be added to the team")
+    role: Literal["owner", "member"] = Field(..., description="New role for the team member")
 
 
 class TeamMemberUpdateRequest(BaseModel):
@@ -6151,6 +6299,7 @@ class TokenCreateRequest(BaseModel):
         expires_in_days: Optional expiry in days
         scope: Optional token scoping configuration
         tags: Optional organizational tags
+        is_active: Token active status (defaults to True)
 
     Examples:
         >>> request = TokenCreateRequest(
@@ -6165,10 +6314,11 @@ class TokenCreateRequest(BaseModel):
 
     name: str = Field(..., description="Human-readable token name", min_length=1, max_length=255)
     description: Optional[str] = Field(None, description="Token description", max_length=1000)
-    expires_in_days: Optional[int] = Field(default=None, description="Expiry in days")
+    expires_in_days: Optional[int] = Field(default=None, ge=1, description="Expiry in days (must be >= 1 if specified)")
     scope: Optional[TokenScopeRequest] = Field(None, description="Token scoping configuration")
     tags: List[str] = Field(default_factory=list, description="Organizational tags")
     team_id: Optional[str] = Field(None, description="Team ID for team-scoped tokens")
+    is_active: bool = Field(default=True, description="Token active status")
 
 
 class TokenUpdateRequest(BaseModel):
@@ -6179,6 +6329,7 @@ class TokenUpdateRequest(BaseModel):
         description: New token description
         scope: New token scoping configuration
         tags: New organizational tags
+        is_active: New token active status
 
     Examples:
         >>> request = TokenUpdateRequest(
@@ -6193,6 +6344,7 @@ class TokenUpdateRequest(BaseModel):
     description: Optional[str] = Field(None, description="New token description", max_length=1000)
     scope: Optional[TokenScopeRequest] = Field(None, description="New token scoping configuration")
     tags: Optional[List[str]] = Field(None, description="New organizational tags")
+    is_active: Optional[bool] = Field(None, description="New token active status")
 
 
 class TokenResponse(BaseModel):
@@ -6653,6 +6805,7 @@ class SSOProviderResponse(BaseModelWithConfigDict):
     provider_type: Optional[str] = Field(None, description="Provider type (oauth2, oidc)")
     is_enabled: Optional[bool] = Field(None, description="Whether provider is enabled")
     authorization_url: Optional[str] = Field(None, description="OAuth authorization URL")
+    jwks_uri: Optional[str] = Field(None, description="OIDC JWKS endpoint for token signature verification")
 
 
 class SSOLoginResponse(BaseModelWithConfigDict):
@@ -6871,7 +7024,7 @@ class GrpcServiceRead(BaseModel):
     last_reflection: Optional[datetime] = Field(None, description="Last reflection timestamp")
 
     # Tags
-    tags: List[Dict[str, str]] = Field(default_factory=list, description="Service tags")
+    tags: List[str] = Field(default_factory=list, description="Service tags")
 
     # Timestamps
     created_at: datetime = Field(..., description="Creation timestamp")
@@ -6879,6 +7032,7 @@ class GrpcServiceRead(BaseModel):
 
     # Team scoping
     team_id: Optional[str] = Field(None, description="Team ID")
+    team: Optional[str] = Field(None, description="Name of the team that owns this resource")
     owner_email: Optional[str] = Field(None, description="Owner email")
     visibility: str = Field(default="public", description="Visibility level")
 
