@@ -1,0 +1,81 @@
+[
+    {
+        "name": "uptimize_sadmin",
+        "description": "Super admin with full API and Admin UI access",
+        "scope": "global",
+        "permissions": [
+            "*"
+        ],
+        "is_system_role": true
+    },
+    {
+        "name": "uptimize_admin",
+        "description": "Admin with team creation plus all team_admin capabilities",
+        "scope": "global",
+        "permissions": [
+            "admin.dashboard",
+            "admin.overview",
+            "gateways.read",
+            "servers.read",
+            "servers.use",
+            "teams.create",
+            "teams.read",
+            "teams.update",
+            "teams.join",
+            "teams.delete",
+            "teams.manage_members",
+            "tools.read",
+            "tools.execute",
+            "resources.read",
+            "prompts.read",
+            "a2a.read",
+            "gateways.create",
+            "servers.create",
+            "tools.create",
+            "resources.create",
+            "prompts.create",
+            "a2a.create",
+            "gateways.update",
+            "servers.update",
+            "tools.update",
+            "resources.update",
+            "prompts.update",
+            "a2a.update",
+            "gateways.delete",
+            "servers.delete",
+            "tools.delete",
+            "resources.delete",
+            "prompts.delete",
+            "a2a.delete",
+            "a2a.invoke",
+            "tokens.create",
+            "tokens.read",
+            "tokens.update",
+            "tokens.revoke"
+        ],
+        "is_system_role": false
+    },
+    {
+        "name": "uptimize_user",
+        "description": "Read-only user with token creation and resource consumption access",
+        "scope": "global",
+        "permissions": [
+            "admin.dashboard",
+            "admin.overview",
+            "gateways.read",
+            "servers.read",
+            "servers.use",
+            "teams.read",
+            "tools.read",
+            "tools.execute",
+            "resources.read",
+            "prompts.read",
+            "prompts.execute",
+            "a2a.read",
+            "a2a.invoke",
+            "tokens.create",
+            "tokens.read"
+        ],
+        "is_system_role": false
+    }
+]

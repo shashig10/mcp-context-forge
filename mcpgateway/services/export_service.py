@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=import-outside-toplevel,no-name-in-module
 """Location: ./mcpgateway/services/export_service.py
 Copyright 2025
 SPDX-License-Identifier: Apache-2.0
@@ -31,12 +32,8 @@ from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import Resource as DbResource
 from mcpgateway.db import Server as DbServer
 from mcpgateway.db import Tool as DbTool
-from mcpgateway.services.gateway_service import GatewayService
-from mcpgateway.services.prompt_service import PromptService
-from mcpgateway.services.resource_service import ResourceService
-from mcpgateway.services.root_service import RootService
-from mcpgateway.services.server_service import ServerService
-from mcpgateway.services.tool_service import ToolService
+
+# Service singletons are imported lazily in __init__ to avoid circular imports
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +123,23 @@ class ExportService:
 
     def __init__(self):
         """Initialize the export service with required dependencies."""
-        self.gateway_service = GatewayService()
-        self.tool_service = ToolService()
-        self.resource_service = ResourceService()
-        self.prompt_service = PromptService()
-        self.server_service = ServerService()
-        self.root_service = RootService()
+        # Use globally-exported singletons from service modules so they
+        # share initialized EventService/Redis clients created at app startup.
+        # Import lazily to avoid circular import at module load time.
+        # First-Party
+        from mcpgateway.services.gateway_service import gateway_service
+        from mcpgateway.services.prompt_service import prompt_service
+        from mcpgateway.services.resource_service import resource_service
+        from mcpgateway.services.root_service import root_service
+        from mcpgateway.services.server_service import server_service
+        from mcpgateway.services.tool_service import tool_service
+
+        self.gateway_service = gateway_service
+        self.tool_service = tool_service
+        self.resource_service = resource_service
+        self.prompt_service = prompt_service
+        self.server_service = server_service
+        self.root_service = root_service
 
     async def initialize(self) -> None:
         """Initialize the export service."""
@@ -412,6 +420,7 @@ class ExportService:
                 "integration_type": tool.integration_type,
                 "request_type": tool.request_type,
                 "description": tool.description,
+                "original_description": tool.original_description,
                 "headers": tool.headers or {},
                 "input_schema": tool.input_schema or {"type": "object", "properties": {}},
                 "output_schema": tool.output_schema,
@@ -802,9 +811,9 @@ class ExportService:
                 "annotations": db_tool.annotations or {},
                 "jsonpath_filter": db_tool.jsonpath_filter,
                 "tags": db_tool.tags or [],
-                "rate_limit": db_tool.rate_limit,
-                "timeout": db_tool.timeout,
-                "is_active": db_tool.is_active,
+                "rate_limit": getattr(db_tool, "rate_limit", None),
+                "timeout": getattr(db_tool, "timeout", None),
+                "is_active": db_tool.enabled,
                 "created_at": db_tool.created_at.isoformat() if db_tool.created_at else None,
                 "updated_at": db_tool.updated_at.isoformat() if db_tool.updated_at else None,
             }
@@ -845,7 +854,7 @@ class ExportService:
                 "transport": db_gateway.transport,
                 "capabilities": db_gateway.capabilities or {},
                 "health_check": {"url": f"{db_gateway.url}/health", "interval": 30, "timeout": 10, "retries": 3},
-                "is_active": db_gateway.is_active,
+                "is_active": db_gateway.enabled,
                 "tags": db_gateway.tags or [],
                 "passthrough_headers": db_gateway.passthrough_headers or [],
             }
@@ -895,7 +904,7 @@ class ExportService:
                 "websocket_endpoint": f"{root_path}/servers/{db_server.id}/ws",
                 "jsonrpc_endpoint": f"{root_path}/servers/{db_server.id}/jsonrpc",
                 "capabilities": {"tools": {"list_changed": True}, "prompts": {"list_changed": True}},
-                "is_active": db_server.is_active,
+                "is_active": db_server.enabled,
                 "tags": db_server.tags or [],
             }
 
@@ -970,7 +979,7 @@ class ExportService:
                 "description": db_resource.description,
                 "mime_type": db_resource.mime_type,
                 "tags": db_resource.tags or [],
-                "is_active": db_resource.is_active,
+                "is_active": db_resource.enabled,
                 "last_modified": db_resource.updated_at.isoformat() if db_resource.updated_at else None,
             }
 

@@ -28,13 +28,15 @@ import uuid
 from jinja2 import Environment, meta, select_autoescape, Template
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, not_, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import joinedload, Session
 
 # First-Party
 from mcpgateway.common.models import Message, PromptResult, Role, TextContent
 from mcpgateway.config import settings
-from mcpgateway.db import EmailTeam, get_for_update
+from mcpgateway.db import EmailTeam
+from mcpgateway.db import Gateway as DbGateway
+from mcpgateway.db import get_for_update
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import PromptMetric, PromptMetricsHourly, server_prompt_association
 from mcpgateway.observability import create_span
@@ -158,6 +160,15 @@ class PromptNameConflictError(PromptError):
 
 class PromptValidationError(PromptError):
     """Raised when prompt validation fails."""
+
+
+class PromptLockConflictError(PromptError):
+    """Raised when a prompt row is locked by another transaction.
+
+    Raises:
+        PromptLockConflictError: When attempting to modify a prompt that is
+            currently locked by another concurrent request.
+    """
 
 
 class PromptService:
@@ -471,7 +482,14 @@ class PromptService:
 
             custom_name = prompt.custom_name or prompt.name
             display_name = prompt.display_name or custom_name
-            computed_name = self._compute_prompt_name(custom_name)
+
+            # Extract gateway_id from prompt if present and look up gateway for namespacing
+            gateway_id = getattr(prompt, "gateway_id", None)
+            gateway = None
+            if gateway_id:
+                gateway = db.execute(select(DbGateway).where(DbGateway.id == gateway_id)).scalar_one_or_none()
+
+            computed_name = self._compute_prompt_name(custom_name, gateway=gateway)
 
             # Create DB model
             db_prompt = DbPrompt(
@@ -495,18 +513,26 @@ class PromptService:
                 team_id=getattr(prompt, "team_id", None) or team_id,
                 owner_email=getattr(prompt, "owner_email", None) or owner_email or created_by,
                 visibility=getattr(prompt, "visibility", None) or visibility,
+                gateway_id=gateway_id,
             )
             # Check for existing server with the same name
             if visibility.lower() == "public":
-                # Check for existing public prompt with the same name
-                existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == computed_name, DbPrompt.visibility == "public")).scalar_one_or_none()
+                # Check for existing public prompt with the same name and gateway_id
+                existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == computed_name, DbPrompt.visibility == "public", DbPrompt.gateway_id == gateway_id)).scalar_one_or_none()
                 if existing_prompt:
                     raise PromptNameConflictError(computed_name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
             elif visibility.lower() == "team":
-                # Check for existing team prompt with the same name
-                existing_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == computed_name, DbPrompt.visibility == "team", DbPrompt.team_id == team_id)).scalar_one_or_none()
+                # Check for existing team prompt with the same name and gateway_id
+                existing_prompt = db.execute(
+                    select(DbPrompt).where(DbPrompt.name == computed_name, DbPrompt.visibility == "team", DbPrompt.team_id == team_id, DbPrompt.gateway_id == gateway_id)
+                ).scalar_one_or_none()
                 if existing_prompt:
                     raise PromptNameConflictError(computed_name, enabled=existing_prompt.enabled, prompt_id=existing_prompt.id, visibility=existing_prompt.visibility)
+
+            # Set gateway relationship to help the before_insert event handler compute the name correctly
+            if gateway:
+                db_prompt.gateway = gateway
+                db_prompt.gateway_name_cache = gateway.name  # type: ignore[attr-defined]
 
             # Add to DB
             db.add(db_prompt)
@@ -555,7 +581,6 @@ class PromptService:
                     "prompt_name": db_prompt.name,
                     "visibility": visibility,
                 },
-                db=db,
             )
 
             db_prompt.team = self._get_team_name(db, db_prompt.team_id)
@@ -589,7 +614,6 @@ class PromptService:
                 user_email=owner_email,
                 error=ie,
                 custom_fields={"prompt_name": prompt.name},
-                db=db,
             )
             raise ie
         except PromptNameConflictError as se:
@@ -603,7 +627,6 @@ class PromptService:
                 user_id=created_by,
                 user_email=owner_email,
                 custom_fields={"prompt_name": prompt.name, "visibility": visibility},
-                db=db,
             )
             raise se
         except Exception as e:
@@ -618,7 +641,6 @@ class PromptService:
                 user_email=owner_email,
                 error=e,
                 custom_fields={"prompt_name": prompt.name},
-                db=db,
             )
             raise PromptError(f"Failed to register prompt: {str(e)}")
 
@@ -695,22 +717,42 @@ class PromptService:
             chunk = prompts[chunk_start : chunk_start + chunk_size]
 
             try:
+                # Collect unique gateway_ids and look them up
+                gateway_ids = set()
+                for prompt in chunk:
+                    gw_id = getattr(prompt, "gateway_id", None)
+                    if gw_id:
+                        gateway_ids.add(gw_id)
+
+                gateways_map: Dict[str, Any] = {}
+                if gateway_ids:
+                    gateways = db.execute(select(DbGateway).where(DbGateway.id.in_(gateway_ids))).scalars().all()
+                    gateways_map = {gw.id: gw for gw in gateways}
+
                 # Batch check for existing prompts to detect conflicts
+                # Build computed names with gateway context
                 prompt_names = []
                 for prompt in chunk:
                     custom_name = getattr(prompt, "custom_name", None) or prompt.name
-                    prompt_names.append(self._compute_prompt_name(custom_name))
+                    gw_id = getattr(prompt, "gateway_id", None)
+                    gateway = gateways_map.get(gw_id) if gw_id else None
+                    computed_name = self._compute_prompt_name(custom_name, gateway=gateway)
+                    prompt_names.append(computed_name)
 
+                # Query for existing prompts - need to consider gateway_id in conflict detection
+                # Build base query conditions
                 if visibility.lower() == "public":
-                    existing_prompts_query = select(DbPrompt).where(DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "public")
+                    base_conditions = [DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "public"]
                 elif visibility.lower() == "team" and team_id:
-                    existing_prompts_query = select(DbPrompt).where(DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "team", DbPrompt.team_id == team_id)
+                    base_conditions = [DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "team", DbPrompt.team_id == team_id]
                 else:
                     # Private prompts - check by owner
-                    existing_prompts_query = select(DbPrompt).where(DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "private", DbPrompt.owner_email == (owner_email or created_by))
+                    base_conditions = [DbPrompt.name.in_(prompt_names), DbPrompt.visibility == "private", DbPrompt.owner_email == (owner_email or created_by)]
 
+                existing_prompts_query = select(DbPrompt).where(*base_conditions)
                 existing_prompts = db.execute(existing_prompts_query).scalars().all()
-                existing_prompts_map = {prompt.name: prompt for prompt in existing_prompts}
+                # Use (name, gateway_id) tuple as key for proper conflict detection
+                existing_prompts_map = {(p.name, p.gateway_id): p for p in existing_prompts}
 
                 prompts_to_add = []
                 prompts_to_update = []
@@ -739,12 +781,15 @@ class PromptService:
                         prompt_team_id = team_id if team_id is not None else getattr(prompt, "team_id", None)
                         prompt_owner_email = owner_email or getattr(prompt, "owner_email", None) or created_by
                         prompt_visibility = visibility if visibility is not None else getattr(prompt, "visibility", "public")
+                        prompt_gateway_id = getattr(prompt, "gateway_id", None)
 
                         custom_name = getattr(prompt, "custom_name", None) or prompt.name
                         display_name = getattr(prompt, "display_name", None) or custom_name
-                        computed_name = self._compute_prompt_name(custom_name)
+                        gateway = gateways_map.get(prompt_gateway_id) if prompt_gateway_id else None
+                        computed_name = self._compute_prompt_name(custom_name, gateway=gateway)
 
-                        existing_prompt = existing_prompts_map.get(computed_name)
+                        # Look up existing prompt by (name, gateway_id) tuple
+                        existing_prompt = existing_prompts_map.get((computed_name, prompt_gateway_id))
 
                         if existing_prompt:
                             # Handle conflict based on strategy
@@ -777,7 +822,7 @@ class PromptService:
                                 new_name = f"{prompt.name}_imported_{int(datetime.now().timestamp())}"
                                 new_custom_name = new_name
                                 new_display_name = new_name
-                                computed_name = self._compute_prompt_name(new_custom_name)
+                                computed_name = self._compute_prompt_name(new_custom_name, gateway=gateway)
                                 db_prompt = DbPrompt(
                                     name=computed_name,
                                     original_name=prompt.name,
@@ -797,7 +842,12 @@ class PromptService:
                                     team_id=prompt_team_id,
                                     owner_email=prompt_owner_email,
                                     visibility=prompt_visibility,
+                                    gateway_id=prompt_gateway_id,
                                 )
+                                # Set gateway relationship to help the before_insert event handler
+                                if gateway:
+                                    db_prompt.gateway = gateway
+                                    db_prompt.gateway_name_cache = gateway.name  # type: ignore[attr-defined]
                                 prompts_to_add.append(db_prompt)
                                 stats["created"] += 1
                             elif conflict_strategy == "fail":
@@ -825,7 +875,12 @@ class PromptService:
                                 team_id=prompt_team_id,
                                 owner_email=prompt_owner_email,
                                 visibility=prompt_visibility,
+                                gateway_id=prompt_gateway_id,
                             )
+                            # Set gateway relationship to help the before_insert event handler
+                            if gateway:
+                                db_prompt.gateway = gateway
+                                db_prompt.gateway_name_cache = gateway.name  # type: ignore[attr-defined]
                             prompts_to_add.append(db_prompt)
                             stats["created"] += 1
 
@@ -902,7 +957,6 @@ class PromptService:
                 "visibility": visibility,
                 "conflict_strategy": conflict_strategy,
             },
-            db=db,
         )
 
         return stats
@@ -986,7 +1040,7 @@ class PromptService:
 
         # Apply team-based access control if user_email is provided OR token_teams is explicitly set
         # This ensures unauthenticated requests with token_teams=[] only see public prompts
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1238,7 +1292,7 @@ class PromptService:
 
         # Add visibility filtering if user context OR token_teams provided
         # This ensures unauthenticated requests with token_teams=[] only see public prompts
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1613,7 +1667,6 @@ class PromptService:
                         "tenant_id": tenant_id,
                         "server_id": server_id,
                     },
-                    db=db,
                 )
 
                 # Set success attributes on span
@@ -1845,7 +1898,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt.id),
                 custom_fields={"prompt_name": prompt.name, "version": prompt.version},
-                db=db,
             )
 
             prompt.team = self._get_team_name(db, prompt.team_id)
@@ -1873,7 +1925,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=pe,
-                db=db,
             )
             raise
         except IntegrityError as ie:
@@ -1889,7 +1940,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=ie,
-                db=db,
             )
             raise ie
         except PromptNotFoundError as e:
@@ -1905,7 +1955,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=e,
-                db=db,
             )
             raise e
         except PromptNameConflictError as pnce:
@@ -1921,7 +1970,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=pnce,
-                db=db,
             )
             raise pnce
         except Exception as e:
@@ -1936,7 +1984,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=e,
-                db=db,
             )
             raise PromptError(f"Failed to update prompt: {str(e)}")
 
@@ -1955,9 +2002,10 @@ class PromptService:
             The updated PromptRead object
 
         Raises:
-            PromptNotFoundError: If the prompt is not found
-            PromptError: For other errors
-            PermissionError: If user doesn't own the agent.
+            PromptNotFoundError: If the prompt is not found.
+            PromptLockConflictError: If the prompt is locked by another transaction.
+            PromptError: For other errors.
+            PermissionError: If user doesn't own the prompt.
 
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
@@ -1978,7 +2026,13 @@ class PromptService:
             ...     pass
         """
         try:
-            prompt = get_for_update(db, DbPrompt, prompt_id)
+            # Use nowait=True to fail fast if row is locked, preventing lock contention under high load
+            try:
+                prompt = get_for_update(db, DbPrompt, prompt_id, nowait=True)
+            except OperationalError as lock_err:
+                # Row is locked by another transaction - fail fast with 409
+                db.rollback()
+                raise PromptLockConflictError(f"Prompt {prompt_id} is currently being modified by another request") from lock_err
             if not prompt:
                 raise PromptNotFoundError(f"Prompt not found: {prompt_id}")
 
@@ -2031,7 +2085,6 @@ class PromptService:
                     resource_type="prompt",
                     resource_id=str(prompt.id),
                     custom_fields={"prompt_name": prompt.name, "enabled": prompt.enabled},
-                    db=db,
                 )
 
             prompt.team = self._get_team_name(db, prompt.team_id)
@@ -2046,9 +2099,14 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=e,
-                db=db,
             )
             raise e
+        except PromptLockConflictError:
+            # Re-raise lock conflicts without wrapping - allows 409 response
+            raise
+        except PromptNotFoundError:
+            # Re-raise not found without wrapping - allows 404 response
+            raise
         except Exception as e:
             db.rollback()
 
@@ -2061,7 +2119,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=e,
-                db=db,
             )
             raise PromptError(f"Failed to set prompt state: {str(e)}")
 
@@ -2125,7 +2182,6 @@ class PromptService:
                 "prompt_name": prompt.name,
                 "include_inactive": include_inactive,
             },
-            db=db,
         )
 
         return prompt_data
@@ -2217,7 +2273,6 @@ class PromptService:
                     "prompt_name": prompt_name,
                     "purge_metrics": purge_metrics,
                 },
-                db=db,
             )
 
             # Invalidate cache after successful deletion
@@ -2241,7 +2296,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=pe,
-                db=db,
             )
             raise
         except Exception as e:
@@ -2257,7 +2311,6 @@ class PromptService:
                     resource_type="prompt",
                     resource_id=str(prompt_id),
                     error=e,
-                    db=db,
                 )
                 raise e
 
@@ -2271,7 +2324,6 @@ class PromptService:
                 resource_type="prompt",
                 resource_id=str(prompt_id),
                 error=e,
-                db=db,
             )
             raise PromptError(f"Failed to delete prompt: {str(e)}")
 
@@ -2594,3 +2646,28 @@ class PromptService:
 
         metrics_cache.invalidate("prompts")
         metrics_cache.invalidate_prefix("top_prompts:")
+
+
+# Lazy singleton - created on first access, not at module import time.
+# This avoids instantiation when only exception classes are imported.
+_prompt_service_instance = None  # pylint: disable=invalid-name
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ for lazy singleton creation.
+
+    Args:
+        name: The attribute name being accessed.
+
+    Returns:
+        The prompt_service singleton instance if name is "prompt_service".
+
+    Raises:
+        AttributeError: If the attribute name is not "prompt_service".
+    """
+    global _prompt_service_instance  # pylint: disable=global-statement
+    if name == "prompt_service":
+        if _prompt_service_instance is None:
+            _prompt_service_instance = PromptService()
+        return _prompt_service_instance
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

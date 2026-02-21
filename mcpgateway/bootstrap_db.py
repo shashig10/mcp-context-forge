@@ -33,7 +33,9 @@ Examples:
 import asyncio
 from contextlib import contextmanager
 from importlib.resources import files
+import json
 import os
+from pathlib import Path
 import tempfile
 from typing import cast
 
@@ -85,7 +87,12 @@ def _schema_looks_current(inspector) -> bool:
     Returns:
         True when expected columns exist for a recent schema version.
     """
-    return _column_exists(inspector, "tools", "display_name") and _column_exists(inspector, "gateways", "oauth_config") and _column_exists(inspector, "prompts", "custom_name")
+    return (
+        _column_exists(inspector, "tools", "display_name")
+        and _column_exists(inspector, "gateways", "oauth_config")
+        and _column_exists(inspector, "prompts", "custom_name")
+        and _column_exists(inspector, "sso_providers", "jwks_uri")
+    )
 
 
 @contextmanager
@@ -241,24 +248,141 @@ async def bootstrap_default_roles(conn: Connection) -> None:
                     "name": "team_admin",
                     "description": "Team administrator with team management permissions",
                     "scope": "team",
-                    "permissions": ["teams.read", "teams.update", "teams.join", "teams.manage_members", "tools.read", "tools.execute", "resources.read", "prompts.read"],
+                    "permissions": [
+                        "admin.dashboard",
+                        "gateways.read",
+                        "servers.read",
+                        "servers.use",
+                        "teams.read",
+                        "teams.update",
+                        "teams.join",
+                        "teams.delete",
+                        "teams.manage_members",
+                        "tools.read",
+                        "tools.execute",
+                        "resources.read",
+                        "prompts.read",
+                        "a2a.read",
+                        "gateways.create",
+                        "servers.create",
+                        "tools.create",
+                        "resources.create",
+                        "prompts.create",
+                        "a2a.create",
+                        "gateways.update",
+                        "servers.update",
+                        "tools.update",
+                        "resources.update",
+                        "prompts.update",
+                        "a2a.update",
+                        "gateways.delete",
+                        "servers.delete",
+                        "tools.delete",
+                        "resources.delete",
+                        "prompts.delete",
+                        "a2a.delete",
+                        "a2a.invoke",
+                        "tokens.create",
+                        "tokens.read",
+                        "tokens.update",
+                        "tokens.revoke",
+                    ],
                     "is_system_role": True,
                 },
                 {
                     "name": "developer",
                     "description": "Developer with tool and resource access",
                     "scope": "team",
-                    "permissions": ["teams.join", "tools.read", "tools.execute", "resources.read", "prompts.read"],
+                    "permissions": [
+                        "admin.dashboard",
+                        "gateways.read",
+                        "servers.read",
+                        "servers.use",
+                        "teams.join",
+                        "tools.read",
+                        "tools.execute",
+                        "resources.read",
+                        "prompts.read",
+                        "a2a.read",
+                        "gateways.create",
+                        "servers.create",
+                        "tools.create",
+                        "resources.create",
+                        "prompts.create",
+                        "a2a.create",
+                        "gateways.update",
+                        "servers.update",
+                        "tools.update",
+                        "resources.update",
+                        "prompts.update",
+                        "a2a.update",
+                        "gateways.delete",
+                        "servers.delete",
+                        "tools.delete",
+                        "resources.delete",
+                        "prompts.delete",
+                        "a2a.delete",
+                        "a2a.invoke",
+                    ],
                     "is_system_role": True,
                 },
                 {
                     "name": "viewer",
-                    "description": "Read-only access to resources",
+                    "description": "Read-only access to resources and admin UI",
                     "scope": "team",
-                    "permissions": ["teams.join", "tools.read", "resources.read", "prompts.read"],
+                    "permissions": ["admin.dashboard", "gateways.read", "servers.read", "teams.join", "tools.read", "resources.read", "prompts.read", "a2a.read"],
+                    "is_system_role": True,
+                },
+                {
+                    "name": "platform_viewer",
+                    "description": "Read-only access to resources and admin UI",
+                    "scope": "global",
+                    "permissions": ["admin.dashboard", "gateways.read", "servers.read", "teams.join", "tools.read", "resources.read", "prompts.read", "a2a.read"],
                     "is_system_role": True,
                 },
             ]
+
+            # Logic to add additional default roles from a json file
+            if settings.mcpgateway_bootstrap_roles_in_db_enabled:
+                try:
+                    additional_default_roles_path = Path(settings.mcpgateway_bootstrap_roles_in_db_file)
+                    # Try multiple locations for the mcpgateway_bootstrap_roles_in_db_file file
+                    if not additional_default_roles_path.is_absolute():
+                        # Try current directory first
+                        if not additional_default_roles_path.exists():
+                            # Try project root (mcpgateway/bootstrap_db.py -> parent.parent = repo root)
+                            additional_default_roles_path = Path(__file__).resolve().parent.parent / settings.mcpgateway_bootstrap_roles_in_db_file
+
+                    if not additional_default_roles_path.exists():
+                        logger.warning(f"Additional roles file not found. Searched: CWD/{settings.mcpgateway_bootstrap_roles_in_db_file}, {additional_default_roles_path}")
+                    else:
+                        with open(additional_default_roles_path, "r", encoding="utf-8") as f:
+                            additional_default_roles_data = json.load(f)
+
+                        # Validate JSON structure: must be a list of dicts with required keys
+                        required_keys = {"name", "scope", "permissions"}
+                        if not isinstance(additional_default_roles_data, list):
+                            logger.error(f"Additional roles file must contain a JSON array, got {type(additional_default_roles_data).__name__}")
+                        else:
+                            valid_roles = []
+                            for idx, role in enumerate(additional_default_roles_data):
+                                if not isinstance(role, dict):
+                                    logger.warning(f"Skipping invalid role at index {idx}: expected dict, got {type(role).__name__}")
+                                    continue
+                                missing_keys = required_keys - set(role.keys())
+                                if missing_keys:
+                                    role_name = role.get("name", f"<index {idx}>")
+                                    logger.warning(f"Skipping role '{role_name}': missing required keys {missing_keys}")
+                                    continue
+                                valid_roles.append(role)
+
+                            if valid_roles:
+                                default_roles.extend(valid_roles)
+                                logger.info(f"Added {len(valid_roles)} additional roles to default roles in bootstrap db")
+                            elif additional_default_roles_data:
+                                logger.warning("No valid roles found in additional roles file")
+                except Exception as e:
+                    logger.error(f"Failed to load mcpgateway_bootstrap_roles_in_db_file: {e}")
 
             # Create default roles
             created_roles = []
@@ -271,14 +395,14 @@ async def bootstrap_default_roles(conn: Connection) -> None:
                         created_roles.append(existing_role)
                         continue
 
-                    # Create the role
+                    # Create the role (description and is_system_role are optional)
                     role = await role_service.create_role(
                         name=str(role_def["name"]),
-                        description=str(role_def["description"]),
+                        description=str(role_def.get("description", "")),
                         scope=str(role_def["scope"]),
                         permissions=cast(list[str], role_def["permissions"]),
                         created_by=settings.platform_admin_email,
-                        is_system_role=bool(role_def["is_system_role"]),
+                        is_system_role=bool(role_def.get("is_system_role", False)),
                     )
                     created_roles.append(role)
                     logger.info(f"Created system role: {role.name}")
@@ -289,6 +413,9 @@ async def bootstrap_default_roles(conn: Connection) -> None:
 
             # Assign platform_admin role to admin user
             platform_admin_role = next((r for r in created_roles if r.name == "platform_admin"), None)
+            if not platform_admin_role:
+                # Role not in created_roles (creation may have failed) — look up from DB as fallback
+                platform_admin_role = await role_service.get_role_by_name("platform_admin", "global")
             if platform_admin_role:
                 try:
                     # Check if assignment already exists
@@ -301,7 +428,9 @@ async def bootstrap_default_roles(conn: Connection) -> None:
                         logger.info("Admin user already has platform_admin role")
 
                 except Exception as e:
-                    logger.error(f"Failed to assign platform_admin role: {e}")
+                    logger.error(f"Failed to assign platform_admin role to {admin_user.email}: {e}. Admin UI routes using allow_admin_bypass=False will return 403.")
+            else:
+                logger.error(f"platform_admin role not found — could not assign to {admin_user.email}. Admin UI routes using allow_admin_bypass=False will return 403.")
 
             logger.info("Default RBAC roles bootstrap completed successfully")
 

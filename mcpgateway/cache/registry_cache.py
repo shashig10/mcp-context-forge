@@ -34,6 +34,21 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _get_cleanup_timeout() -> float:
+    """Get cleanup timeout from config (lazy import to avoid circular deps).
+
+    Returns:
+        Cleanup timeout in seconds (default: 5.0).
+    """
+    try:
+        # First-Party
+        from mcpgateway.config import settings  # pylint: disable=import-outside-toplevel
+
+        return settings.mcp_session_pool_cleanup_timeout
+    except Exception:
+        return 5.0
+
+
 @dataclass
 class CacheEntry:
     """Cache entry with value and expiry timestamp.
@@ -205,7 +220,7 @@ class RegistryCache:
         # Sort keys for consistent hashing
         sorted_items = sorted(kwargs.items())
         filter_str = str(sorted_items)
-        return hashlib.md5(filter_str.encode()).hexdigest()  # nosec B324 # noqa: DUO130
+        return hashlib.md5(filter_str.encode()).hexdigest()  # nosec B324  # noqa: DUO130
 
     async def _get_redis_client(self):
         """Get Redis client if available.
@@ -580,12 +595,16 @@ class CacheInvalidationSubscriber:
         except Exception as e:
             logger.warning("CacheInvalidationSubscriber failed to start: %s", e)
             # Clean up partially created pubsub to prevent leaks
+            # Use timeout to prevent blocking if pubsub doesn't close cleanly
+            cleanup_timeout = _get_cleanup_timeout()
             if self._pubsub is not None:
                 try:
                     try:
-                        await self._pubsub.aclose()
+                        await asyncio.wait_for(self._pubsub.aclose(), timeout=cleanup_timeout)
                     except AttributeError:
-                        await self._pubsub.close()
+                        await asyncio.wait_for(self._pubsub.close(), timeout=cleanup_timeout)
+                except asyncio.TimeoutError:
+                    logger.debug("Pubsub cleanup timed out - proceeding anyway")
                 except Exception as cleanup_err:
                     logger.debug("Error during pubsub cleanup: %s", cleanup_err)
                 self._pubsub = None
@@ -617,12 +636,20 @@ class CacheInvalidationSubscriber:
             self._task = None
 
         if self._pubsub:
+            cleanup_timeout = _get_cleanup_timeout()
             try:
-                await self._pubsub.unsubscribe(self._channel)
+                await asyncio.wait_for(self._pubsub.unsubscribe(self._channel), timeout=cleanup_timeout)
+            except asyncio.TimeoutError:
+                logger.debug("Pubsub unsubscribe timed out - proceeding anyway")
+            except Exception as e:
+                logger.debug("Error unsubscribing from pubsub: %s", e)
+            try:
                 try:
-                    await self._pubsub.aclose()
+                    await asyncio.wait_for(self._pubsub.aclose(), timeout=cleanup_timeout)
                 except AttributeError:
-                    await self._pubsub.close()
+                    await asyncio.wait_for(self._pubsub.close(), timeout=cleanup_timeout)
+            except asyncio.TimeoutError:
+                logger.debug("Pubsub close timed out - proceeding anyway")
             except Exception as e:
                 logger.debug("Error closing pubsub: %s", e)
             self._pubsub = None
@@ -630,7 +657,11 @@ class CacheInvalidationSubscriber:
         logger.info("CacheInvalidationSubscriber stopped")
 
     async def _listen_loop(self) -> None:
-        """Background loop that listens for and processes invalidation messages."""
+        """Background loop that listens for and processes invalidation messages.
+
+        Raises:
+            asyncio.CancelledError: If the task is cancelled during shutdown.
+        """
         logger.debug("CacheInvalidationSubscriber listen loop started")
         try:
             while self._started and not (self._stop_event and self._stop_event.is_set()):
@@ -654,6 +685,7 @@ class CacheInvalidationSubscriber:
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             logger.debug("CacheInvalidationSubscriber listen loop cancelled")
+            raise
         finally:
             logger.debug("CacheInvalidationSubscriber listen loop exited")
 

@@ -409,6 +409,11 @@
               "type": "object",
               "description": "Redis connection configuration",
               "properties": {
+                "host": {
+                  "type": "string",
+                  "description": "Redis host override",
+                  "default": ""
+                },
                 "port": {
                   "type": "integer",
                   "minimum": 1,
@@ -502,6 +507,11 @@
               "type": "string",
               "description": "Database pool recycle time",
               "default": "3600"
+            },
+            "DB_SQLITE_BUSY_TIMEOUT": {
+              "type": "string",
+              "description": "SQLite lock wait timeout in milliseconds",
+              "default": "5000"
             },
             "CACHE_TYPE": {
               "type": "string",
@@ -617,6 +627,22 @@
               "enum": ["true", "false"],
               "description": "Enable air-gapped mode for UI assets (serve vendored CSS/JS files locally)",
               "default": "false"
+            },
+            "MCPGATEWAY_UI_EMBEDDED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable embedded UI mode (hides logout + team selector by default)",
+              "default": "false"
+            },
+            "MCPGATEWAY_UI_HIDE_SECTIONS": {
+              "type": "string",
+              "description": "CSV/JSON list of UI sections to hide (overview, servers, gateways, tools, prompts, resources, roots, mcp-registry, metrics, plugins, export-import, logs, version-info, maintenance, teams, users, agents, tokens, settings)",
+              "default": ""
+            },
+            "MCPGATEWAY_UI_HIDE_HEADER_ITEMS": {
+              "type": "string",
+              "description": "CSV/JSON list of header items to hide (logout, team_selector, user_identity, theme_toggle)",
+              "default": ""
             },
             "MCPGATEWAY_ADMIN_API_ENABLED": {
               "type": "string",
@@ -761,6 +787,12 @@
               "type": "string",
               "enum": ["true", "false"],
               "description": "Enable DB lookup for user identity during request logging",
+              "default": "false"
+            },
+            "PERMISSION_AUDIT_ENABLED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable permission audit logging for RBAC checks",
               "default": "false"
             },
             "TRANSPORT_TYPE": {
@@ -914,14 +946,117 @@
             },
             "BASIC_AUTH_PASSWORD": {
               "type": "string",
-              "description": "Basic auth password",
+              "description": "Basic auth password (when Basic auth is enabled)",
               "default": "changeme"
+            },
+            "API_ALLOW_BASIC_AUTH": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable Basic auth for API endpoints (disabled by default for security)",
+              "default": "false"
             },
             "AUTH_REQUIRED": {
               "type": "string",
               "enum": ["true", "false"],
               "description": "Require authentication",
               "default": "true"
+            },
+            "ACCOUNT_LOCKOUT_NOTIFICATION_ENABLED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Send account lockout notification emails",
+              "default": "true"
+            },
+            "PASSWORD_RESET_ENABLED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable self-service forgot/reset password flow",
+              "default": "true"
+            },
+            "PASSWORD_RESET_TOKEN_EXPIRY_MINUTES": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$",
+              "description": "Password reset token expiry in minutes",
+              "default": "60"
+            },
+            "PASSWORD_RESET_RATE_LIMIT": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$",
+              "description": "Maximum password reset requests per email in each window",
+              "default": "5"
+            },
+            "PASSWORD_RESET_RATE_WINDOW_MINUTES": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$",
+              "description": "Password reset request rate-limit window in minutes",
+              "default": "15"
+            },
+            "PASSWORD_RESET_INVALIDATE_SESSIONS": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Invalidate active sessions after successful password reset",
+              "default": "true"
+            },
+            "PASSWORD_RESET_MIN_RESPONSE_MS": {
+              "type": "string",
+              "pattern": "^[0-9]+$",
+              "description": "Minimum forgot-password response duration in milliseconds",
+              "default": "250"
+            },
+            "SMTP_ENABLED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable SMTP delivery for auth notifications",
+              "default": "false"
+            },
+            "SMTP_HOST": {
+              "type": "string",
+              "description": "SMTP host",
+              "default": ""
+            },
+            "SMTP_PORT": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,4}$",
+              "description": "SMTP port",
+              "default": "587"
+            },
+            "SMTP_USER": {
+              "type": "string",
+              "description": "SMTP username",
+              "default": ""
+            },
+            "SMTP_PASSWORD": {
+              "type": "string",
+              "description": "SMTP password",
+              "default": ""
+            },
+            "SMTP_FROM_EMAIL": {
+              "type": "string",
+              "description": "Sender email for auth notifications",
+              "default": ""
+            },
+            "SMTP_FROM_NAME": {
+              "type": "string",
+              "description": "Sender display name for auth notifications",
+              "default": "MCP Gateway"
+            },
+            "SMTP_USE_TLS": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Use STARTTLS for SMTP connections",
+              "default": "true"
+            },
+            "SMTP_USE_SSL": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Use implicit SSL/TLS for SMTP connections",
+              "default": "false"
+            },
+            "SMTP_TIMEOUT_SECONDS": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$",
+              "description": "SMTP timeout in seconds",
+              "default": "15"
             },
             "JWT_SECRET_KEY": {
               "type": "string",
@@ -981,31 +1116,6 @@
             }
           },
           "additionalProperties": true
-        },
-        "envFrom": {
-          "type": "array",
-          "description": "Environment variable sources",
-          "items": {
-            "type": "object",
-            "properties": {
-              "secretRef": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                }
-              },
-              "configMapRef": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          }
         }
       },
       "additionalProperties": false
@@ -1476,6 +1586,51 @@
           },
           "additionalProperties": false
         },
+        "external": {
+          "type": "object",
+          "description": "External Redis configuration",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable external Redis",
+              "default": false
+            },
+            "existingSecret": {
+              "type": "string",
+              "description": "Secret containing REDIS_URL",
+              "default": ""
+            },
+            "urlKey": {
+              "type": "string",
+              "description": "Secret key for REDIS_URL",
+              "default": "REDIS_URL"
+            },
+            "url": {
+              "type": "string",
+              "description": "Direct Redis URL override",
+              "default": ""
+            },
+            "host": {
+              "type": "string",
+              "description": "Redis host",
+              "default": ""
+            },
+            "port": {
+              "type": "integer",
+              "description": "Redis port",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 6379
+            },
+            "db": {
+              "type": "integer",
+              "description": "Redis database index",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          "additionalProperties": false
+        },
         "resources": {
           "$ref": "#/$defs/resources",
           "description": "Resource limits and requests"
@@ -1595,6 +1750,16 @@
             }
           },
           "additionalProperties": false
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Existing Secret name for PgAdmin credentials",
+          "default": ""
+        },
+        "passwordKey": {
+          "type": "string",
+          "description": "Secret key for PGADMIN_DEFAULT_PASSWORD",
+          "default": "PGADMIN_DEFAULT_PASSWORD"
         },
         "env": {
           "type": "object",
@@ -1807,6 +1972,22 @@
           "maximum": 65535,
           "default": 8080
         },
+        "command": {
+          "type": "array",
+          "description": "Optional command override",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "args": {
+          "type": "array",
+          "description": "Optional args override",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
         "ingress": {
           "type": "object",
           "description": "Fast Time Server ingress configuration",
@@ -1815,6 +1996,16 @@
               "type": "boolean",
               "description": "Enable ingress",
               "default": true
+            },
+            "className": {
+              "type": "string",
+              "description": "Ingress class name",
+              "default": "nginx"
+            },
+            "host": {
+              "type": "string",
+              "description": "Ingress host",
+              "default": "gateway.local"
             },
             "path": {
               "type": "string",
@@ -1833,6 +2024,29 @@
               "minimum": 1,
               "maximum": 65535,
               "default": 80
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Ingress annotations",
+              "additionalProperties": { "type": "string" },
+              "default": {}
+            },
+            "tls": {
+              "type": "object",
+              "description": "TLS configuration for ingress",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Enable TLS for ingress",
+                  "default": false
+                },
+                "secretName": {
+                  "type": "string",
+                  "description": "Name of the TLS secret (optional, auto-generated if empty)",
+                  "default": ""
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -1858,6 +2072,36 @@
         }
       },
       "additionalProperties": false
+    },
+    "nginxProxy": {
+      "type": "object",
+      "description": "Optional nginx reverse-proxy profile values",
+      "additionalProperties": true
+    },
+    "monitoring": {
+      "type": "object",
+      "description": "Optional monitoring profile values",
+      "additionalProperties": true
+    },
+    "testing": {
+      "type": "object",
+      "description": "Optional testing profile values",
+      "additionalProperties": true
+    },
+    "benchmark": {
+      "type": "object",
+      "description": "Optional benchmark profile values",
+      "additionalProperties": true
+    },
+    "tls": {
+      "type": "object",
+      "description": "Optional TLS profile values",
+      "additionalProperties": true
+    },
+    "inspector": {
+      "type": "object",
+      "description": "Optional MCP inspector profile values",
+      "additionalProperties": true
     }
   },
   "$defs": {

@@ -84,6 +84,13 @@ table thead th {
 }
 
 /* URL column - panel-specific styling */
+
+#gateways-table td:nth-child(4),
+#gateways-table td:nth-child(5),
+#gateways-table td:nth-child(7),
+#gateways-table td:nth-child(9) {
+    text-align: center !important;
+}
 /* MCP Servers - URL is 3rd column */
 #gateways-table td:nth-child(3) {
     max-width: 350px !important;
@@ -129,10 +136,10 @@ table thead th {
 }
 
 /* Actions column - minimum width with flexibility */
-/* Apply to all tab panels */
 #gateways-table td:last-child {
     min-width: 180px !important;
     white-space: normal !important;
+    text-align: center !important;
 }
 
 /* Virtual Servers (Catalog)*/
@@ -253,7 +260,7 @@ table thead th {
 #tools-table td:nth-child(6),
 #tools-table td:nth-child(7),
 #tools-table td:nth-child(9),
-#tools-table td:nth-child(11) {    
+#tools-table td:nth-child(11) {
     text-align: center !important;
 }
 
@@ -287,10 +294,20 @@ table thead th {
 
 /* Prompts Panel */
 
+#prompts-table thead th:nth-child(4),
 #prompts-table thead th:nth-child(7),
-#prompts-table tbody td:nth-child(7) {
+#prompts-table thead th:nth-child(8),
+#prompts-table tbody td:nth-child(4),
+#prompts-table tbody td:nth-child(7),
+#prompts-table tbody td:nth-child(8) {
     display: none !important;
 }
+
+#prompts-table td:nth-child(5),
+#prompts-table td:nth-child(6) {
+    text-align: center !important;
+}
+
 
 /* Description and Owner column - Prompts Panel */
 #prompts-table td:nth-child(2), /* Name */
@@ -470,6 +487,10 @@ table thead th {
     -webkit-box-orient: vertical !important;
     -webkit-line-clamp: 4 !important;
     text-overflow: ellipsis !important;
+}
+
+#a2a-agents-panel table td:nth-child(6) {
+    text-align: center !important;
 }
 
 
@@ -2384,4 +2405,17 @@ nav[class*="-mb-px"]::-webkit-scrollbar-thumb:hover {
     nav[class*="-mb-px"] {
         gap: 0.5rem;
     }
+}
+
+/* Override HTMX's default "show all indicators on any request" behavior
+   This prevents spinners from showing during background /trace requests */
+body.htmx-request .htmx-indicator {
+    visibility: hidden;
+}
+
+/* Only show indicators when explicitly targeted via hx-indicator attribute
+   HTMX adds htmx-request class to the indicator when it's the target.
+   Use higher specificity to override the rule above. */
+body.htmx-request .htmx-indicator.htmx-request {
+    visibility: visible;
 }
