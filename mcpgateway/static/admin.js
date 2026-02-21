@@ -18718,6 +18718,13 @@ async function exportServerConfig(serverId, configType) {
  */
 function generateConfig(server, configType) {
     const currentHost = window.location.hostname;
+    const hostParts = currentHost.split(".");
+    const exportHost =
+        hostParts.length > 1
+            ? hostParts[0] === "api"
+                ? currentHost
+                : `api.${hostParts.slice(1).join(".")}`
+            : currentHost;
     const currentPort =
         window.location.port ||
         (window.location.protocol === "https:" ? "443" : "80");
@@ -18727,10 +18734,10 @@ function generateConfig(server, configType) {
     const pathSegments = currentURL.pathname.split("/").filter(Boolean);
     let baseUrl = "";
     if (pathSegments.length > 0 && pathSegments[0] !== "admin") {
-        baseUrl = `${protocol}//${currentHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}/${pathSegments[0]}`;
+        baseUrl = `${protocol}//${exportHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}/${pathSegments[0]}`;
     }
     else {
-        baseUrl = `${protocol}//${currentHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}`;
+        baseUrl = `${protocol}//${exportHost}${currentPort !== "80" && currentPort !== "443" ? ":" + currentPort : ""}`;
     }
 
     // Clean server name for use as config key (alphanumeric and hyphens only)
