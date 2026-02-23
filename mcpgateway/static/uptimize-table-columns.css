@@ -104,7 +104,6 @@
 
 /* URL-ish cells look cleaner when lightly mono-spaced */
 .upt-cell-expandable.upt-expand--url {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 0.81rem;
 }
 
@@ -123,6 +122,7 @@
    Gateways table (#gateways-table)
    ===================================== */
 
+/* Center align: Tags(4), Status(5), Owner(7), Visibility(9) */
 #gateways-table td:nth-child(4),
 #gateways-table td:nth-child(5),
 #gateways-table td:nth-child(7),
@@ -130,23 +130,25 @@
     text-align: center !important;
 }
 
+/* Width constraint: Name(2) */
 #gateways-table td:nth-child(2) {
     max-width: 13rem !important;
 }
 
+/* Width constraint: URL(3) */
 #gateways-table td:nth-child(3) {
     max-width: 18rem !important;
 }
 
-#gateways-table thead th:nth-child(1),
+/* Hide columns: Last Seen(6), Team(8) */
 #gateways-table thead th:nth-child(6),
 #gateways-table thead th:nth-child(8),
-#gateways-table tbody td:nth-child(1),
 #gateways-table tbody td:nth-child(6),
 #gateways-table tbody td:nth-child(8) {
     display: none !important;
 }
 
+/* Action controls column sizing: Actions(10) */
 #gateways-table td:last-child {
     min-width: 11.25rem !important;
     white-space: normal !important;
@@ -167,15 +169,18 @@
     display: none !important;
 }
 
+/* Width constraint: Description(5) */
 #servers-table td:nth-child(5) {
     max-width: 22rem !important;
     --upt-clamp-lines: 4;
 }
 
+/* Width constraint: Owner(8) */
 #servers-table td:nth-child(8) {
     max-width: 18rem !important;
 }
 
+/* Center align: Tools | Resources | Prompts(6) */
 #servers-table td:nth-child(6) {
     text-align: center !important;
 }
@@ -184,6 +189,7 @@
    Tools table (#tools-table)
    ===================================== */
 
+/* Hide columns: Source(2), Request Type(4), Annotations(6), Team(9) */
 #tools-table thead th:nth-child(2),
 #tools-table thead th:nth-child(4),
 #tools-table thead th:nth-child(6),
@@ -195,21 +201,25 @@
     display: none !important;
 }
 
+/* Min width: Name(3), Tags(7), Owner(8) */
 #tools-table td:nth-child(3),
 #tools-table td:nth-child(7),
 #tools-table td:nth-child(8) {
     min-width: 9rem !important;
 }
 
+/* Width + clamp: Description(5) */
 #tools-table td:nth-child(5) {
     max-width: 30rem !important;
     --upt-clamp-lines: 3;
 }
 
+/* Width constraint: Status group(10) */
 #tools-table td:nth-child(10) {
     max-width: 18rem !important;
 }
 
+/* Center align: Annotations(6), Tags(7), Team(9), Actions(11) */
 #tools-table td:nth-child(6),
 #tools-table td:nth-child(7),
 #tools-table td:nth-child(9),
@@ -232,16 +242,19 @@
     display: none !important;
 }
 
+/* Width constraints: MCP Server Name(2), Description(5) */
 #prompts-table td:nth-child(2),
 #prompts-table td:nth-child(5) {
     max-width: 22rem !important;
 }
 
+/* Clamp + align: Description(5) */
 #prompts-table td:nth-child(5) {
     --upt-clamp-lines: 3;
     text-align: left !important;
 }
 
+/* Center align: Tags(6) */
 #prompts-table td:nth-child(6) {
     text-align: center !important;
 }
@@ -250,17 +263,19 @@
    Resources table (#resources-table)
    ===================================== */
 
-/* Hide Team column */
+/* Hide column: Team(6) */
 #resources-table thead th:nth-child(6),
 #resources-table tbody td:nth-child(6) {
     display: none !important;
 }
 
+/* Width constraints: Source(1), Owner(5) */
 #resources-table td:nth-child(1),
 #resources-table td:nth-child(5) {
     max-width: 18rem !important;
 }
 
+/* Width + clamp: Description(3) */
 #resources-table td:nth-child(3) {
     max-width: 24rem !important;
     --upt-clamp-lines: 3;
@@ -270,25 +285,29 @@
    Agents table (#agents-table)
    ===================================== */
 
-/* Hide Team column */
+/* Hide column: Team(8) */
 #agents-table thead th:nth-child(8),
 #agents-table tbody td:nth-child(8) {
     display: none !important;
 }
 
+/* Width constraint: Name(2) */
 #agents-table td:nth-child(2) {
     max-width: 12rem !important;
 }
 
+/* Width + clamp: Description(3) */
 #agents-table td:nth-child(3) {
     max-width: 22rem !important;
     --upt-clamp-lines: 3;
 }
 
+/* Width constraint: Endpoint(4) */
 #agents-table td:nth-child(4) {
     max-width: 20rem !important;
 }
 
+/* Center align: Type | Status | Reachability(6) */
 #agents-table td:nth-child(6) {
     text-align: center !important;
 }

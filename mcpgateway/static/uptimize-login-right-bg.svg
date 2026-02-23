@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" role="img" aria-label="Uptimize themed background">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#002742" />
+      <stop offset="55%" stop-color="#003b63" />
+      <stop offset="100%" stop-color="#0b4f84" />
+    </linearGradient>
+    <radialGradient id="glowTopRight" cx="0.84" cy="0.11" r="0.56">
+      <stop offset="0%" stop-color="#0f69af" stop-opacity="0.50" />
+      <stop offset="100%" stop-color="#0f69af" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="glowBottomLeft" cx="0.08" cy="0.84" r="0.62">
+      <stop offset="0%" stop-color="#96d7d2" stop-opacity="0.34" />
+      <stop offset="100%" stop-color="#96d7d2" stop-opacity="0" />
+    </radialGradient>
+    <pattern id="dotGrid" width="42" height="42" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.15" fill="#ffffff" fill-opacity="0.12" />
+    </pattern>
+    <clipPath id="uptimize-favicon-clip">
+      <path d="M39.5833 277.083C17.722 255.222 17.7221 219.778 39.5833 197.917L197.917 39.5832C219.778 17.7219 255.222 17.722 277.083 39.5832L435.417 197.917C457.278 219.778 457.278 255.222 435.417 277.083L277.083 435.417C255.222 457.278 219.778 457.278 197.917 435.417L39.5833 277.083Z" />
+    </clipPath>
+  </defs>
+
+  <rect width="1920" height="1080" fill="url(#bg)" />
+  <rect width="1920" height="1080" fill="url(#glowTopRight)" />
+  <rect width="1920" height="1080" fill="url(#glowBottomLeft)" />
+  <rect width="1920" height="1080" fill="url(#dotGrid)" opacity="0.25" />
+
+  <!-- Uptimize favicon mark -->
+  <g transform="translate(1180 82)" opacity="0.95">
+    <g clip-path="url(#uptimize-favicon-clip)">
+      <path d="M39.5833 277.083C17.722 255.222 17.7221 219.778 39.5833 197.917L197.917 39.5832C219.778 17.7219 255.222 17.722 277.083 39.5832L435.417 197.917C457.278 219.778 457.278 255.222 435.417 277.083L277.083 435.417C255.222 457.278 219.778 457.278 197.917 435.417L39.5833 277.083Z" fill="#ffffff" />
+      <rect y="237.5" width="111.959" height="111.959" transform="rotate(-45 0 237.5)" fill="#0F69AF" />
+      <rect x="79.1667" y="316.667" width="111.959" height="111.959" transform="rotate(-45 79.1667 316.667)" fill="#96D7D2" />
+      <rect x="158.333" y="395.833" width="111.959" height="111.959" transform="rotate(-45 158.333 395.833)" fill="#FFDCB9" />
+      <rect x="79.1667" y="158.333" width="111.959" height="111.959" transform="rotate(-45 79.1667 158.333)" fill="#0F69AF" />
+      <rect x="158.333" y="237.5" width="111.959" height="111.959" transform="rotate(-45 158.333 237.5)" fill="#F8F8FC" />
+      <rect x="237.5" y="316.667" width="111.959" height="111.959" transform="rotate(-45 237.5 316.667)" fill="#96D7D2" />
+      <rect x="158.333" y="79.1666" width="111.959" height="111.959" transform="rotate(-45 158.333 79.1666)" fill="#0F69AF" />
+      <rect x="237.5" y="158.333" width="111.959" height="111.959" transform="rotate(-45 237.5 158.333)" fill="#0F69AF" />
+      <rect x="316.667" y="237.5" width="111.959" height="111.959" transform="rotate(-45 316.667 237.5)" fill="#0F69AF" />
+    </g>
+  </g>
+
+  <g opacity="0.20">
+    <circle cx="1660" cy="840" r="172" fill="#96d7d2" />
+    <circle cx="1460" cy="940" r="98" fill="#ffdcb9" />
+    <circle cx="1240" cy="810" r="62" fill="#f6fbff" />
+    <circle cx="1365" cy="735" r="28" fill="#96d7d2" />
+  </g>
+
+  <g stroke="#ffffff" stroke-opacity="0.12" fill="none">
+    <path d="M0 830 C520 680 1320 1020 1920 760" />
+    <path d="M0 932 C560 782 1320 1080 1920 862" />
+  </g>
+</svg>

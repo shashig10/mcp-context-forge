@@ -21492,17 +21492,17 @@ function showTokenCreatedModal(tokenData) {
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                         Your API Token:
                     </label>
-                    <div class="flex">
+                    <div class="flex items-stretch gap-2">
                         <input
                             type="text"
                             value="${tokenData.access_token}"
                             readonly
-                            class="flex-1 p-2 border border-gray-300 dark:border-gray-600 rounded-l-md bg-gray-50 dark:bg-gray-700 text-sm font-mono"
+                            class="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-gray-50 dark:bg-gray-700 text-sm font-mono text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
                             id="new-token-value"
                         />
                         <button
                             onclick="copyToClipboard('new-token-value')"
-                            class="px-3 py-2 bg-indigo-600 text-sm rounded-r-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 whitespace-nowrap"
                         >
                             Copy
                         </button>
