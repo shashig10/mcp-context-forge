@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1200"
+  height="180"
+  viewBox="0 0 1200 180"
+  role="img"
+  aria-label="UPTIMIZE logo"
+>
+  <title>UPTIMIZE</title>
+
+  <!-- Transparent background by design -->
+  <g transform="translate(10, 8) scale(0.380)">
+    <g clip-path="url(#uptimize-clip)">
+      <path d="M39.5833 277.083C17.722 255.222 17.7221 219.778 39.5833 197.917L197.917 39.5832C219.778 17.7219 255.222 17.722 277.083 39.5832L435.417 197.917C457.278 219.778 457.278 255.222 435.417 277.083L277.083 435.417C255.222 457.278 219.778 457.278 197.917 435.417L39.5833 277.083Z" fill="#0F69AF"/>
+      <rect y="237.5" width="111.959" height="111.959" transform="rotate(-45 0 237.5)" fill="#0F69AF"/>
+      <rect x="79.1667" y="316.667" width="111.959" height="111.959" transform="rotate(-45 79.1667 316.667)" fill="#96D7D2"/>
+      <rect x="158.333" y="395.833" width="111.959" height="111.959" transform="rotate(-45 158.333 395.833)" fill="#FFDCB9"/>
+      <rect x="79.1667" y="158.333" width="111.959" height="111.959" transform="rotate(-45 79.1667 158.333)" fill="#0F69AF"/>
+      <rect x="158.333" y="237.5" width="111.959" height="111.959" transform="rotate(-45 158.333 237.5)" fill="#F8F8FC"/>
+      <rect x="237.5" y="316.667" width="111.959" height="111.959" transform="rotate(-45 237.5 316.667)" fill="#96D7D2"/>
+      <rect x="158.333" y="79.1666" width="111.959" height="111.959" transform="rotate(-45 158.333 79.1666)" fill="#0F69AF"/>
+      <rect x="237.5" y="158.333" width="111.959" height="111.959" transform="rotate(-45 237.5 158.333)" fill="#0F69AF"/>
+      <rect x="316.667" y="237.5" width="111.959" height="111.959" transform="rotate(-45 316.667 237.5)" fill="#0F69AF"/>
+    </g>
+  </g>
+
+  <text
+    x="350"
+    y="150"
+    fill="#0F69AF"
+    font-size="150"
+    font-weight="800"
+    letter-spacing="2"
+    font-family="Lato, Helvetica, Arial, sans-serif"
+  >
+    UPTIMIZE
+  </text>
+
+  <defs>
+    <clipPath id="uptimize-clip">
+      <path d="M39.5833 277.083C17.722 255.222 17.7221 219.778 39.5833 197.917L197.917 39.5832C219.778 17.7219 255.222 17.722 277.083 39.5832L435.417 197.917C457.278 219.778 457.278 255.222 435.417 277.083L277.083 435.417C255.222 457.278 219.778 457.278 197.917 435.417L39.5833 277.083Z"/>
+    </clipPath>
+  </defs>
+</svg>

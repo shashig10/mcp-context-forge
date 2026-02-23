@@ -1,7 +1,7 @@
 <!doctype html>
 <html
   lang="en"
-  x-data="{ darkMode: (() => { try { return JSON.parse(localStorage.getItem('darkMode') || 'false') } catch(e) { if (typeof _logRestrictedContext === 'function') _logRestrictedContext(e); return false } })() }"
+  x-data="{ darkMode: (() => { try { return JSON.parse(localStorage.getItem('darkMode') || 'true') } catch(e) { if (typeof _logRestrictedContext === 'function') _logRestrictedContext(e); return true } })() }"
   x-bind:class="darkMode ? 'dark' : ''"
   x-init="$watch('darkMode', val => { try { localStorage.setItem('darkMode', val) } catch(e) { if (typeof _logRestrictedContext === 'function') _logRestrictedContext(e); } })"
 >
@@ -217,6 +217,7 @@
     <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
     {% endif %}
     <script src="{{ root_path }}/static/admin.js"></script>
+    <script src="{{ root_path }}/static/uptimize-table-columns.js?v=5"></script>
     {% if is_admin %}
     <script src="{{ root_path }}/static/gantt-chart.js?v=3"></script>
     <script src="{{ root_path }}/static/flame-graph.js?v=1"></script>
@@ -248,6 +249,8 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
     {% endif %}
     <link href="{{ root_path }}/static/admin.css" rel="stylesheet" />
+    <link href="{{ root_path }}/static/uptimize-theme.css?v=9" rel="stylesheet" />
+    <link href="{{ root_path }}/static/uptimize-table-columns.css?v=5" rel="stylesheet" />
     <link href="{{ root_path }}/static/gantt-chart.css" rel="stylesheet" />
     <link href="{{ root_path }}/static/flame-graph.css" rel="stylesheet" />
     <style>
@@ -283,7 +286,7 @@
   <body class="bg-gray-100 dark:bg-gray-900">
     {% set hidden_sections = ui_hidden_sections | default([]) %}
     {% set hidden_header_items = ui_hidden_header_items | default([]) %}
-    <div class="flex h-screen overflow-hidden w-full max-w-[2000px] mx-auto" x-data="{ sidebarOpen: true, sidebarCollapsed: false }">
+    <div class="uptimize-shell flex h-screen overflow-hidden w-full max-w-[2000px] mx-auto" x-data="{ sidebarOpen: true, sidebarCollapsed: false }">
 
       <!-- Mobile sidebar backdrop -->
       <div
@@ -321,8 +324,8 @@
         <div class="flex items-center h-16 px-4 border-b border-gray-200 dark:border-gray-700 flex-shrink-0"
              :class="sidebarCollapsed ? 'justify-center' : 'justify-between'">
           <a href="{{ root_path }}/admin" class="flex items-center" x-show="!sidebarCollapsed">
-            <img src="{{ root_path }}/static/UPTIMIZE_Docs_logo_large.jpeg" alt="UPTIMIZE" class="height: 3rem dark:hidden" />
-            <img src="{{ root_path }}/static/UPTIMIZE_Docs_logo_large.jpeg" alt="UPTIMIZE" class="height: 3rem hidden dark:block" />
+            <img src="{{ root_path }}/static/uptimize_logo_blue.svg" alt="UPTIMIZE" class="h-9 w-auto max-w-[11.5rem] object-contain dark:hidden" />
+            <img src="{{ root_path }}/static/uptimize_logo_blue.svg" alt="UPTIMIZE" class="h-9 w-auto max-w-[11.5rem] object-contain hidden dark:block" />
           </a>
           <button @click="sidebarCollapsed = false" class="flex items-center justify-center" x-show="sidebarCollapsed" title="Expand sidebar">
             <img src="{{ root_path }}/static/uptimize_favicon.svg" alt="UPTIMIZE" class="h-8 w-8 dark:hidden" />
@@ -661,7 +664,7 @@
       <!-- Main Content Area -->
       <div class="flex-1 flex flex-col overflow-hidden">
         <!-- Top Header Bar -->
-        <header class="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+        <header class="relative z-40 overflow-visible bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
           <div class="flex items-center justify-between h-16 px-4">
             <!-- Left side: mobile menu button + title -->
             <div class="flex items-center">
@@ -693,7 +696,7 @@
               <!-- Team Selector with Search and Infinite Scroll -->
               {% if email_auth_enabled and 'team_selector' not in hidden_header_items %}
               <div
-                class="relative inline-block text-left"
+                class="relative z-50 inline-block text-left"
                 x-data="{
                   open: false,
                   selectedTeam: '',
@@ -746,11 +749,11 @@
                   x-transition:leave="transition ease-in duration-75"
                   x-transition:leave-start="transform opacity-100 scale-100"
                   x-transition:leave-end="transform opacity-0 scale-95"
-                  class="origin-top-right absolute right-0 mt-2 w-72 rounded-md shadow-lg bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5 z-50"
+                  class="origin-top-right absolute right-0 mt-2 w-72 rounded-md shadow-lg bg-white dark:bg-gray-800 ring-1 ring-black ring-opacity-5 z-[90]"
                   role="menu"
                   aria-orientation="vertical"
                   aria-labelledby="team-selector-button"
-                  style="display: none"
+                  style="z-index: 90; display: none"
                 >
                   <!-- Search Input -->
                   <div class="p-2 border-b border-gray-200 dark:border-gray-700">
@@ -8861,7 +8864,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     </div>
                   </div>
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
@@ -9176,7 +9179,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     </div>
                   </div>
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
@@ -9399,7 +9402,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     </div>
                   </div>
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
@@ -9546,7 +9549,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                 Gateway Details
               </h3>
               <div
-                class="mt-4 space-y-4 bg-white dark:bg-gray-400"
+                class="mt-4 space-y-4 bg-white dark:bg-gray-900"
                 id="gateway-details"
               ></div>
             </div>
@@ -10279,7 +10282,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     </div>
                   </div>
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
@@ -11378,7 +11381,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                 </div>
 
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
@@ -11782,7 +11785,7 @@ class="fixed z-50 inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-ce
                     </div>
                   </div>
                   <div
-                    class="mt-6 flex justify-end space-x-3 bg-white dark:bg-gray-900 dark:text-gray-100"
+                    class="mt-8 flex justify-end gap-3"
                   >
                     <button
                       type="button"
