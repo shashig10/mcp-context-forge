@@ -12,9 +12,10 @@
         {
             selector: "#gateways-table tbody td:nth-child(3)",
             mode: "url",
-            style: "singleline",
+            style: "multiline",
+            lines: 2,
             minLength: 36,
-            maxWidth: "42rem",
+            maxWidth: "32rem",
         },
         {
             selector: "#servers-table tbody td:nth-child(5)",
@@ -30,7 +31,7 @@
             style: "multiline",
             lines: 3,
             minLength: 85,
-            maxWidth: "42rem",
+            maxWidth: "34rem",
         },
         {
             selector: "#prompts-table tbody td:nth-child(5)",
@@ -59,9 +60,10 @@
         {
             selector: "#agents-table tbody td:nth-child(4)",
             mode: "url",
-            style: "singleline",
+            style: "multiline",
+            lines: 2,
             minLength: 30,
-            maxWidth: "42rem",
+            maxWidth: "34rem",
         },
     ];
 
@@ -150,29 +152,33 @@
         cell.setAttribute("data-upt-full-text", fullText);
     }
 
-    function initializeTableExpansions(root = document) {
+    function initializeTableExpansions() {
         CELL_CONFIG.forEach((config) => {
-            root.querySelectorAll(config.selector).forEach((cell) => applyCellBehavior(cell, config));
+            document.querySelectorAll(config.selector).forEach((cell) => applyCellBehavior(cell, config));
         });
     }
 
-    function scheduleInitialize(root = document) {
-        window.requestAnimationFrame(() => initializeTableExpansions(root));
+    function scheduleInitialize() {
+        window.requestAnimationFrame(() => initializeTableExpansions());
     }
 
     document.addEventListener("DOMContentLoaded", () => {
-        scheduleInitialize(document);
+        scheduleInitialize();
     });
 
-    document.addEventListener("htmx:afterSwap", (event) => {
-        const root = event?.detail?.target || document;
-        scheduleInitialize(root);
+    document.addEventListener("htmx:afterSwap", () => {
+        scheduleInitialize();
     });
 
     document.addEventListener("click", (event) => {
         if (event.target.closest('[onclick*="showTab"]')) {
-            window.setTimeout(() => scheduleInitialize(document), 120);
+            window.setTimeout(() => scheduleInitialize(), 120);
         }
+    });
+
+    // Safety pass for first paint + late HTMX content.
+    window.addEventListener("load", () => {
+        window.setTimeout(() => scheduleInitialize(), 140);
     });
 
     window.uptimizeInitializeTableExpansions = scheduleInitialize;

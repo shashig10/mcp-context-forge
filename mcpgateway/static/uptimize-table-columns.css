@@ -59,7 +59,7 @@
 .upt-cell-expandable[data-upt-full-text]::after {
     content: attr(data-upt-full-text);
     position: absolute;
-    top: calc(100% + 0.45rem);
+    top: 0;
     left: 0;
     z-index: var(--upt-table-popover-z);
     width: max-content;
@@ -78,7 +78,7 @@
     font-size: 0.8125rem;
     opacity: 0;
     pointer-events: none;
-    transform: translateY(-4px) scale(0.985);
+    transform: scale(0.985);
     transition:
         opacity 180ms ease,
         transform 180ms ease;
@@ -87,7 +87,7 @@
 .upt-cell-expandable[data-upt-full-text]:hover::after,
 .upt-cell-expandable[data-upt-full-text]:focus-within::after {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: scale(1);
 }
 
 .upt-cell-expandable[data-upt-full-text]:hover,
@@ -96,10 +96,7 @@
 }
 
 /* Keep popover inside viewport for right-side columns */
-#tools-table td:nth-child(5).upt-cell-expandable::after,
-#prompts-table td:nth-child(5).upt-cell-expandable::after,
-#resources-table td:nth-child(3).upt-cell-expandable::after,
-#agents-table td:nth-child(3).upt-cell-expandable::after,
+/* Keep only far-right expandable columns right-aligned */
 #agents-table td:nth-child(4).upt-cell-expandable::after {
     left: auto;
     right: 0;
@@ -109,6 +106,12 @@
 .upt-cell-expandable.upt-expand--url {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 0.81rem;
+}
+
+.upt-cell-expandable.upt-expand--url > .upt-cell-preview {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    line-height: 1.38;
 }
 
 /* Subtle popover scrollbar */

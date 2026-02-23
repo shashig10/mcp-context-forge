@@ -6,6 +6,7 @@
  */
 
 :root {
+    --uptimize-font-sans: "Lato", Helvetica, Arial, sans-serif;
     --uptimize-primary: #0f69af;
     --uptimize-primary-strong: #0b4f84;
     --uptimize-primary-soft: rgb(15 105 175 / 10%);
@@ -40,7 +41,7 @@
 }
 
 body {
-    font-family: "SF Pro Text", "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-family: var(--uptimize-font-sans);
     color: var(--uptimize-text);
     background:
         radial-gradient(1200px circle at 8% -12%, rgb(150 215 210 / 36%), transparent 42%),
@@ -53,6 +54,18 @@ body {
         radial-gradient(1200px circle at 0% -10%, rgb(150 215 210 / 16%), transparent 38%),
         radial-gradient(920px circle at 100% 4%, rgb(15 105 175 / 30%), transparent 40%),
         linear-gradient(180deg, #07111d 0%, #0b1726 52%, #0b1a2b 100%);
+}
+
+html,
+body,
+button,
+input,
+textarea,
+select,
+table,
+th,
+td {
+    font-family: var(--uptimize-font-sans);
 }
 
 .uptimize-shell {
@@ -241,6 +254,8 @@ table thead th {
     border-bottom: 1px solid rgb(15 105 175 / 16%) !important;
     font-size: 0.69rem !important;
     letter-spacing: 0.05em;
+    text-align: center !important;
+    vertical-align: middle;
 }
 
 .dark table thead th {
