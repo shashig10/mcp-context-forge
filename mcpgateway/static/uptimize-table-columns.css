@@ -18,6 +18,9 @@
     --upt-table-popover-radius: 0.75rem;
     --upt-table-popover-max-height: 16rem;
     --upt-table-popover-z: 60;
+    --upt-col-sno-min: 2.75rem;
+    --upt-col-url-min: 16rem;
+    --upt-col-owner-max: 14rem;
 }
 
 .dark {
@@ -185,6 +188,26 @@
     text-align: center !important;
 }
 
+/*
+ * Keep association summary column compact.
+ * Header can wrap so it doesn't force excessive table width.
+ */
+#servers-table thead th:nth-child(6),
+#servers-table tbody td:nth-child(6) {
+    min-width: 11rem !important;
+    max-width: 11.5rem !important;
+}
+
+#servers-table thead th:nth-child(6) {
+    white-space: normal !important;
+    line-height: 1.2;
+}
+
+#servers-table thead th:nth-child(2),
+.markdown-body thead th:nth-child(2) {
+    border-top-left-radius: 12px !important;
+}
+
 /* =====================================
    Tools table (#tools-table)
    ===================================== */
@@ -310,6 +333,76 @@
 /* Center align: Type | Status | Reachability(6) */
 #agents-table td:nth-child(6) {
     text-align: center !important;
+}
+
+/* =====================================
+   Shared registry column sizing
+   ===================================== */
+
+/*
+ * S. No. stays compact by default and grows only when wider content appears.
+ * This keeps tables dense without clipping larger serial labels.
+ */
+#gateways-table :is(thead th:nth-child(1), tbody td:nth-child(1)),
+#servers-table :is(thead th:nth-child(2), tbody td:nth-child(2)),
+#tools-table :is(thead th:nth-child(1), tbody td:nth-child(1)),
+#prompts-table :is(thead th:nth-child(1), tbody td:nth-child(1)) {
+    width: 1% !important;
+    min-width: var(--upt-col-sno-min) !important;
+    white-space: nowrap !important;
+    text-align: center !important;
+}
+
+/*
+ * Match tools-table compact feel by reducing horizontal padding
+ * on S.No. cells in tables that still use larger px-6 utility classes.
+ */
+#gateways-table :is(thead th:nth-child(1), tbody td:nth-child(1)),
+#servers-table :is(thead th:nth-child(2), tbody td:nth-child(2)),
+#prompts-table :is(thead th:nth-child(1), tbody td:nth-child(1)) {
+    padding-left: 0.5rem !important;
+    padding-right: 0.5rem !important;
+}
+
+/* URL / Endpoint columns keep a practical baseline width. */
+#gateways-table :is(thead th:nth-child(3), tbody td:nth-child(3)),
+#agents-table :is(thead th:nth-child(4), tbody td:nth-child(4)) {
+    min-width: var(--upt-col-url-min) !important;
+}
+
+/* Owner column widths are bounded to prevent layout distortion. */
+#gateways-table :is(thead th:nth-child(7), tbody td:nth-child(7)),
+#servers-table :is(thead th:nth-child(8), tbody td:nth-child(8)),
+#tools-table :is(thead th:nth-child(8), tbody td:nth-child(8)),
+#prompts-table :is(thead th:nth-child(7), tbody td:nth-child(7)),
+#resources-table :is(thead th:nth-child(5), tbody td:nth-child(5)),
+#agents-table :is(thead th:nth-child(7), tbody td:nth-child(7)) {
+    max-width: var(--upt-col-owner-max) !important;
+}
+
+#gateways-table td:nth-child(7),
+#servers-table td:nth-child(8),
+#tools-table td:nth-child(8),
+#prompts-table td:nth-child(7),
+#resources-table td:nth-child(5),
+#agents-table td:nth-child(7) {
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+#gateways-table td:nth-child(7) > :is(span, div, a),
+#servers-table td:nth-child(8) > :is(span, div, a),
+#tools-table td:nth-child(8) > :is(span, div, a),
+#prompts-table td:nth-child(7) > :is(span, div, a),
+#resources-table td:nth-child(5) > :is(span, div, a),
+#agents-table td:nth-child(7) > :is(span, div, a) {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
 }
 
 /* =====================================
