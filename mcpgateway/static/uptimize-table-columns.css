@@ -1,0 +1,317 @@
+/*
+ * UPTIMIZE table column/overflow manager.
+ *
+ * This file intentionally contains only table presentation behavior:
+ * - hidden columns
+ * - compact/truncated cells
+ * - non-distorting expandable hover popovers
+ *
+ * Expansion popovers are powered by the companion JS file
+ * `uptimize-table-columns.js`, which attaches `data-upt-full-text`.
+ */
+
+:root {
+    --upt-table-popover-bg: #ffffff;
+    --upt-table-popover-border: rgb(209 213 219);
+    --upt-table-popover-shadow: 0 14px 30px rgb(0 0 0 / 22%);
+    --upt-table-popover-text: rgb(17 24 39);
+    --upt-table-popover-radius: 0.75rem;
+    --upt-table-popover-max-height: 16rem;
+    --upt-table-popover-z: 60;
+}
+
+.dark {
+    --upt-table-popover-bg: rgb(17 24 39);
+    --upt-table-popover-border: rgb(75 85 99);
+    --upt-table-popover-shadow: 0 16px 34px rgb(0 0 0 / 42%);
+    --upt-table-popover-text: rgb(243 244 246);
+}
+
+/* =====================================
+   Shared expandable-cell behavior
+   ===================================== */
+
+.upt-cell-expandable {
+    position: relative;
+    vertical-align: top;
+    cursor: zoom-in;
+}
+
+.upt-cell-preview {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.upt-cell-expandable.upt-expand--singleline > .upt-cell-preview {
+    white-space: nowrap !important;
+    text-overflow: ellipsis !important;
+}
+
+.upt-cell-expandable.upt-expand--multiline > .upt-cell-preview {
+    display: -webkit-box !important;
+    -webkit-box-orient: vertical !important;
+    -webkit-line-clamp: var(--upt-clamp-lines, 3) !important;
+    white-space: normal !important;
+    text-overflow: ellipsis !important;
+}
+
+.upt-cell-expandable[data-upt-full-text]::after {
+    content: attr(data-upt-full-text);
+    position: absolute;
+    top: calc(100% + 0.45rem);
+    left: 0;
+    z-index: var(--upt-table-popover-z);
+    width: max-content;
+    max-width: min(var(--upt-expand-max-width, 34rem), calc(100vw - 2rem));
+    max-height: var(--upt-table-popover-max-height);
+    overflow: auto;
+    padding: 0.72rem 0.82rem;
+    border-radius: var(--upt-table-popover-radius);
+    border: 1px solid var(--upt-table-popover-border);
+    background: var(--upt-table-popover-bg);
+    color: var(--upt-table-popover-text);
+    box-shadow: var(--upt-table-popover-shadow);
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.45;
+    font-size: 0.8125rem;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-4px) scale(0.985);
+    transition:
+        opacity 180ms ease,
+        transform 180ms ease;
+}
+
+.upt-cell-expandable[data-upt-full-text]:hover::after,
+.upt-cell-expandable[data-upt-full-text]:focus-within::after {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+.upt-cell-expandable[data-upt-full-text]:hover,
+.upt-cell-expandable[data-upt-full-text]:focus-within {
+    z-index: 20;
+}
+
+/* Keep popover inside viewport for right-side columns */
+#tools-table td:nth-child(5).upt-cell-expandable::after,
+#prompts-table td:nth-child(5).upt-cell-expandable::after,
+#resources-table td:nth-child(3).upt-cell-expandable::after,
+#agents-table td:nth-child(3).upt-cell-expandable::after,
+#agents-table td:nth-child(4).upt-cell-expandable::after {
+    left: auto;
+    right: 0;
+}
+
+/* URL-ish cells look cleaner when lightly mono-spaced */
+.upt-cell-expandable.upt-expand--url {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.81rem;
+}
+
+/* Subtle popover scrollbar */
+.upt-cell-expandable[data-upt-full-text]::after {
+    scrollbar-width: thin;
+}
+
+/* =====================================
+   Gateways table (#gateways-table)
+   ===================================== */
+
+#gateways-table td:nth-child(4),
+#gateways-table td:nth-child(5),
+#gateways-table td:nth-child(7),
+#gateways-table td:nth-child(9) {
+    text-align: center !important;
+}
+
+#gateways-table td:nth-child(2) {
+    max-width: 13rem !important;
+}
+
+#gateways-table td:nth-child(3) {
+    max-width: 18rem !important;
+}
+
+#gateways-table thead th:nth-child(1),
+#gateways-table thead th:nth-child(6),
+#gateways-table thead th:nth-child(8),
+#gateways-table tbody td:nth-child(1),
+#gateways-table tbody td:nth-child(6),
+#gateways-table tbody td:nth-child(8) {
+    display: none !important;
+}
+
+#gateways-table td:last-child {
+    min-width: 11.25rem !important;
+    white-space: normal !important;
+    text-align: center !important;
+}
+
+/* =====================================
+   Virtual servers table (#servers-table)
+   ===================================== */
+
+/* Hidden columns requested: Icon (1), UUID (3), Team (9) */
+#servers-table thead th:nth-child(1),
+#servers-table thead th:nth-child(3),
+#servers-table thead th:nth-child(9),
+#servers-table tbody td:nth-child(1),
+#servers-table tbody td:nth-child(3),
+#servers-table tbody td:nth-child(9) {
+    display: none !important;
+}
+
+#servers-table td:nth-child(5) {
+    max-width: 22rem !important;
+    --upt-clamp-lines: 4;
+}
+
+#servers-table td:nth-child(8) {
+    max-width: 18rem !important;
+}
+
+#servers-table td:nth-child(6) {
+    text-align: center !important;
+}
+
+/* =====================================
+   Tools table (#tools-table)
+   ===================================== */
+
+#tools-table thead th:nth-child(2),
+#tools-table thead th:nth-child(4),
+#tools-table thead th:nth-child(6),
+#tools-table thead th:nth-child(9),
+#tools-table tbody td:nth-child(2),
+#tools-table tbody td:nth-child(4),
+#tools-table tbody td:nth-child(6),
+#tools-table tbody td:nth-child(9) {
+    display: none !important;
+}
+
+#tools-table td:nth-child(3),
+#tools-table td:nth-child(7),
+#tools-table td:nth-child(8) {
+    min-width: 9rem !important;
+}
+
+#tools-table td:nth-child(5) {
+    max-width: 30rem !important;
+    --upt-clamp-lines: 3;
+}
+
+#tools-table td:nth-child(10) {
+    max-width: 18rem !important;
+}
+
+#tools-table td:nth-child(6),
+#tools-table td:nth-child(7),
+#tools-table td:nth-child(9),
+#tools-table td:nth-child(11) {
+    text-align: center !important;
+}
+
+/* =====================================
+   Prompts table (#prompts-table)
+   ===================================== */
+
+/* Keep: S.No, Source, Name, Description, Tags, Visibility/Status, Actions */
+/* Hide: Prompt ID (4), Owner (7), Team (8) */
+#prompts-table thead th:nth-child(4),
+#prompts-table thead th:nth-child(7),
+#prompts-table thead th:nth-child(8),
+#prompts-table tbody td:nth-child(4),
+#prompts-table tbody td:nth-child(7),
+#prompts-table tbody td:nth-child(8) {
+    display: none !important;
+}
+
+#prompts-table td:nth-child(2),
+#prompts-table td:nth-child(5) {
+    max-width: 22rem !important;
+}
+
+#prompts-table td:nth-child(5) {
+    --upt-clamp-lines: 3;
+    text-align: left !important;
+}
+
+#prompts-table td:nth-child(6) {
+    text-align: center !important;
+}
+
+/* =====================================
+   Resources table (#resources-table)
+   ===================================== */
+
+/* Hide Team column */
+#resources-table thead th:nth-child(6),
+#resources-table tbody td:nth-child(6) {
+    display: none !important;
+}
+
+#resources-table td:nth-child(1),
+#resources-table td:nth-child(5) {
+    max-width: 18rem !important;
+}
+
+#resources-table td:nth-child(3) {
+    max-width: 24rem !important;
+    --upt-clamp-lines: 3;
+}
+
+/* =====================================
+   Agents table (#agents-table)
+   ===================================== */
+
+/* Hide Team column */
+#agents-table thead th:nth-child(8),
+#agents-table tbody td:nth-child(8) {
+    display: none !important;
+}
+
+#agents-table td:nth-child(2) {
+    max-width: 12rem !important;
+}
+
+#agents-table td:nth-child(3) {
+    max-width: 22rem !important;
+    --upt-clamp-lines: 3;
+}
+
+#agents-table td:nth-child(4) {
+    max-width: 20rem !important;
+}
+
+#agents-table td:nth-child(6) {
+    text-align: center !important;
+}
+
+/* =====================================
+   Shared URL/link truncation baseline
+   ===================================== */
+
+table td a[href^="http"],
+table td a[href^="https"] {
+    display: inline-block;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: rgb(107 114 128);
+    font-size: 0.875rem;
+}
+
+.dark table td a[href^="http"],
+.dark table td a[href^="https"] {
+    color: rgb(156 163 175);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .upt-cell-expandable[data-upt-full-text]::after {
+        transition: none;
+    }
+}
