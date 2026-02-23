@@ -24,6 +24,10 @@
     --uptimize-shadow-soft: 0 8px 24px rgb(12 44 76 / 9%);
     --uptimize-shadow-card: 0 16px 40px rgb(8 32 58 / 12%);
     --uptimize-focus-ring: 0 0 0 3px rgb(15 105 175 / 24%);
+
+    --uptimize-modal-overlay: rgb(6 20 36 / 58%);
+    --uptimize-detail-card: rgb(255 255 255 / 74%);
+    --uptimize-detail-row: rgb(15 105 175 / 5%);
 }
 
 .dark {
@@ -38,6 +42,10 @@
     --uptimize-shadow-soft: 0 10px 30px rgb(0 0 0 / 28%);
     --uptimize-shadow-card: 0 18px 42px rgb(0 0 0 / 34%);
     --uptimize-focus-ring: 0 0 0 3px rgb(150 215 210 / 26%);
+
+    --uptimize-modal-overlay: rgb(3 10 18 / 72%);
+    --uptimize-detail-card: rgb(12 25 40 / 82%);
+    --uptimize-detail-row: rgb(150 215 210 / 8%);
 }
 
 body {
@@ -276,6 +284,57 @@ table tbody tr:hover {
     background: rgb(150 215 210 / 7%) !important;
 }
 
+/* Center align action buttons in all primary registry tables */
+#gateways-table tbody td:last-child,
+#servers-table tbody td:last-child,
+#tools-table tbody td:last-child,
+#prompts-table tbody td:last-child,
+#resources-table tbody td:last-child,
+#agents-table tbody td:last-child {
+    text-align: center !important;
+    vertical-align: top !important;
+    white-space: normal !important;
+}
+
+#gateways-table tbody td:last-child > :is(div, form),
+#servers-table tbody td:last-child > :is(div, form),
+#tools-table tbody td:last-child > :is(div, form),
+#prompts-table tbody td:last-child > :is(div, form),
+#resources-table tbody td:last-child > :is(div, form),
+#agents-table tbody td:last-child > :is(div, form) {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+#gateways-table tbody td:last-child .grid,
+#servers-table tbody td:last-child .grid,
+#tools-table tbody td:last-child .grid,
+#prompts-table tbody td:last-child .grid,
+#resources-table tbody td:last-child .grid,
+#agents-table tbody td:last-child .grid {
+    justify-items: center;
+}
+
+#gateways-table tbody td:last-child .flex,
+#servers-table tbody td:last-child .flex,
+#tools-table tbody td:last-child .flex,
+#prompts-table tbody td:last-child .flex,
+#resources-table tbody td:last-child .flex,
+#agents-table tbody td:last-child .flex {
+    justify-content: center;
+    align-items: center;
+}
+
+#gateways-table tbody td:last-child :is(button, a),
+#servers-table tbody td:last-child :is(button, a),
+#tools-table tbody td:last-child :is(button, a),
+#prompts-table tbody td:last-child :is(button, a),
+#resources-table tbody td:last-child :is(button, a),
+#agents-table tbody td:last-child :is(button, a) {
+    margin-left: auto;
+    margin-right: auto;
+}
+
 .bg-blue-600,
 .bg-indigo-600,
 .bg-indigo-500 {
@@ -329,7 +388,143 @@ table tbody tr:hover {
     backdrop-filter: blur(3px);
 }
 
+/* Polished visual treatment for all "View" detail popups */
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal)
+    > div
+    > .fixed.inset-0
+    .absolute.inset-0 {
+    opacity: 1 !important;
+    background: var(--uptimize-modal-overlay) !important;
+    backdrop-filter: blur(8px) saturate(140%);
+}
+
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal)
+    > div
+    > .inline-block {
+    border: 1px solid var(--uptimize-border);
+    border-radius: 20px !important;
+    background: var(--uptimize-surface-strong) !important;
+    box-shadow: 0 30px 72px rgb(4 20 34 / 34%);
+}
+
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal) h3 {
+    letter-spacing: 0.01em;
+}
+
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal)
+    > div
+    > .inline-block
+    > div:first-child {
+    background: var(--uptimize-surface-strong) !important;
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details) {
+    max-height: min(70vh, 860px);
+    overflow-y: auto;
+    padding-right: 0.2rem;
+    scrollbar-gutter: stable;
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    > div {
+    background: var(--uptimize-detail-card);
+    border: 1px solid var(--uptimize-border);
+    border-radius: 16px;
+    padding: 1rem;
+    box-shadow: var(--uptimize-shadow-soft);
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    > div
+    > div {
+    border-radius: 14px;
+    border: 1px solid rgb(15 105 175 / 14%);
+    background: rgb(255 255 255 / 52%);
+    padding: 0.9rem 1rem;
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    > div
+    > p {
+    margin: 0;
+    border-radius: 12px;
+    border: 1px solid rgb(15 105 175 / 12%);
+    background: var(--uptimize-detail-row);
+    padding: 0.62rem 0.8rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.35rem;
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    p
+    > strong:first-child {
+    min-width: 8.6rem;
+    color: var(--uptimize-text);
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    .border-t {
+    border-top-color: rgb(15 105 175 / 18%) !important;
+}
+
+.dark
+    :is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    > div
+    > div {
+    border-color: rgb(150 215 210 / 22%);
+    background: rgb(10 25 40 / 64%);
+}
+
+.dark
+    :is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details)
+    > div
+    > p {
+    border-color: rgb(150 215 210 / 18%);
+    background: var(--uptimize-detail-row);
+}
+
+:is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details) pre {
+    border: 1px solid var(--uptimize-border);
+    border-radius: 12px !important;
+    background: rgb(255 255 255 / 65%) !important;
+}
+
+.dark :is(#tool-details, #resource-details, #prompt-details, #gateway-details, #server-details, #agent-details) pre {
+    background: rgb(7 18 31 / 72%) !important;
+}
+
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal)
+    > div
+    > .inline-block
+    > div:last-child {
+    border-top: 1px solid var(--uptimize-border);
+    background: var(--uptimize-surface-muted) !important;
+}
+
+:is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal)
+    button[onclick*="closeModal"] {
+    border-color: rgb(15 105 175 / 30%) !important;
+    border-radius: 999px !important;
+    background: var(--uptimize-surface-strong) !important;
+    color: var(--uptimize-primary-strong) !important;
+    min-width: 7rem;
+    font-weight: 600;
+}
+
+.dark :is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal) button[onclick*="closeModal"] {
+    border-color: rgb(150 215 210 / 30%) !important;
+    color: #d7eeff !important;
+}
+
 @media (prefers-reduced-motion: no-preference) {
+    :is(#tool-modal, #resource-modal, #prompt-modal, #gateway-modal, #server-modal, #agent-modal):not(.hidden)
+        > div
+        > .inline-block {
+        animation: uptimize-modal-in 240ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
     .tab-panel:not(.hidden) {
         animation: uptimize-panel-in 220ms ease-out;
     }
@@ -360,6 +555,18 @@ table tbody tr:hover {
     from {
         opacity: 0;
         transform: translateY(8px) scale(0.996);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes uptimize-modal-in {
+    from {
+        opacity: 0;
+        transform: translateY(14px) scale(0.985);
     }
 
     to {
