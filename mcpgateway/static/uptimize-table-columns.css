@@ -133,27 +133,38 @@
     text-align: center !important;
 }
 
-/* Width constraint: Name(2) */
+/* Width constraint: Name(2)*/
 #gateways-table td:nth-child(2) {
-    max-width: 13rem !important;
+    max-width: 7rem !important;
+    text-wrap-mode: wrap;
+}
+
+/* Width constraint: Status | Visibility(9) */
+#gateways-table thead th:nth-child(9),
+#gateways-table tbody td:nth-child(9) {
+    max-width: 4rem !important;
 }
 
 /* Width constraint: URL(3) */
 #gateways-table td:nth-child(3) {
+    min-width: 16rem !important;
     max-width: 18rem !important;
 }
 
-/* Hide columns: Last Seen(6), Team(8) */
+/* Hide columns: Status(5), Last Seen(6), Team(8) */
+#gateways-table thead th:nth-child(5),
 #gateways-table thead th:nth-child(6),
 #gateways-table thead th:nth-child(8),
+#gateways-table tbody td:nth-child(5),
 #gateways-table tbody td:nth-child(6),
 #gateways-table tbody td:nth-child(8) {
     display: none !important;
 }
 
 /* Action controls column sizing: Actions(10) */
-#gateways-table td:last-child {
-    min-width: 11.25rem !important;
+#gateways-table thead th:last-child,
+#gateways-table tbody td:last-child {
+    max-width: 7rem !important;
     white-space: normal !important;
     text-align: center !important;
 }
@@ -172,9 +183,17 @@
     display: none !important;
 }
 
+/* Width constraint: Name(4)*/
+#servers-table thead th:nth-child(4),
+#servers-table tbody td:nth-child(4) {
+    max-width: 14rem !important;
+    text-wrap-mode: wrap;
+}
+
 /* Width constraint: Description(5) */
-#servers-table td:nth-child(5) {
-    max-width: 22rem !important;
+#servers-table tbody td:nth-child(5) {
+    min-width: 14rem !important;
+    max-width: 24rem !important;
     --upt-clamp-lines: 4;
 }
 
@@ -186,6 +205,7 @@
 /* Center align: Tools | Resources | Prompts(6) */
 #servers-table td:nth-child(6) {
     text-align: center !important;
+    max-width: 6rem !important;
 }
 
 /*
@@ -208,6 +228,15 @@
     border-top-left-radius: 12px !important;
 }
 
+/* Action controls column sizing: Actions(10) */
+#servers-table thead th:last-child,
+#servers-table tbody td:last-child {
+    min-width: 9rem !important;
+    max-width: 10rem !important;
+    white-space: normal !important;
+    text-align: center !important;
+}
+
 /* =====================================
    Tools table (#tools-table)
    ===================================== */
@@ -224,11 +253,17 @@
     display: none !important;
 }
 
-/* Min width: Name(3), Tags(7), Owner(8) */
+/* Min width: Name(3), Owner(8) */
 #tools-table td:nth-child(3),
-#tools-table td:nth-child(7),
 #tools-table td:nth-child(8) {
     min-width: 9rem !important;
+}
+
+/* Max width: Name(3), Tags(7), */
+#tools-table td:nth-child(3),
+#tools-table td:nth-child(7) {
+    max-width: 12rem !important;
+    text-wrap-mode: wrap !important;
 }
 
 /* Width + clamp: Description(5) */
