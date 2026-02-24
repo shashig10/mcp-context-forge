@@ -87,7 +87,7 @@
         <td
           class="px-2 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300 w-20"
         >
-          {{ tool.ownerEmail }}
+          <span class="inline-block max-w-48 truncate align-bottom cursor-help" title="{{ tool.ownerEmail }}" x-tooltip="{{ (tool.ownerEmail or '') | tojson }}">{{ tool.ownerEmail }}</span>
         </td>
         <td
           class="px-2 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-300 w-20"
